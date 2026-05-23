@@ -1,0 +1,58 @@
+<!-- Helper script to generate icon PNGs at different sizes -->
+<!-- Load this in a browser to generate icon16.png and icon48.png -->
+<html>
+<body>
+<canvas id="c16" width="16" height="16"></canvas>
+<canvas id="c48" width="48" height="48"></canvas>
+<script>
+function drawIcon(canvas) {
+  const ctx = canvas.getContext('2d');
+  const s = canvas.width;
+  const r = s * 0.2; // corner radius
+
+  // Rounded rect
+  ctx.beginPath();
+  ctx.roundRect(0, 0, s, s, r);
+  const grad = ctx.createLinearGradient(0, 0, s, s);
+  grad.addColorStop(0, '#4338ca');
+  grad.addColorStop(1, '#7c3aed');
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // Radar circles
+  const cx = s * 0.5, cy = s * 0.5;
+  ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+  ctx.lineWidth = Math.max(1, s * 0.03);
+  for (let i = 1; i <= 3; i++) {
+    ctx.beginPath();
+    ctx.arc(cx, cy, s * 0.12 * i, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+
+  // Center play triangle
+  ctx.fillStyle = '#22d3ee';
+  ctx.beginPath();
+  const ts = s * 0.18;
+  ctx.moveTo(cx - ts * 0.4, cy - ts * 0.5);
+  ctx.lineTo(cx + ts * 0.6, cy);
+  ctx.lineTo(cx - ts * 0.4, cy + ts * 0.5);
+  ctx.closePath();
+  ctx.fill();
+}
+
+drawIcon(document.getElementById('c16'));
+drawIcon(document.getElementById('c48'));
+
+// Download links
+['c16', 'c48'].forEach(id => {
+  const canvas = document.getElementById(id);
+  const link = document.createElement('a');
+  link.download = `icon${canvas.width}.png`;
+  link.href = canvas.toDataURL('image/png');
+  link.textContent = `Download ${canvas.width}px`;
+  document.body.appendChild(link);
+  document.body.appendChild(document.createElement('br'));
+});
+</script>
+</body>
+</html>
