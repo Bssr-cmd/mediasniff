@@ -321,33 +321,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const alreadyHas = Array.from(tabMedia.values()).some(m => m.source === 'youtube' && m.youtubeId === info.videoId);
       if (alreadyHas) return true;
 
-      // Build quality variants from adaptive formats
+      // Build quality info from adaptive formats (no direct URLs — those go through Cobalt API)
       const videoFormats = (message.formats || []).filter(f => f.mimeType.startsWith('video/'));
       const audioFormats = (message.formats || []).filter(f => f.mimeType.startsWith('audio/'));
+      const watchUrl = `https://www.youtube.com/watch?v=${info.videoId}`;
 
-      const variants = videoFormats
-        .filter(f => f.hasUrl)
-        .sort((a, b) => b.height - a.height)
-        .map(f => ({
-          url: f.url,
-          label: `${f.qualityLabel || f.height + 'p'} · ${formatBitrate(f.bitrate)}`,
-          resolution: f.width && f.height ? `${f.width}x${f.height}` : '',
-          height: f.height,
-          width: f.width,
-          bandwidth: f.bitrate,
-          codecs: f.mimeType.match(/codecs="([^"]+)"/)?.[1] || '',
-        }));
-
-      const audioRenditions = audioFormats
-        .filter(f => f.hasUrl)
-        .sort((a, b) => b.bitrate - a.bitrate)
-        .map(f => ({
-          url: f.url,
-          name: `${formatBitrate(f.bitrate)}`,
-          label: f.mimeType.match(/codecs="([^"]+)"/)?.[1] || 'audio',
-          language: 'default',
-          bandwidth: f.bitrate,
-        }));
+      // Build quality label for display (best available)
+      const bestVideo = videoFormats.sort((a, b) => b.height - a.height)[0];
+      const bestAudio = audioFormats.sort((a, b) => b.bitrate - a.bitrate)[0];
+      const qualityLabel = bestVideo
+        ? `${bestVideo.qualityLabel || bestVideo.height + 'p'} · ${formatBitrate(bestVideo.bitrate)}`
+        : 'Unknown';
 
       const id = `media_${++idCounter}`;
       const smartTitle = info.author
@@ -356,18 +340,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       tabMedia.set(id, {
         id,
-        url: message.dashManifestUrl || (variants.length > 0 ? variants[0].url : `https://www.youtube.com/watch?v=${info.videoId}`),
-        type: 'stream',
-        streamType: variants.length > 0 ? 'direct' : 'dash',
+        url: watchUrl,
+        type: 'video',
+        streamType: 'direct',
         mimeType: 'video/mp4',
         contentLength: 0,
-        sizeLabel: variants.length > 0 ? 'YouTube' : 'Use yt-dlp',
+        sizeLabel: 'YouTube',
         filename: smartTitle,
-        quality: variants.length > 0 ? variants[0].label : 'Signature-protected',
-        variants,
-        audioRenditions,
+        quality: qualityLabel,
+        variants: [],  // YouTube downloads go through Cobalt API, not direct variant URLs
+        audioRenditions: [],
         subtitles: [],
-        isEncrypted: variants.length === 0, // If no direct URLs, needs signature
+        isEncrypted: false,
         isLive: info.isLive,
         totalDuration: info.lengthSeconds,
         segmentCount: 0,
@@ -375,6 +359,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         source: 'youtube',
         youtubeId: info.videoId,
         thumbnail: info.thumbnail,
+        availableQualities: videoFormats.map(f => ({
+          label: f.qualityLabel || `${f.height}p`,
+          height: f.height,
+          width: f.width,
+          bitrate: f.bitrate,
+        })),
         timestamp: Date.now()
       });
 
@@ -413,9 +403,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Get page thumbnail/poster for preview
   if (message.type === 'GET_THUMBNAIL') {
     const tabId = message.tabId;
-    chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_THUMBNAIL' }, (response) => {
-      sendResponse(response || { thumbnail: null });
-    });
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_THUMBNAIL' }, (response) => {
+        if (chrome.runtime.lastError) {
+          sendResponse({ thumbnail: null });
+          return;
+        }
+        sendResponse(response || { thumbnail: null });
+      });
+    } catch (e) {
+      sendResponse({ thumbnail: null });
+    }
     return true;
   }
 
@@ -423,6 +421,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'GET_PAGE_INFO') {
     const tabId = message.tabId;
     chrome.tabs.get(tabId, (tab) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ title: '', url: '' });
+        return;
+      }
       sendResponse({
         title: tab?.title || '',
         url: tab?.url || ''
@@ -449,17 +451,43 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 });
 
-// ─── Tab Cleanup ────────────────────────────────────────────────────
+// ─── Tab Navigation & Reinjection ───────────────────────────────────
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaRegistry.delete(tabId);
 });
 
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status === 'loading') {
+    // Clear media registry for fresh page loads
     mediaRegistry.delete(tabId);
     updateBadge(tabId);
   }
+
+  if (changeInfo.status === 'complete' && tab?.url) {
+    // Page fully loaded — re-inject content script to catch BFCache and SPA navigations
+    injectContentScript(tabId);
+  }
 });
+
+// Re-inject content script when user switches back to a tab
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  chrome.tabs.get(tabId, (tab) => {
+    if (chrome.runtime.lastError) return;
+    if (tab?.url && !tab.url.startsWith('chrome://') && !tab.url.startsWith('chrome-extension://')) {
+      injectContentScript(tabId);
+      updateBadge(tabId);
+    }
+  });
+});
+
+function injectContentScript(tabId) {
+  chrome.scripting.executeScript({
+    target: { tabId },
+    files: ['content/content.js']
+  }).catch(() => {
+    // Tab might be a chrome:// page or extension page — ignore
+  });
+}
 
 // ─── Helpers ────────────────────────────────────────────────────────
 function getTabMedia(tabId) {

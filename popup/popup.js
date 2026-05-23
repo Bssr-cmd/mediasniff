@@ -141,13 +141,25 @@ function createMediaCard(item) {
       ${item.isLive ? `<span class="badge live">● LIVE</span>` : ''}
     </div>`;
 
-  // Quality selector for variants
+  // Quality selector for variants (HLS/DASH)
   if (item.variants && item.variants.length > 1) {
     html += `
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
       <select class="quality-select" id="quality-${item.id}">
         ${item.variants.map((v, i) => `<option value="${i}">${v.label}${v.resolution ? ' (' + v.resolution + ')' : ''}${v.codecs ? ' [' + v.codecs + ']' : ''}</option>`).join('')}
+      </select>
+    </div>`;
+  }
+
+  // YouTube quality selector (uses Cobalt API)
+  if (item.source === 'youtube' && item.availableQualities?.length > 0) {
+    const uniqueQualities = [...new Map(item.availableQualities.map(q => [q.height, q])).values()];
+    html += `
+    <div class="quality-section">
+      <div class="quality-label">Video Quality</div>
+      <select class="quality-select" id="ytquality-${item.id}">
+        ${uniqueQualities.map(q => `<option value="${q.height}">${q.label} (${q.width}x${q.height})</option>`).join('')}
       </select>
     </div>`;
   }
@@ -163,14 +175,17 @@ function createMediaCard(item) {
     </div>`;
   }
 
-  // Subtitle embed option
+  // Subtitle download options — auto-download subs alongside video
   if (item.subtitles && item.subtitles.length > 0) {
     html += `
     <div class="subtitle-section">
-      <label class="subtitle-checkbox-label">
-        <input type="checkbox" id="embedSub-${item.id}">
-        Download subtitle (${item.subtitles[0].language || item.subtitles[0].filename})
-      </label>
+      <div class="quality-label">Subtitles</div>
+      ${item.subtitles.map((sub, i) => `
+        <label class="subtitle-checkbox-label">
+          <input type="checkbox" id="sub-${item.id}-${i}" checked>
+          📄 ${sub.language || sub.filename || 'Subtitle'} (.${sub.format || 'vtt'})
+        </label>
+      `).join('')}
     </div>`;
   }
 
@@ -190,15 +205,14 @@ function createMediaCard(item) {
   // Action buttons
   html += `
     <div class="card-actions">
+      <button class="btn btn-download" id="dl-${item.id}" title="Download">
+        ${ICONS.download} Download
+      </button>
       ${(item.variants?.length > 0 && item.audioRenditions?.length > 0) ? `
         <button class="btn btn-mux" id="mux-${item.id}" title="Download & combine video+audio">
-          ${ICONS.mux} Mux & Download
+          ${ICONS.mux} Mux
         </button>
-      ` : `
-        <button class="btn btn-download" id="dl-${item.id}" title="Download">
-          ${ICONS.download} Download
-        </button>
-      `}
+      ` : ''}
       <button class="btn btn-secondary" id="copy-${item.id}" title="Copy URL">
         ${ICONS.copy}
       </button>
@@ -307,10 +321,16 @@ async function handleDownload(item) {
     return;
   }
 
+  // YouTube videos — use Cobalt API for direct download
+  if (item.source === 'youtube') {
+    await handleYouTubeDownload(item);
+    return;
+  }
+
   if (item.streamType === 'direct') {
     // Direct download
     const filename = getSmartName(item);
-    chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: item.url, filename });
+    chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: getSelectedUrl(item), filename });
     showToast('Download started');
     return;
   }
@@ -390,9 +410,13 @@ async function handleDownload(item) {
     const { Transmuxer } = await import(chrome.runtime.getURL('lib/transmuxer.js'));
     const blob = Transmuxer.merge(result.init, result.segments);
 
-    // Trigger download using anchor element (works for any file size)
+    // Trigger video download
     const filename = getSmartName(item);
     triggerBlobDownload(blob, filename);
+
+    // Auto-download checked subtitles alongside video
+    await downloadSubtitles(item, filename);
+
     statusEl.textContent = 'Complete!';
     showToast(`Downloaded: ${filename}`);
 
@@ -403,6 +427,75 @@ async function handleDownload(item) {
   } finally {
     if (dlBtn) dlBtn.disabled = false;
     activeDownloads.delete(item.id);
+  }
+}
+
+// ─── YouTube Direct Download ────────────────────────────────────────
+async function handleYouTubeDownload(item) {
+  const progressEl = document.getElementById(`progress-${item.id}`);
+  const fillEl = document.getElementById(`progressFill-${item.id}`);
+  const statusEl = document.getElementById(`progressStatus-${item.id}`);
+  const percentEl = document.getElementById(`progressPercent-${item.id}`);
+  const dlBtn = document.getElementById(`dl-${item.id}`);
+
+  progressEl.classList.add('active');
+  if (dlBtn) dlBtn.disabled = true;
+  statusEl.textContent = 'Resolving YouTube URL...';
+
+  try {
+    const { YouTubeDownloader } = await import(chrome.runtime.getURL('lib/youtube-downloader.js'));
+
+    // Determine quality from YouTube quality selector
+    const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
+    let quality = '1080';
+    if (ytQualitySelect) {
+      quality = ytQualitySelect.value || '1080';
+    }
+
+    const result = await YouTubeDownloader.getDownloadUrl(item.url, quality);
+
+    if (!result?.url) {
+      // API failed — fallback to yt-dlp
+      statusEl.textContent = 'API unavailable — yt-dlp command copied!';
+      fillEl.style.width = '100%';
+      percentEl.textContent = '100%';
+      const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
+      await navigator.clipboard.writeText(cmd);
+      showToast('API unavailable. yt-dlp command copied to clipboard!');
+      if (dlBtn) dlBtn.disabled = false;
+      return;
+    }
+
+    // Stream download with progress
+    statusEl.textContent = `Downloading ${result.quality || ''} from YouTube...`;
+    const blob = await YouTubeDownloader.downloadStream(result.url, (p) => {
+      fillEl.style.width = `${p.percent}%`;
+      percentEl.textContent = `${p.percent}%`;
+      statusEl.textContent = `Downloading ${p.sizeLabel || ''}... ${p.speedLabel}`;
+    });
+
+    // Save with smart name
+    const filename = result.filename || getSmartName(item);
+    triggerBlobDownload(blob, filename);
+
+    // Auto-download checked subtitles alongside video
+    await downloadSubtitles(item, filename);
+
+    statusEl.textContent = 'Complete!';
+    fillEl.style.width = '100%';
+    percentEl.textContent = '100%';
+    showToast(`Downloaded: ${filename}`);
+
+  } catch (err) {
+    console.error('[MediaSniff] YouTube download error:', err);
+    // Fallback to yt-dlp clipboard
+    statusEl.textContent = 'Download failed — yt-dlp command copied!';
+    fillEl.style.width = '0%';
+    const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
+    try { await navigator.clipboard.writeText(cmd); } catch (_) {}
+    showToast(`Download failed. yt-dlp command copied.`);
+  } finally {
+    if (dlBtn) dlBtn.disabled = false;
   }
 }
 
@@ -521,6 +614,10 @@ async function handleMuxDownload(item) {
 
     const filename = getSmartName(item);
     triggerBlobDownload(muxedBlob, filename);
+
+    // Auto-download checked subtitles alongside video
+    await downloadSubtitles(item, filename);
+
     statusEl.textContent = 'Complete!';
     showToast(`Downloaded: ${filename}`);
 
@@ -531,6 +628,32 @@ async function handleMuxDownload(item) {
     console.error('[MediaSniff] Mux error:', err);
   } finally {
     if (muxBtn) muxBtn.disabled = false;
+  }
+}
+
+// ─── Subtitle Auto-Downloader ───────────────────────────────────────
+async function downloadSubtitles(item, videoFilename) {
+  if (!item.subtitles || item.subtitles.length === 0) return;
+
+  const baseName = videoFilename.replace(/\.[^.]+$/, ''); // strip extension
+
+  for (let i = 0; i < item.subtitles.length; i++) {
+    const checkbox = document.getElementById(`sub-${item.id}-${i}`);
+    if (!checkbox || !checkbox.checked) continue;
+
+    const sub = item.subtitles[i];
+    try {
+      const response = await fetch(sub.url);
+      if (!response.ok) continue;
+      const blob = await response.blob();
+
+      const lang = sub.language || `sub${i + 1}`;
+      const ext = sub.format || 'vtt';
+      const subFilename = `${baseName}.${lang}.${ext}`;
+      triggerBlobDownload(blob, subFilename);
+    } catch (e) {
+      console.warn(`[MediaSniff] Subtitle download failed:`, e.message);
+    }
   }
 }
 

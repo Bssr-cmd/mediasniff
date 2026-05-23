@@ -7,6 +7,14 @@
 (function () {
   'use strict';
 
+  // Guard against duplicate injection — re-scan but don't duplicate observers
+  if (window.__mediaSniffInjected) {
+    // Already running — trigger a fresh scan by clearing reported URLs
+    if (window.__mediaSniffRescan) window.__mediaSniffRescan();
+    return;
+  }
+  window.__mediaSniffInjected = true;
+
   const reportedUrls = new Set();
 
   function extractMediaUrls() {
@@ -93,7 +101,8 @@
               isLive: videoDetails.isLiveContent || false,
             };
 
-            // Collect adaptive formats (separate video/audio streams)
+            // Collect adaptive formats — only send MINIMAL data to avoid 64MB message limit
+            // signatureCipher URLs are massive, so we never send raw URL strings
             const formats = [];
             if (streamingData.adaptiveFormats) {
               for (const fmt of streamingData.adaptiveFormats) {
@@ -105,20 +114,19 @@
                   width: fmt.width || 0,
                   height: fmt.height || 0,
                   contentLength: parseInt(fmt.contentLength) || 0,
-                  url: fmt.url || null, // null if signature-encrypted
-                  hasUrl: !!fmt.url,
+                  hasUrl: !!fmt.url, // just a flag — don't send actual URL
                 });
               }
             }
 
-            chrome.runtime.sendMessage({
-              type: 'YOUTUBE_DATA',
-              videoInfo: info,
-              formats: formats,
-              hasAdaptiveFormats: formats.length > 0,
-              hasDashManifest: !!streamingData.dashManifestUrl,
-              dashManifestUrl: streamingData.dashManifestUrl || null,
-            });
+            try {
+              chrome.runtime.sendMessage({
+                type: 'YOUTUBE_DATA',
+                videoInfo: info,
+                formats: formats,
+                hasAdaptiveFormats: formats.length > 0,
+              });
+            } catch (e) { /* message send failed */ }
           }
         } catch (e) { /* JSON parse failed */ }
         break;
@@ -163,6 +171,18 @@
   });
 
   // ─── Init ──────────────────────────────────────────────────────────
+  function fullRescan() {
+    reportedUrls.clear();
+    reportMedia();
+    if (location.hostname.includes('youtube.com')) {
+      ytDataReported = false;
+      extractYouTubeData();
+    }
+  }
+
+  // Expose for re-injection
+  window.__mediaSniffRescan = fullRescan;
+
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       setTimeout(reportMedia, 500);
