@@ -310,6 +310,77 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'DOM_EMBED') {
+    if (sender.tab) {
+      const tabId = sender.tab.id;
+      for (const embed of message.embeds) {
+        const tabMedia = getTabMedia(tabId);
+        
+        // Deduplicate: check if this YouTube/Vimeo ID is already registered or URL exists
+        const isDuplicate = Array.from(tabMedia.values()).some(m => {
+          if (embed.type === 'youtube' && m.source === 'youtube' && m.youtubeId === embed.id) return true;
+          if (m.url === embed.url) return true;
+          return false;
+        });
+        
+        if (!isDuplicate) {
+          const id = `media_${++idCounter}`;
+          if (embed.type === 'youtube') {
+            tabMedia.set(id, {
+              id,
+              url: embed.url,
+              type: 'video',
+              streamType: 'direct',
+              mimeType: 'video/mp4',
+              contentLength: 0,
+              sizeLabel: 'YouTube',
+              filename: embed.title || 'YouTube Video',
+              quality: 'Embedded Video',
+              variants: [],
+              audioRenditions: [],
+              subtitles: [],
+              isEncrypted: false,
+              isLive: false,
+              totalDuration: 0,
+              segmentCount: 0,
+              parsed: true,
+              source: 'youtube',
+              youtubeId: embed.id,
+              thumbnail: `https://img.youtube.com/vi/${embed.id}/hqdefault.jpg`,
+              timestamp: Date.now()
+            });
+          } else {
+            tabMedia.set(id, {
+              id,
+              url: embed.url,
+              type: 'video',
+              streamType: 'direct',
+              mimeType: 'video/unknown',
+              contentLength: 0,
+              sizeLabel: embed.type.toUpperCase(),
+              filename: embed.title || `${embed.type} Video`,
+              quality: 'Embedded Video',
+              variants: [],
+              audioRenditions: [],
+              subtitles: [],
+              isEncrypted: false,
+              isLive: false,
+              totalDuration: 0,
+              segmentCount: 0,
+              parsed: false,
+              source: 'dom',
+              thumbnail: embed.type === 'vimeo' ? `https://vumbnail.com/${embed.id}.jpg` : null,
+              timestamp: Date.now()
+            });
+          }
+        }
+      }
+      updateBadge(tabId);
+      notifyPopup(tabId);
+    }
+    return true;
+  }
+
   // YouTube player data from content script
   if (message.type === 'YOUTUBE_DATA') {
     if (sender.tab) {

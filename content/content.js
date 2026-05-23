@@ -16,6 +16,104 @@
   window.__mediaSniffInjected = true;
 
   const reportedUrls = new Set();
+  const reportedEmbedIds = new Set();
+
+  const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|flv|wmv|m4v|mp3|aac|ogg|opus|flac|wav|m4a)(\?|#|$)/i;
+
+  function parseEmbedUrl(url) {
+    try {
+      const u = new URL(url);
+      
+      // YouTube Embeds
+      if (u.hostname.includes('youtube.com') || u.hostname.includes('youtube-nocookie.com')) {
+        const embedMatch = u.pathname.match(/\/embed\/([^/?#]+)/);
+        if (embedMatch) {
+          return {
+            type: 'youtube',
+            id: embedMatch[1],
+            url: `https://www.youtube.com/watch?v=${embedMatch[1]}`,
+            title: 'Embedded YouTube Video'
+          };
+        }
+        const vMatch = u.pathname.match(/\/v\/([^/?#]+)/);
+        if (vMatch) {
+          return {
+            type: 'youtube',
+            id: vMatch[1],
+            url: `https://www.youtube.com/watch?v=${vMatch[1]}`,
+            title: 'Embedded YouTube Video'
+          };
+        }
+      }
+      if (u.hostname.includes('youtu.be')) {
+        const id = u.pathname.substring(1);
+        if (id) {
+          return {
+            type: 'youtube',
+            id: id,
+            url: `https://www.youtube.com/watch?v=${id}`,
+            title: 'Embedded YouTube Video'
+          };
+        }
+      }
+      
+      // Vimeo Embeds
+      if (u.hostname.includes('vimeo.com')) {
+        const embedMatch = u.pathname.match(/\/video\/([^/?#]+)/);
+        if (embedMatch) {
+          return {
+            type: 'vimeo',
+            id: embedMatch[1],
+            url: `https://vimeo.com/${embedMatch[1]}`,
+            title: 'Embedded Vimeo Video'
+          };
+        }
+      }
+      
+      // Dailymotion Embeds
+      if (u.hostname.includes('dailymotion.com')) {
+        const embedMatch = u.pathname.match(/\/embed\/video\/([^/?#]+)/);
+        if (embedMatch) {
+          return {
+            type: 'dailymotion',
+            id: embedMatch[1],
+            url: `https://www.dailymotion.com/video/${embedMatch[1]}`,
+            title: 'Embedded Dailymotion Video'
+          };
+        }
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+
+  function extractEmbeds() {
+    const embeds = [];
+
+    // 1. Scan iframes on the current page for video embed embeds
+    const iframes = document.querySelectorAll('iframe');
+    for (const iframe of iframes) {
+      const src = iframe.src || iframe.getAttribute('data-src');
+      if (src) {
+        const parsed = parseEmbedUrl(src);
+        if (parsed) {
+          const titleAttr = iframe.getAttribute('title') || iframe.getAttribute('aria-label') || '';
+          if (titleAttr && titleAttr.trim()) {
+            parsed.title = titleAttr.trim();
+          }
+          embeds.push(parsed);
+        }
+      }
+    }
+
+    // 2. Scan self location (in case we run inside the embed iframe itself)
+    const parsedSelf = parseEmbedUrl(location.href);
+    if (parsedSelf) {
+      parsedSelf.title = document.title || parsedSelf.title;
+      embeds.push(parsedSelf);
+    }
+
+    return embeds;
+  }
 
   function extractMediaUrls() {
     const urls = [];
@@ -33,6 +131,38 @@
         if (source.src && !source.src.startsWith('blob:') && !source.src.startsWith('data:')) {
           urls.push(source.src);
         }
+      }
+      // Check common data attributes for source URLs (often used by custom players)
+      const dataAttrs = ['data-src', 'data-video', 'data-mp4', 'data-stream', 'data-url'];
+      for (const attr of dataAttrs) {
+        const val = el.getAttribute(attr);
+        if (val && !val.startsWith('blob:') && !val.startsWith('data:')) {
+          try {
+            const resolved = new URL(val, document.baseURI).href;
+            if (resolved.startsWith('http')) urls.push(resolved);
+          } catch (_) {}
+        }
+      }
+    }
+
+    // Check embed and object elements
+    const embedsAndObjects = document.querySelectorAll('embed, object');
+    for (const el of embedsAndObjects) {
+      const src = el.src || el.getAttribute('data');
+      if (src && !src.startsWith('blob:') && !src.startsWith('data:')) {
+        try {
+          const resolved = new URL(src, document.baseURI).href;
+          if (resolved.startsWith('http')) urls.push(resolved);
+        } catch (_) {}
+      }
+    }
+
+    // Check anchor links pointing directly to media files
+    const anchors = document.querySelectorAll('a');
+    for (const a of anchors) {
+      const href = a.href;
+      if (href && MEDIA_REGEX.test(href)) {
+        urls.push(href);
       }
     }
 
@@ -57,6 +187,7 @@
   }
 
   function reportMedia() {
+    // 1. Report regular direct URLs
     const urls = extractMediaUrls();
     const newUrls = urls.filter(u => !reportedUrls.has(u));
 
@@ -64,6 +195,17 @@
       newUrls.forEach(u => reportedUrls.add(u));
       try {
         chrome.runtime.sendMessage({ type: 'DOM_MEDIA', urls: newUrls });
+      } catch (e) { /* Extension context invalidated */ }
+    }
+
+    // 2. Report embed platforms (YouTube, Vimeo, Dailymotion)
+    const embeds = extractEmbeds();
+    const newEmbeds = embeds.filter(emb => !reportedEmbedIds.has(emb.type + '-' + emb.id));
+
+    if (newEmbeds.length > 0) {
+      newEmbeds.forEach(emb => reportedEmbedIds.add(emb.type + '-' + emb.id));
+      try {
+        chrome.runtime.sendMessage({ type: 'DOM_EMBED', embeds: newEmbeds });
       } catch (e) { /* Extension context invalidated */ }
     }
   }
@@ -173,6 +315,7 @@
   // ─── Init ──────────────────────────────────────────────────────────
   function fullRescan() {
     reportedUrls.clear();
+    reportedEmbedIds.clear();
     reportMedia();
     if (location.hostname.includes('youtube.com')) {
       ytDataReported = false;
