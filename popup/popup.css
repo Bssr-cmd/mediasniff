@@ -478,6 +478,24 @@ body {
   color: var(--text-muted);
 }
 .progress-label .progress-status { color: var(--accent-light); font-weight: 500; }
+.btn-cancel {
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 9px;
+  font-weight: bold;
+  padding: 1px 4px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: all var(--transition);
+}
+.btn-cancel:hover {
+  color: var(--red);
+  background: rgba(248,113,113,0.1);
+}
 
 /* ─── Empty State ────────────────────────────────────────────────── */
 .empty-state {

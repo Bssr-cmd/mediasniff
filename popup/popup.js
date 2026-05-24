@@ -66,6 +66,46 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (msg.type === 'MEDIA_UPDATED' && msg.tabId === currentTabId) {
       loadMedia();
     }
+
+    if (msg.type === 'BACKGROUND_DOWNLOAD_PROGRESS') {
+      const { itemId, status, percent, statusLabel, speedLabel } = msg;
+      
+      const progressEl = document.getElementById(`progress-${itemId}`);
+      const fillEl = document.getElementById(`progressFill-${itemId}`);
+      const statusEl = document.getElementById(`progressStatus-${itemId}`);
+      const percentEl = document.getElementById(`progressPercent-${itemId}`);
+      const dlBtn = document.getElementById(`dl-${itemId}`);
+      const muxBtn = document.getElementById(`mux-${itemId}`);
+
+      if (status === 'complete' || status === 'failed' || status === 'cancelled') {
+        if (progressEl) progressEl.classList.remove('active');
+        if (dlBtn) dlBtn.disabled = false;
+        if (muxBtn) muxBtn.disabled = false;
+        if (status === 'complete') {
+          showToast(statusLabel);
+        } else if (status === 'failed') {
+          if (statusLabel === 'Error: API_UNAVAILABLE') {
+            const item = mediaItems.find(m => m.id === itemId);
+            if (item) {
+              const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
+              navigator.clipboard.writeText(cmd).catch(() => {});
+              showToast('YouTube API failed. yt-dlp command copied!');
+            }
+          } else {
+            showToast(statusLabel);
+          }
+        } else if (status === 'cancelled') {
+          showToast('Download cancelled');
+        }
+      } else {
+        if (progressEl) progressEl.classList.add('active');
+        if (dlBtn) dlBtn.disabled = true;
+        if (muxBtn) muxBtn.disabled = true;
+        if (fillEl) fillEl.style.width = `${percent}%`;
+        if (percentEl) percentEl.textContent = `${percent}%`;
+        if (statusEl) statusEl.textContent = statusLabel + (speedLabel ? ' · ' + speedLabel : '');
+      }
+    }
   });
 });
 
@@ -75,6 +115,33 @@ async function loadMedia() {
   const response = await chrome.runtime.sendMessage({ type: 'GET_MEDIA', tabId: currentTabId });
   mediaItems = response.media || [];
   renderMediaList();
+
+  // Restore UI states for any active background downloads
+  const activeDownloadsResponse = await chrome.runtime.sendMessage({ type: 'GET_ACTIVE_DOWNLOADS' });
+  if (activeDownloadsResponse?.downloads) {
+    for (const dl of activeDownloadsResponse.downloads) {
+      restoreDownloadUI(dl);
+    }
+  }
+}
+
+function restoreDownloadUI(dl) {
+  const itemId = dl.itemId;
+  const progressEl = document.getElementById(`progress-${itemId}`);
+  const fillEl = document.getElementById(`progressFill-${itemId}`);
+  const statusEl = document.getElementById(`progressStatus-${itemId}`);
+  const percentEl = document.getElementById(`progressPercent-${itemId}`);
+  const dlBtn = document.getElementById(`dl-${itemId}`);
+  const muxBtn = document.getElementById(`mux-${itemId}`);
+
+  if (progressEl) {
+    progressEl.classList.add('active');
+    if (dlBtn) dlBtn.disabled = true;
+    if (muxBtn) muxBtn.disabled = true;
+    if (fillEl) fillEl.style.width = `${dl.percent}%`;
+    if (percentEl) percentEl.textContent = `${dl.percent}%`;
+    if (statusEl) statusEl.textContent = dl.statusLabel + (dl.speedLabel ? ' · ' + dl.speedLabel : '');
+  }
 }
 
 // ─── Render ─────────────────────────────────────────────────────────
@@ -224,7 +291,10 @@ function createMediaCard(item) {
       <div class="progress-bar-track"><div class="progress-bar-fill" id="progressFill-${item.id}"></div></div>
       <div class="progress-label">
         <span class="progress-status" id="progressStatus-${item.id}">Preparing...</span>
-        <span id="progressPercent-${item.id}">0%</span>
+        <div style="display:flex;align-items:center;gap:6px;">
+          <span id="progressPercent-${item.id}">0%</span>
+          <button class="btn-cancel" id="cancel-${item.id}" title="Cancel Download">✕</button>
+        </div>
       </div>
     </div>`;
 
@@ -256,6 +326,11 @@ function createMediaCard(item) {
     const cmd = `yt-dlp "${url}" -o "${getSmartName(item)}"`;
     navigator.clipboard.writeText(cmd);
     showToast('yt-dlp command copied');
+  });
+
+  // Cancel button
+  card.querySelector(`#cancel-${item.id}`).addEventListener('click', () => {
+    chrome.runtime.sendMessage({ type: 'CANCEL_DOWNLOAD', itemId: item.id });
   });
 
   return card;
@@ -321,7 +396,7 @@ async function handleDownload(item) {
     return;
   }
 
-  // YouTube videos — use Cobalt API for direct download
+  // YouTube videos — use background YouTube downloader
   if (item.source === 'youtube') {
     await handleYouTubeDownload(item);
     return;
@@ -335,300 +410,56 @@ async function handleDownload(item) {
     return;
   }
 
-  // Streaming download — fetch and merge segments
-  const progressEl = document.getElementById(`progress-${item.id}`);
-  const fillEl = document.getElementById(`progressFill-${item.id}`);
-  const statusEl = document.getElementById(`progressStatus-${item.id}`);
-  const percentEl = document.getElementById(`progressPercent-${item.id}`);
-  const dlBtn = document.getElementById(`dl-${item.id}`);
+  // Streaming download — delegate to background
+  const qualitySelect = document.getElementById(`quality-${item.id}`);
+  const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
+  const filename = getSmartName(item);
 
-  progressEl.classList.add('active');
-  if (dlBtn) dlBtn.disabled = true;
-  statusEl.textContent = 'Fetching manifest...';
-
-  try {
-    // Get selected variant
-    let targetUrl = item.url;
-    let segments = null;
-    let initUrl = null;
-
-    const qualitySelect = document.getElementById(`quality-${item.id}`);
-    if (qualitySelect && item.variants.length > 0) {
-      const variant = item.variants[parseInt(qualitySelect.value)];
-      targetUrl = variant.url;
-
-      if (variant.segments) {
-        segments = variant.segments;
-        initUrl = variant.initUrl;
-      }
-    }
-
-    // If no segments yet (HLS master → need to fetch media playlist)
-    if (!segments) {
-      statusEl.textContent = 'Parsing stream...';
-      const resp = await fetch(targetUrl);
-      const text = await resp.text();
-      // Dynamic import for parser
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, targetUrl);
-      if (parsed.type === 'media') {
-        segments = parsed.segments;
-        initUrl = parsed.initSegment?.url || null;
-      } else {
-        // Nested master, pick first variant
-        const firstVariant = parsed.variants[0];
-        const resp2 = await fetch(firstVariant.url);
-        const text2 = await resp2.text();
-        const parsed2 = HLSParser.parse(text2, firstVariant.url);
-        segments = parsed2.segments;
-        initUrl = parsed2.initSegment?.url || null;
-      }
-    }
-
-    if (!segments || segments.length === 0) {
-      throw new Error('No segments found');
-    }
-
-    // Download segments concurrently (8 at a time)
-    statusEl.textContent = `Downloading 0/${segments.length} chunks...`;
-    const { SegmentDownloader } = await import(chrome.runtime.getURL('lib/segment-downloader.js'));
-    const downloader = new SegmentDownloader({
-      concurrency: 8,
-      onProgress: (p) => {
-        fillEl.style.width = `${p.percent}%`;
-        percentEl.textContent = `${p.percent}%`;
-        statusEl.textContent = `Downloading ${p.completed}/${p.total} chunks${p.speedLabel ? ' · ' + p.speedLabel : ''}`;
-      }
-    });
-
-    activeDownloads.set(item.id, downloader);
-    const result = await downloader.downloadAll(segments, initUrl);
-
-    // Merge segments
-    statusEl.textContent = 'Merging segments...';
-    fillEl.style.width = '100%';
-    const { Transmuxer } = await import(chrome.runtime.getURL('lib/transmuxer.js'));
-    const blob = Transmuxer.merge(result.init, result.segments);
-
-    // Trigger video download
-    const filename = getSmartName(item);
-    triggerBlobDownload(blob, filename);
-
-    // Auto-download checked subtitles alongside video
-    await downloadSubtitles(item, filename);
-
-    statusEl.textContent = 'Complete!';
-    showToast(`Downloaded: ${filename}`);
-
-  } catch (err) {
-    statusEl.textContent = `Error: ${err.message}`;
-    fillEl.style.width = '0%';
-    showToast(`Download failed: ${err.message}`);
-  } finally {
-    if (dlBtn) dlBtn.disabled = false;
-    activeDownloads.delete(item.id);
-  }
+  chrome.runtime.sendMessage({
+    type: 'START_DOWNLOAD',
+    itemId: item.id,
+    item,
+    downloadType: 'stream',
+    options: { filename, qualityIndex }
+  });
 }
 
-// ─── YouTube Direct Download ────────────────────────────────────────
 async function handleYouTubeDownload(item) {
-  const progressEl = document.getElementById(`progress-${item.id}`);
-  const fillEl = document.getElementById(`progressFill-${item.id}`);
-  const statusEl = document.getElementById(`progressStatus-${item.id}`);
-  const percentEl = document.getElementById(`progressPercent-${item.id}`);
-  const dlBtn = document.getElementById(`dl-${item.id}`);
+  const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
+  const ytQuality = ytQualitySelect ? ytQualitySelect.value : '1080';
+  const filename = getSmartName(item);
 
-  progressEl.classList.add('active');
-  if (dlBtn) dlBtn.disabled = true;
-  statusEl.textContent = 'Resolving YouTube URL...';
-
-  try {
-    const { YouTubeDownloader } = await import(chrome.runtime.getURL('lib/youtube-downloader.js'));
-
-    // Determine quality from YouTube quality selector
-    const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
-    let quality = '1080';
-    if (ytQualitySelect) {
-      quality = ytQualitySelect.value || '1080';
-    }
-
-    const result = await YouTubeDownloader.getDownloadUrl(item.url, quality);
-
-    if (!result?.url) {
-      // API failed — fallback to yt-dlp
-      statusEl.textContent = 'API unavailable — yt-dlp command copied!';
-      fillEl.style.width = '100%';
-      percentEl.textContent = '100%';
-      const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
-      await navigator.clipboard.writeText(cmd);
-      showToast('API unavailable. yt-dlp command copied to clipboard!');
-      if (dlBtn) dlBtn.disabled = false;
-      return;
-    }
-
-    // Stream download with progress
-    statusEl.textContent = `Downloading ${result.quality || ''} from YouTube...`;
-    const blob = await YouTubeDownloader.downloadStream(result.url, (p) => {
-      fillEl.style.width = `${p.percent}%`;
-      percentEl.textContent = `${p.percent}%`;
-      statusEl.textContent = `Downloading ${p.sizeLabel || ''}... ${p.speedLabel}`;
-    });
-
-    // Save with smart name
-    const filename = result.filename || getSmartName(item);
-    triggerBlobDownload(blob, filename);
-
-    // Auto-download checked subtitles alongside video
-    await downloadSubtitles(item, filename);
-
-    statusEl.textContent = 'Complete!';
-    fillEl.style.width = '100%';
-    percentEl.textContent = '100%';
-    showToast(`Downloaded: ${filename}`);
-
-  } catch (err) {
-    console.error('[MediaSniff] YouTube download error:', err);
-    // Fallback to yt-dlp clipboard
-    statusEl.textContent = 'Download failed — yt-dlp command copied!';
-    fillEl.style.width = '0%';
-    const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
-    try { await navigator.clipboard.writeText(cmd); } catch (_) {}
-    showToast(`Download failed. yt-dlp command copied.`);
-  } finally {
-    if (dlBtn) dlBtn.disabled = false;
-  }
+  chrome.runtime.sendMessage({
+    type: 'START_DOWNLOAD',
+    itemId: item.id,
+    item,
+    downloadType: 'youtube',
+    options: { filename, ytQuality }
+  });
 }
 
-// ─── Mux Download (Video + Audio) ───────────────────────────────────
 async function handleMuxDownload(item) {
   if (item.isEncrypted) {
     showToast('Cannot download DRM-protected content');
     return;
   }
 
-  const progressEl = document.getElementById(`progress-${item.id}`);
-  const fillEl = document.getElementById(`progressFill-${item.id}`);
-  const statusEl = document.getElementById(`progressStatus-${item.id}`);
-  const percentEl = document.getElementById(`progressPercent-${item.id}`);
-  const muxBtn = document.getElementById(`mux-${item.id}`);
+  const qualitySelect = document.getElementById(`quality-${item.id}`);
+  const audioSelect = document.getElementById(`audio-${item.id}`);
+  const embedSubCheckbox = document.getElementById(`embedSub-${item.id}`);
 
-  progressEl.classList.add('active');
-  if (muxBtn) muxBtn.disabled = true;
+  const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
+  const audioIndex = audioSelect ? parseInt(audioSelect.value) : 0;
+  const embedSub = !!embedSubCheckbox?.checked;
+  const filename = getSmartName(item);
 
-  try {
-    const qualitySelect = document.getElementById(`quality-${item.id}`);
-    const audioSelect = document.getElementById(`audio-${item.id}`);
-    const videoVariant = item.variants[qualitySelect ? parseInt(qualitySelect.value) : 0];
-    const audioRendition = item.audioRenditions[audioSelect ? parseInt(audioSelect.value) : 0];
-
-    const { SegmentDownloader } = await import(chrome.runtime.getURL('lib/segment-downloader.js'));
-    const { Transmuxer } = await import(chrome.runtime.getURL('lib/transmuxer.js'));
-    const { WASMMuxer } = await import(chrome.runtime.getURL('lib/muxer.js'));
-
-    // ─── Phase 1: Download video segments ───
-    statusEl.textContent = 'Downloading video...';
-    let videoSegments = videoVariant.segments;
-    let videoInitUrl = videoVariant.initUrl;
-
-    if (!videoSegments) {
-      const resp = await fetch(videoVariant.url);
-      const text = await resp.text();
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, videoVariant.url);
-      videoSegments = parsed.segments;
-      videoInitUrl = parsed.initSegment?.url;
-    }
-
-    const videoDownloader = new SegmentDownloader({
-      concurrency: 8,
-      onProgress: (p) => {
-        const overall = p.percent * 0.4;
-        fillEl.style.width = `${overall}%`;
-        percentEl.textContent = `${Math.round(overall)}%`;
-        statusEl.textContent = `Video: ${p.completed}/${p.total} chunks${p.speedLabel ? ' · ' + p.speedLabel : ''}`;
-      }
-    });
-
-    const videoResult = await videoDownloader.downloadAll(videoSegments, videoInitUrl);
-    const videoBlob = Transmuxer.merge(videoResult.init, videoResult.segments);
-
-    // ─── Phase 2: Download audio segments ───
-    statusEl.textContent = 'Downloading audio...';
-    let audioSegments = audioRendition.segments;
-    let audioInitUrl = audioRendition.initUrl;
-
-    if (!audioSegments && audioRendition.url) {
-      const resp = await fetch(audioRendition.url);
-      const text = await resp.text();
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, audioRendition.url);
-      audioSegments = parsed.segments;
-      audioInitUrl = parsed.initSegment?.url;
-    }
-
-    let audioBlob;
-    if (audioSegments) {
-      const audioDownloader = new SegmentDownloader({
-        concurrency: 8,
-        onProgress: (p) => {
-          const overall = 40 + p.percent * 0.3;
-          fillEl.style.width = `${overall}%`;
-          percentEl.textContent = `${Math.round(overall)}%`;
-          statusEl.textContent = `Audio: ${p.completed}/${p.total} chunks${p.speedLabel ? ' · ' + p.speedLabel : ''}`;
-        }
-      });
-      const audioResult = await audioDownloader.downloadAll(audioSegments, audioInitUrl);
-      audioBlob = Transmuxer.merge(audioResult.init, audioResult.segments);
-    }
-
-    // ─── Phase 3: Mux video + audio ───
-    statusEl.textContent = 'Muxing video + audio (WASM)...';
-    fillEl.style.width = '75%';
-    percentEl.textContent = '75%';
-
-    const videoBuffer = await videoBlob.arrayBuffer();
-    const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
-
-    const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
-      const overall = 75 + progress * 0.25;
-      fillEl.style.width = `${overall}%`;
-      percentEl.textContent = `${Math.round(overall)}%`;
-    });
-
-    // ─── Phase 4: Download subtitle if selected ───
-    const embedSubCheckbox = document.getElementById(`embedSub-${item.id}`);
-    if (embedSubCheckbox?.checked && item.subtitles?.length > 0) {
-      statusEl.textContent = 'Downloading subtitle...';
-      const subUrl = item.subtitles[0].url;
-      const subResp = await fetch(subUrl);
-      const subBlob = await subResp.blob();
-      const subName = getSmartName(item).replace(/\.[^.]+$/, '') + '.' + (item.subtitles[0].format || 'vtt');
-      const subDownloadUrl = URL.createObjectURL(subBlob);
-      await chrome.downloads.download({ url: subDownloadUrl, filename: subName, saveAs: false });
-      setTimeout(() => URL.revokeObjectURL(subDownloadUrl), 30000);
-    }
-
-    // ─── Phase 5: Trigger final download ───
-    fillEl.style.width = '100%';
-    percentEl.textContent = '100%';
-
-    const filename = getSmartName(item);
-    triggerBlobDownload(muxedBlob, filename);
-
-    // Auto-download checked subtitles alongside video
-    await downloadSubtitles(item, filename);
-
-    statusEl.textContent = 'Complete!';
-    showToast(`Downloaded: ${filename}`);
-
-  } catch (err) {
-    statusEl.textContent = `Error: ${err.message}`;
-    fillEl.style.width = '0%';
-    showToast(`Mux failed: ${err.message}`);
-    console.error('[MediaSniff] Mux error:', err);
-  } finally {
-    if (muxBtn) muxBtn.disabled = false;
-  }
+  chrome.runtime.sendMessage({
+    type: 'START_DOWNLOAD',
+    itemId: item.id,
+    item,
+    downloadType: 'mux',
+    options: { filename, qualityIndex, audioIndex, embedSub }
+  });
 }
 
 // ─── Subtitle Auto-Downloader ───────────────────────────────────────

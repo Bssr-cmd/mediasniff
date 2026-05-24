@@ -10,6 +10,28 @@ import { DASHParser } from '../lib/dash-parser.js';
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
 let idCounter = 0;
 
+// ─── Active Background Downloads Registry ────────────────────────────
+const activeDownloads = new Map(); // itemId -> taskState
+let offscreenCreating = null;
+
+async function ensureOffscreen() {
+  if (await chrome.offscreen.hasDocument()) return;
+  
+  if (offscreenCreating) {
+    await offscreenCreating;
+    return;
+  }
+  
+  offscreenCreating = chrome.offscreen.createDocument({
+    url: 'background/offscreen.html',
+    reasons: ['DOM_SCRAPING'],
+    justification: 'Media downloading, stream multiplexing, and assembling'
+  });
+  
+  await offscreenCreating;
+  offscreenCreating = null;
+}
+
 // ─── Media Detection Patterns ───────────────────────────────────────
 const MEDIA_EXTENSIONS = /\.(mp4|webm|mkv|avi|mov|flv|wmv|m4v|3gp|ogv)(\?|#|$)/i;
 const AUDIO_EXTENSIONS = /\.(mp3|aac|ogg|opus|flac|wav|m4a|wma)(\?|#|$)/i;
@@ -518,6 +540,90 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }));
     }
     sendResponse({ success: true });
+    return true;
+  }
+
+  // Handle requests from offscreen to trigger downloads (since offscreen cannot call downloads API)
+  if (message.type === 'TRIGGER_DOWNLOAD_SAVE') {
+    chrome.downloads.download({
+      url: message.url,
+      filename: sanitizeFilename(message.filename) || undefined,
+      saveAs: false
+    }, (downloadId) => {
+      if (chrome.runtime.lastError) {
+        sendResponse({ success: false, error: chrome.runtime.lastError.message });
+      } else {
+        sendResponse({ success: true, downloadId });
+      }
+    });
+    return true;
+  }
+
+  // Start background download (opens offscreen document and delegates task)
+  if (message.type === 'START_DOWNLOAD') {
+    const { itemId, item, downloadType, options } = message;
+    activeDownloads.set(itemId, {
+      itemId,
+      status: 'downloading',
+      percent: 0,
+      statusLabel: 'Preparing...',
+      speedLabel: ''
+    });
+
+    ensureOffscreen().then(() => {
+      chrome.runtime.sendMessage({
+        type: 'START_BACKGROUND_DOWNLOAD',
+        itemId, item, downloadType, options
+      });
+    });
+
+    sendResponse({ success: true });
+    return true;
+  }
+
+  // Cancel background download
+  if (message.type === 'CANCEL_DOWNLOAD') {
+    const { itemId } = message;
+    chrome.runtime.sendMessage({
+      type: 'CANCEL_BACKGROUND_DOWNLOAD',
+      itemId
+    });
+    activeDownloads.delete(itemId);
+    sendResponse({ success: true });
+    return true;
+  }
+
+  // Get list of active background downloads
+  if (message.type === 'GET_ACTIVE_DOWNLOADS') {
+    sendResponse({ downloads: Array.from(activeDownloads.values()) });
+    return true;
+  }
+
+  // Process progress updates sent from the offscreen document
+  if (message.type === 'BACKGROUND_DOWNLOAD_PROGRESS') {
+    const { itemId, status, percent, statusLabel, speedLabel } = message;
+    
+    if (status === 'complete' || status === 'failed' || status === 'cancelled') {
+      activeDownloads.delete(itemId);
+    } else {
+      activeDownloads.set(itemId, {
+        itemId, status, percent, statusLabel, speedLabel
+      });
+    }
+
+    // Forward to popup (if popup is open)
+    chrome.runtime.sendMessage(message).catch(() => {
+      // Popup closed, ignore error
+    });
+
+    // Close offscreen document if no more active downloads
+    if (activeDownloads.size === 0) {
+      setTimeout(async () => {
+        if (activeDownloads.size === 0 && await chrome.offscreen.hasDocument()) {
+          chrome.offscreen.closeDocument().catch(() => {});
+        }
+      }, 10000);
+    }
     return true;
   }
 });
