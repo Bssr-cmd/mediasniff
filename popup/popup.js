@@ -432,9 +432,9 @@ async function handleYouTubeDownload(item) {
   chrome.runtime.sendMessage({
     type: 'START_DOWNLOAD',
     itemId: item.id,
-    item,
+    item: { ...item, tabId: currentTabId },
     downloadType: 'youtube',
-    options: { filename, ytQuality }
+    options: { filename, ytQuality, tabId: currentTabId }
   });
 }
 

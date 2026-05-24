@@ -10,9 +10,116 @@ import { DASHParser } from '../lib/dash-parser.js';
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
 let idCounter = 0;
 
+// Load registry from chrome.storage.session
+async function loadRegistry() {
+  try {
+    const data = await chrome.storage.session.get('mediaRegistry');
+    const parsed = data.mediaRegistry || {};
+    mediaRegistry.clear();
+    for (const [tabIdStr, itemsObj] of Object.entries(parsed)) {
+      const tabId = parseInt(tabIdStr);
+      const tabMap = new Map();
+      for (const [itemId, item] of Object.entries(itemsObj)) {
+        tabMap.set(itemId, item);
+      }
+      mediaRegistry.set(tabId, tabMap);
+    }
+    console.log('[MediaSniff] Registry successfully loaded from session storage:', mediaRegistry);
+  } catch (e) {
+    console.warn('[MediaSniff] Failed to load session storage registry:', e.message);
+  }
+}
+
+// Save registry to chrome.storage.session
+async function saveRegistry() {
+  try {
+    const obj = {};
+    for (const [tabId, tabMap] of mediaRegistry.entries()) {
+      obj[tabId] = Object.fromEntries(tabMap.entries());
+    }
+    await chrome.storage.session.set({ mediaRegistry: obj });
+    console.log('[MediaSniff] Registry successfully saved to session storage.');
+  } catch (e) {
+    console.warn('[MediaSniff] Failed to save session storage registry:', e.message);
+  }
+}
+
+// Initialize on background load
+loadRegistry();
+
 // ─── Active Background Downloads Registry ────────────────────────────
 const activeDownloads = new Map(); // itemId -> taskState
 let offscreenCreating = null;
+
+// ─── Captured Headers Registry (for authenticated requests) ─────────
+const capturedHeaders = new Map(); // url -> headers
+
+function getResolutionFromItag(itagStr) {
+  const itag = parseInt(itagStr);
+  const itagMap = {
+    // 1080p
+    137: '1080', 248: '1080', 399: '1080', 271: '1080', 303: '1080',
+    // 720p
+    136: '720', 247: '720', 398: '720', 22: '720', 302: '720',
+    // 480p
+    135: '480', 244: '480', 397: '480',
+    // 360p
+    134: '360', 243: '360', 396: '360', 18: '360',
+    // 240p
+    133: '240', 242: '240', 395: '240',
+    // 144p
+    160: '144', 278: '144', 394: '144',
+    // 4K (2160p)
+    313: '2160', 401: '2160', 272: '2160',
+    // 2K (1440p)
+    264: '1440', 270: '1440', 400: '1440'
+  };
+  return itagMap[itag] || null;
+}
+
+const associateStream = (item, streamMime, streamItag, streamUrl, streamHeaders, tabId) => {
+  if (!item.directVideoUrls) item.directVideoUrls = {};
+  if (!item.directAudioUrls) item.directAudioUrls = {};
+
+  if (streamMime.startsWith('video/')) {
+    const format = item.availableQualities?.find(q => q.itag === parseInt(streamItag));
+    const height = format ? String(format.height) : (getResolutionFromItag(streamItag) || 'default');
+    item.directVideoUrls[height] = {
+      url: streamUrl,
+      headers: streamHeaders,
+      mime: streamMime,
+      itag: streamItag
+    };
+    console.log('[VIDEO STREAM]', {
+      quality: height,
+      mime: streamMime,
+      itag: streamItag,
+      tabId,
+      url: streamUrl
+    });
+  } else if (streamMime.startsWith('audio/')) {
+    item.directAudioUrls['default'] = {
+      url: streamUrl,
+      headers: streamHeaders,
+      mime: streamMime,
+      itag: streamItag
+    };
+    console.log('[AUDIO STREAM]', {
+      mime: streamMime,
+      itag: streamItag,
+      tabId,
+      url: streamUrl
+    });
+  }
+
+  console.log('[REGISTRY STATE]', {
+    directVideoUrls: item.directVideoUrls,
+    directAudioUrls: item.directAudioUrls
+  });
+
+  saveRegistry();
+  notifyPopup(tabId);
+};
 
 async function ensureOffscreen() {
   if (await chrome.offscreen.hasDocument()) return;
@@ -68,12 +175,164 @@ const IGNORE_PATTERNS = [
   /googletagmanager\.com/i,
   /doubleclick\.net/i,
   /googlesyndication\.com/i,
-  /\.googlevideo\.com\/.*&range=.*&rn=([0-9]+)/i, // skip individual YouTube range chunks, keep initial
 ];
 
 const MIN_CONTENT_LENGTH = 50000; // 50KB minimum for direct files
 
 // ─── Request Monitoring ─────────────────────────────────────────────
+// Capture Request Headers dynamically to support authentication on fetching YouTube CDN streams
+chrome.webRequest.onBeforeSendHeaders.addListener(
+  (details) => {
+    const url = details.url;
+    
+    // Broad detection
+    const isYT = url.includes('googlevideo.com') && 
+                 (url.includes('videoplayback') || url.includes('mime=video') || url.includes('mime=audio') || url.includes('sabr'));
+                 
+    if (isYT) {
+      console.log('[INTERCEPT]', url);
+      
+      const headers = {};
+      if (details.requestHeaders) {
+        for (const h of details.requestHeaders) {
+          headers[h.name] = h.value;
+        }
+      }
+      capturedHeaders.set(url, headers);
+      
+      // Keep registry size bounded
+      if (capturedHeaders.size > 200) {
+        const firstKey = capturedHeaders.keys().next().value;
+        capturedHeaders.delete(firstKey);
+      }
+
+      // Check for itag and mime query parameters directly at request initiation!
+      try {
+        const urlObj = new URL(url);
+        const itag = urlObj.searchParams.get('itag') || '';
+        let mime = urlObj.searchParams.get('mime') || '';
+        const docid = urlObj.searchParams.get('docid') || '';
+        
+        if (!mime && itag) {
+          const audioItags = ['139', '140', '141', '249', '250', '251', '256', '258', '325', '328'];
+          mime = audioItags.includes(itag) ? 'audio/mp4' : 'video/mp4';
+        }
+
+        console.log('[ITAG]', itag, 'mime:', mime, 'docid:', docid);
+        
+        if (mime.startsWith('video/') || mime.startsWith('audio/')) {
+          // Find matching YouTube item in registry by docid or Referer video ID
+          let targetItem = null;
+          let targetTabId = details.tabId;
+          
+          let videoIdFromReferer = '';
+          const refererHeader = details.requestHeaders?.find(h => h.name.toLowerCase() === 'referer')?.value;
+          if (refererHeader) {
+            try {
+              const rUrl = new URL(refererHeader);
+              videoIdFromReferer = rUrl.searchParams.get('v') || '';
+            } catch(e) {}
+          }
+          
+          const searchVideoId = (docid && docid.length === 11) ? docid : videoIdFromReferer;
+          
+          if (searchVideoId && searchVideoId.length === 11) {
+            for (const [tId, tabMap] of mediaRegistry.entries()) {
+              for (const item of tabMap.values()) {
+                if (item.source === 'youtube' && item.youtubeId === searchVideoId) {
+                  targetItem = item;
+                  targetTabId = tId;
+                  break;
+                }
+              }
+              if (targetItem) break;
+            }
+          }
+          
+          // If not found by docid, and tabId is valid (>=0), find in this tab
+          if (!targetItem && details.tabId >= 0) {
+            const tabMedia = getTabMedia(details.tabId);
+            targetItem = Array.from(tabMedia.values())
+              .filter(m => m.source === 'youtube')
+              .sort((a, b) => b.timestamp - a.timestamp)[0];
+          }
+          
+          // If still not found, fallback to active tab!
+          if (!targetItem) {
+            chrome.tabs.query({ active: true, currentWindow: true }, (tabs) => {
+              if (tabs && tabs[0]) {
+                const activeTabId = tabs[0].id;
+                const tabMedia = getTabMedia(activeTabId);
+                let ytItem = Array.from(tabMedia.values())
+                  .filter(m => m.source === 'youtube')
+                  .sort((a, b) => b.timestamp - a.timestamp)[0];
+                
+                if (!ytItem) {
+                  // Create YouTube item for active tab
+                  const u = new URL(tabs[0].url);
+                  const videoId = u.searchParams.get('v') || u.pathname.split('/').pop() || docid;
+                  if (!videoId || videoId.length !== 11) return;
+                  
+                  const id = `media_${++idCounter}`;
+                  const smartTitle = tabs[0].title
+                    ? tabs[0].title.replace(/\s*[-–—|]\s*(YouTube).*$/i, '').trim()
+                    : 'YouTube Video';
+                    
+                  ytItem = {
+                    id,
+                    tabId: activeTabId,
+                    url: tabs[0].url,
+                    type: 'video',
+                    streamType: 'direct',
+                    mimeType: 'video/mp4',
+                    contentLength: 0,
+                    sizeLabel: 'YouTube',
+                    filename: smartTitle,
+                    quality: '1080p (HD)',
+                    variants: [],
+                    audioRenditions: [],
+                    subtitles: [],
+                    isEncrypted: false,
+                    isLive: false,
+                    totalDuration: 0,
+                    segmentCount: 0,
+                    parsed: true,
+                    source: 'youtube',
+                    youtubeId: videoId,
+                    thumbnail: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+                    availableQualities: [
+                      { label: '2160p (4K)', height: 2160, width: 3840, itag: 313 },
+                      { label: '1440p (2K)', height: 1440, width: 2560, itag: 264 },
+                      { label: '1080p (HD)', height: 1080, width: 1920, itag: 137 },
+                      { label: '720p (HD)', height: 720, width: 1280, itag: 136 },
+                      { label: '480p', height: 480, width: 854, itag: 135 },
+                      { label: '360p', height: 360, width: 640, itag: 134 }
+                    ],
+                    directVideoUrls: {},
+                    directAudioUrls: {},
+                    timestamp: Date.now()
+                  };
+                  tabMedia.set(id, ytItem);
+                  saveRegistry();
+                  updateBadge(activeTabId);
+                }
+                associateStream(ytItem, mime, itag, url, headers, activeTabId);
+              }
+            });
+          } else {
+            // Associated with found item
+            associateStream(targetItem, mime, itag, url, headers, targetTabId);
+          }
+        }
+      } catch (err) {
+        console.warn('[MediaSniff] Error during early YouTube request interception:', err.message);
+      }
+    }
+  },
+  { urls: ['*://*.googlevideo.com/*'] },
+  ['requestHeaders', 'extraHeaders']
+);
+
 chrome.webRequest.onCompleted.addListener(
   handleRequest,
   { urls: ['<all_urls>'] },
@@ -95,17 +354,135 @@ async function handleRequest(details) {
   let streamType = 'direct';
   let mimeType = contentType.split(';')[0].trim();
 
-  // 0. Check for YouTube/Google Video streams
+  // ─── Check for YouTube/Google Video streams ─────────────────────────
   if (YOUTUBE_VIDEO_PATTERN.test(url)) {
-    // Parse YouTube videoplayback URL for stream info
-    const urlParams = new URLSearchParams(new URL(url).search);
-    const ytMime = urlParams.get('mime') || contentType;
-    const itag = urlParams.get('itag') || '';
-    if (ytMime.startsWith('video/') || ytMime.startsWith('audio/')) {
-      mediaType = ytMime.startsWith('video/') ? 'video' : 'audio';
-      streamType = 'direct';
-      mimeType = ytMime;
+    try {
+      const urlObj = new URL(url);
+      const urlParams = urlObj.searchParams;
+      const itag = urlParams.get('itag') || '';
+      let mime = urlParams.get('mime') || contentType || '';
+
+      if (!mime && itag) {
+        const audioItags = ['139', '140', '141', '249', '250', '251', '256', '258', '325', '328'];
+        mime = audioItags.includes(itag) ? 'audio/mp4' : 'video/mp4';
+      }
+      
+      if (mime.startsWith('video/') || mime.startsWith('audio/')) {
+        // Do NOT modify or strip range/sig/n parameters as YouTube CDN uses them for request validation
+        const cleanUrl = url;
+
+        // Get captured headers
+        const headers = capturedHeaders.get(url) || {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://www.youtube.com/'
+        };
+        
+        let videoIdFromReferer = '';
+        const refererVal = headers['Referer'] || headers['referer'];
+        if (refererVal) {
+          try {
+            const rUrl = new URL(refererVal);
+            videoIdFromReferer = rUrl.searchParams.get('v') || '';
+          } catch(e) {}
+        }
+
+        const docid = urlParams.get('docid') || '';
+        const searchVideoId = (docid && docid.length === 11) ? docid : videoIdFromReferer;
+
+        const tabMedia = getTabMedia(details.tabId);
+        let ytItem = null;
+        
+        if (searchVideoId && searchVideoId.length === 11) {
+          // Search across all tabs if needed
+          for (const tabMap of mediaRegistry.values()) {
+            for (const item of tabMap.values()) {
+              if (item.source === 'youtube' && item.youtubeId === searchVideoId) {
+                ytItem = item;
+                break;
+              }
+            }
+            if (ytItem) break;
+          }
+        }
+        
+        if (!ytItem) {
+          ytItem = Array.from(tabMedia.values())
+            .filter(m => m.source === 'youtube')
+            .sort((a, b) => b.timestamp - a.timestamp)[0];
+        }
+
+        if (!ytItem) {
+          chrome.tabs.get(details.tabId, (tab) => {
+            if (chrome.runtime.lastError || !tab || !tab.url) return;
+
+            const tabMedia2 = getTabMedia(details.tabId);
+            let ytItem2 = Array.from(tabMedia2.values())
+              .filter(m => m.source === 'youtube')
+              .sort((a, b) => b.timestamp - a.timestamp)[0];
+
+            if (!ytItem2) {
+              try {
+                const u = new URL(tab.url);
+                const videoId = u.searchParams.get('v') || u.pathname.split('/').pop();
+                if (!videoId || videoId.length !== 11) return;
+
+                const id = `media_${++idCounter}`;
+                const smartTitle = tab.title
+                  ? tab.title.replace(/\s*[-–—|]\s*(YouTube).*$/i, '').trim()
+                  : 'YouTube Video';
+
+                ytItem2 = {
+                  id,
+                  tabId: details.tabId,
+                  url: tab.url,
+                  type: 'video',
+                  streamType: 'direct',
+                  mimeType: 'video/mp4',
+                  contentLength: 0,
+                  sizeLabel: 'YouTube',
+                  filename: smartTitle,
+                  quality: '1080p (HD)',
+                  variants: [],
+                  audioRenditions: [],
+                  subtitles: [],
+                  isEncrypted: false,
+                  isLive: false,
+                  totalDuration: 0,
+                  segmentCount: 0,
+                  parsed: true,
+                  source: 'youtube',
+                  youtubeId: videoId,
+                  thumbnail: `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`,
+                  availableQualities: [
+                    { label: '2160p (4K)', height: 2160, width: 3840, bitrate: 15000000, itag: 313 },
+                    { label: '1440p (2K)', height: 1440, width: 2560, bitrate: 10000000, itag: 264 },
+                    { label: '1080p (HD)', height: 1080, width: 1920, bitrate: 4000000, itag: 137 },
+                    { label: '720p (HD)', height: 720, width: 1280, bitrate: 2000000, itag: 136 },
+                    { label: '480p', height: 480, width: 854, bitrate: 1000000, itag: 135 },
+                    { label: '360p', height: 360, width: 640, bitrate: 500000, itag: 134 }
+                  ],
+                  directVideoUrls: {},
+                  directAudioUrls: {},
+                  timestamp: Date.now()
+                };
+
+                tabMedia2.set(id, ytItem2);
+                updateBadge(details.tabId);
+              } catch (e) {
+                return;
+              }
+            }
+
+            associateStream(ytItem2, mime, itag, cleanUrl, headers, details.tabId);
+          });
+        } else {
+          associateStream(ytItem, mime, itag, cleanUrl, headers, details.tabId);
+        }
+      }
+    } catch (e) {
+      console.warn('[MediaSniff] Error capturing YouTube video stream:', e.message);
     }
+    return; // Stop processing so we don't register individual chunks as duplicate cards
   }
   // 1. Check for HLS manifest
   else if (HLS_EXTENSIONS.test(url) || contentType.includes('mpegurl') || contentType.includes('x-mpegurl')) {
@@ -204,6 +581,7 @@ async function handleRequest(details) {
   }
 
   tabMedia.set(id, item);
+  saveRegistry();
   updateBadge(details.tabId);
   notifyPopup(details.tabId);
 }
@@ -292,8 +670,75 @@ function parseDASHManifest(item, content, url) {
   }
 }
 
+async function forceYouTubeQuality(tabId, quality) {
+  const qualityMap = {
+    '2160': 'hd2160',
+    '1440': 'hd1440',
+    '1080': 'hd1080',
+    '720': 'hd720',
+    '480': 'large',
+    '360': 'medium',
+    '240': 'small',
+    '144': 'tiny'
+  };
+  
+  const ytQuality = qualityMap[quality] || 'hd1080';
+  console.log(`[MediaSniff SW] Injecting quality switch to ${ytQuality} (target quality: ${quality}p) in tab ${tabId}`);
+  
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      world: 'MAIN',
+      func: async (targetQuality) => {
+        try {
+          const player = document.getElementById('movie_player') || document.querySelector('.html5-video-player');
+          const video = document.querySelector('video');
+          if (player) {
+            console.log(`[MediaSniff Injected] Programmatically forcing player quality to: ${targetQuality}`);
+            player.setPlaybackQualityRange(targetQuality);
+            player.setPlaybackQuality(targetQuality);
+            
+            if (video) {
+              console.log('[MediaSniff Injected] Invalidating video buffer pressure...');
+              video.pause();
+              const current = video.currentTime;
+              video.currentTime = current + 2; // Seek forward 2s to force buffer flush
+              
+              await new Promise(r => setTimeout(r, 600));
+              video.play();
+              console.log('[MediaSniff Injected] Buffer flushed and playback resumed successfully.');
+            }
+          } else {
+            console.warn('[MediaSniff Injected] YouTube player not found.');
+          }
+        } catch (e) {
+          console.error('[MediaSniff Injected] Error:', e.message);
+        }
+      },
+      args: [ytQuality]
+    });
+  } catch (err) {
+    console.error('[MediaSniff SW] Failed to execute quality switch script:', err.message);
+  }
+}
+
 // ─── Content Script Messages ────────────────────────────────────────
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message.type === 'FORCE_QUALITY_SWITCH') {
+    const { tabId, quality } = message;
+    forceYouTubeQuality(tabId, quality).then(() => {
+      sendResponse({ success: true });
+    });
+    return true;
+  }
+
+  if (message.type === 'GET_MEDIA_ITEM') {
+    const tabMedia = getTabMedia(message.tabId);
+    const item = tabMedia.get(message.itemId);
+    sendResponse({ item: item || null });
+    return true;
+  }
+
   if (message.type === 'GET_MEDIA') {
     const tabId = message.tabId;
     const tabMedia = getTabMedia(tabId);
@@ -303,6 +748,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.type === 'CLEAR_MEDIA') {
     mediaRegistry.delete(message.tabId);
+    saveRegistry();
     updateBadge(message.tabId);
     sendResponse({ success: true });
     return true;
@@ -326,6 +772,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           });
         }
       }
+      saveRegistry();
       updateBadge(tabId);
       notifyPopup(tabId);
     }
@@ -397,6 +844,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
         }
       }
+      saveRegistry();
       updateBadge(tabId);
       notifyPopup(tabId);
     }
@@ -457,10 +905,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           height: f.height,
           width: f.width,
           bitrate: f.bitrate,
+          itag: f.itag,
         })),
         timestamp: Date.now()
       });
 
+      saveRegistry();
       updateBadge(tabId);
       notifyPopup(tabId);
     }

@@ -1,0 +1,12 @@
+{
+  "name": "net.mediasniff.coapp",
+  "description": "MediaSniff Companion App for native video downloading and remuxing",
+  "path": "C:\\Users\\think\\.gemini\\antigravity\\scratch\\mediasniff\\coapp\\coapp.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://pbgljpcofcekhhdmikhljlpifeoikneo/",
+    "chrome-extension://negfehinkcmfkllilefjdfglifjhehco/",
+    "chrome-extension://dmjcpajgemdhaglcngpokhdmfepgbffm/",
+    "chrome-extension://ijdmgejobfngcmnkckepcnoghjideefc/"
+  ]
+}

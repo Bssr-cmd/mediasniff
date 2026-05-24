@@ -184,25 +184,346 @@ class DownloadTask {
   }
 
   async downloadYouTube() {
-    this.reportProgress(5, 'Resolving YouTube URL...', '');
-    const result = await YouTubeDownloader.getDownloadUrl(this.item.url, this.options.ytQuality || '1080');
+    this.reportProgress(5, 'Preparing YouTube download...', '');
 
-    if (!result?.url) {
+    const targetQuality = this.options.ytQuality || '1080';
+    const tabId = this.item.tabId || this.options.tabId;
+    const watchUrl = this.item.url;
+    
+    console.log(`[MediaSniff Offscreen] YouTube Download: Target=${targetQuality}p, TabID=${tabId}`);
+
+    // ─── Try Pipeline 1: Native Companion App with yt-dlp (Gold Standard) ───
+    try {
+      this.reportProgress(8, 'Connecting to Companion App (yt-dlp)...', '');
+      const nativeResult = await this.triggerNativeYtdlpDownload(
+        watchUrl,
+        this.options.filename,
+        targetQuality
+      );
+      if (nativeResult && nativeResult.status === 'complete') {
+        this.reportStatus('complete', nativeResult.statusLabel || 'Complete!');
+        return;
+      }
+    } catch (e) {
+      console.warn('[MediaSniff Offscreen] Native yt-dlp download failed, falling back to sniffer/WASM:', e.message);
+    }
+
+    let videoUrl = null;
+    let audioUrl = null;
+    let isCombined = false;
+    let videoHeaders = null;
+    let audioHeaders = null;
+    let result = null;
+
+    // Wait for raw stream interception and force player quality switch with buffer invalidation
+    if (tabId) {
+      this.reportProgress(8, 'Polling sniffer registry for streams...', '');
+      
+      for (let attempt = 1; attempt <= 6; attempt++) {
+        // Query the latest state of this item from background session storage registry
+        const latestMedia = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ type: 'GET_MEDIA_ITEM', tabId, itemId: this.item.id }, (resp) => {
+            resolve(resp?.item || this.item);
+          });
+        });
+        
+        const directVideo = latestMedia.directVideoUrls?.[targetQuality];
+        const directAudio = latestMedia.directAudioUrls?.['default'];
+        
+        console.log(`[MediaSniff Offscreen] Registry Check (Attempt ${attempt}/6):`, {
+          videoFound: !!directVideo,
+          audioFound: !!directAudio
+        });
+
+        if (directVideo && directVideo.url && directAudio && directAudio.url) {
+          // DASH Stabilization delay: wait 1.5 seconds to collect all audio/video range chunks
+          this.reportProgress(10, 'Synchronizing DASH streams...', '');
+          await new Promise(r => setTimeout(r, 1500));
+          
+          videoUrl = directVideo.url;
+          videoHeaders = directVideo.headers || null;
+          audioUrl = directAudio.url;
+          audioHeaders = directAudio.headers || null;
+          isCombined = false;
+          
+          result = {
+            url: videoUrl,
+            audioUrl: audioUrl,
+            filename: this.options.filename,
+            quality: targetQuality,
+            isCombined: false,
+            videoType: directVideo.mime || 'video/mp4',
+            audioType: directAudio?.mime || 'audio/mp4'
+          };
+          break;
+        }
+
+        // Programmatically force quality switch with buffer invalidation if not intercepted yet
+        if (!directVideo && (attempt === 1 || attempt === 3)) {
+          this.reportProgress(8, `Forcing player quality switch to ${targetQuality}p...`, '');
+          await chrome.runtime.sendMessage({ type: 'FORCE_QUALITY_SWITCH', tabId, quality: targetQuality });
+        } else if (!directAudio) {
+          this.reportProgress(8, 'Waiting for audio stream synchronization...', '');
+        }
+
+        // Wait 1.5 seconds before next polling check
+        await new Promise(r => setTimeout(r, 1500));
+      }
+    }
+
+    // First Fallback: Scan registry for ANY quality that has been intercepted
+    if (!videoUrl && tabId) {
+      console.log(`[MediaSniff Offscreen] Exact quality not found. Checking for any other captured video qualities...`);
+      const latestMedia = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'GET_MEDIA_ITEM', tabId, itemId: this.item.id }, (resp) => {
+          resolve(resp?.item || this.item);
+        });
+      });
+      
+      const qualities = Object.keys(latestMedia.directVideoUrls || {}).sort((a, b) => parseInt(b) - parseInt(a));
+      if (qualities.length > 0) {
+        const bestQuality = qualities[0];
+        const directVideo = latestMedia.directVideoUrls[bestQuality];
+        const directAudio = latestMedia.directAudioUrls?.['default'];
+
+        console.log(`[MediaSniff Offscreen] Falling back to highest captured direct stream quality: ${bestQuality}p`);
+        videoUrl = directVideo.url;
+        videoHeaders = directVideo.headers || null;
+        isCombined = false;
+
+        if (directAudio && directAudio.url) {
+          audioUrl = directAudio.url;
+          audioHeaders = directAudio.headers || null;
+        }
+
+        result = {
+          url: videoUrl,
+          audioUrl: audioUrl,
+          filename: this.options.filename,
+          quality: bestQuality,
+          isCombined: false,
+          videoType: directVideo.mime || 'video/mp4',
+          audioType: directAudio?.mime || 'audio/mp4'
+        };
+      }
+    }
+
+    // Last Resort Fallback: Invidious API
+    if (!videoUrl) {
+      this.reportProgress(12, 'Sniffer inactive. Resolving streams via fallback API...', '');
+      try {
+        result = await YouTubeDownloader.getDownloadUrl(this.item.url, targetQuality);
+        videoUrl = result?.url;
+        audioUrl = result?.audioUrl;
+        isCombined = result?.isCombined;
+      } catch (e) {
+        console.warn(`[MediaSniff Offscreen] Fallback API query failed:`, e.message);
+      }
+    }
+
+    if (!videoUrl) {
       throw new Error('API_UNAVAILABLE');
     }
 
-    this.reportProgress(10, 'Downloading from YouTube...', '');
-    const blob = await YouTubeDownloader.downloadStream(
-      result.url,
+    try {
+      if (isCombined) {
+        // Combined stream: download in one go
+        this.reportProgress(10, 'Downloading from YouTube...', '');
+        const finalBlob = await YouTubeDownloader.downloadStream(
+          videoUrl,
+          (p) => {
+            const overall = Math.round(10 + p.percent * 0.85); // 10% to 95%
+            this.reportProgress(overall, `Downloading: ${p.sizeLabel}`, p.speedLabel);
+          },
+          this.abortController.signal
+        );
+        this.reportProgress(98, 'Saving video...', '');
+        await this.triggerSave(finalBlob, result?.filename || this.options.filename);
+        this.reportStatus('complete', 'Complete!');
+      } else {
+        // Try the separate adaptive streams (via Companion App first, then in-browser WASM)
+        await this.downloadAdaptive(videoUrl, audioUrl, result, videoHeaders, audioHeaders);
+      }
+    } catch (err) {
+      console.warn('[MediaSniff Offscreen] Adaptive download/merge failed:', err.message);
+      
+      // Fallback to combined stream if available
+      if (result?.combinedUrl && !isCombined) {
+        this.reportProgress(10, 'Retrying in Safe Mode...', '');
+        try {
+          const finalBlob = await YouTubeDownloader.downloadStream(
+            result.combinedUrl,
+            (p) => {
+              const overall = Math.round(10 + p.percent * 0.85);
+              this.reportProgress(overall, `Downloading (Safe Mode): ${p.sizeLabel}`, p.speedLabel);
+            },
+            this.abortController.signal
+          );
+          this.reportProgress(98, 'Saving video...', '');
+          await this.triggerSave(finalBlob, result.filename || this.options.filename);
+          this.reportStatus('complete', 'Complete (Safe Mode)!');
+        } catch (err2) {
+          throw new Error('Safe Mode download failed: ' + err2.message);
+        }
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  async downloadAdaptive(videoUrl, audioUrl, result, videoHeaders = null, audioHeaders = null) {
+    // ─── Pipeline 1: Native Messaging Companion App (Lossless FFmpeg Merging) ───
+    try {
+      this.reportProgress(8, 'Connecting to Companion App...', '');
+      const nativeResult = await this.triggerNativeDownload(
+        videoUrl, 
+        audioUrl, 
+        result?.filename || this.options.filename,
+        videoHeaders,
+        audioHeaders
+      );
+      if (nativeResult && nativeResult.status === 'complete') {
+        this.reportStatus('complete', nativeResult.statusLabel || 'Complete!');
+        return;
+      }
+    } catch (e) {
+      console.warn('[MediaSniff Offscreen] Companion App failed or not installed. Falling back to WASM:', e.message);
+    }
+
+    // ─── Pipeline 2: In-Browser WASM Muxer / Downloader Fallback ───
+    // Check if the stream is VP9/AV1 (not AVC/H.264)
+    const isAVC = (type) => {
+      const t = String(type || '').toLowerCase();
+      return t.includes('avc1') || t.includes('h264') || t.includes('avc');
+    };
+    
+    const videoType = result?.videoType || '';
+    if (!isAVC(videoType)) {
+      console.warn('[MediaSniff Offscreen] Video stream is not standard AVC/H.264 (likely VP9 or AV1). WASM box-muxing of this format is unstable and unsupported by default Windows players. Falling back to pre-muxed combined H.264 stream.');
+      throw new Error('CODEC_NOT_SUPPORTED_IN_BROWSER');
+    }
+
+    this.reportProgress(10, 'Downloading video stream...', '');
+    const videoBlob = await YouTubeDownloader.downloadStream(
+      videoUrl,
       (p) => {
-        this.reportProgress(p.percent, `Downloading: ${p.sizeLabel}`, p.speedLabel);
+        const overall = Math.round(10 + p.percent * 0.40); // 10% to 50%
+        this.reportProgress(overall, `Video: ${p.sizeLabel}`, p.speedLabel);
       },
       this.abortController.signal
     );
 
+    let audioBlob = null;
+    if (audioUrl) {
+      this.reportProgress(50, 'Downloading audio stream...', '');
+      audioBlob = await YouTubeDownloader.downloadStream(
+        audioUrl,
+        (p) => {
+          const overall = Math.round(50 + p.percent * 0.30); // 50% to 80%
+          this.reportProgress(overall, `Audio: ${p.sizeLabel}`, p.speedLabel);
+        },
+        this.abortController.signal
+      );
+    }
+
+    this.reportProgress(80, 'Remuxing tracks (WASM)...', '');
+    const videoBuffer = await videoBlob.arrayBuffer();
+    const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
+
+    const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
+      const overall = Math.round(80 + progress * 0.16); // 80% to 96%
+      this.reportProgress(overall, 'Remuxing tracks (WASM)...', '');
+    });
+
     this.reportProgress(98, 'Saving video...', '');
-    await this.triggerSave(blob, result.filename || this.options.filename);
+    await this.triggerSave(muxedBlob, result?.filename || this.options.filename);
     this.reportStatus('complete', 'Complete!');
+  }
+
+  triggerNativeYtdlpDownload(url, filename, quality) {
+    return new Promise((resolve, reject) => {
+      try {
+        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
+        
+        port.onMessage.addListener((msg) => {
+          console.log("[MediaSniff Offscreen] Native Ytdlp Companion message:", msg);
+          if (msg.status === 'progress') {
+            this.reportProgress(msg.percent, msg.statusLabel, '');
+          } else if (msg.status === 'complete') {
+            port.disconnect();
+            resolve(msg);
+          } else if (msg.status === 'failed') {
+            port.disconnect();
+            reject(new Error(msg.statusLabel || 'Native Host failed'));
+          }
+        });
+        
+        port.onDisconnect.addListener(() => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            console.warn("[MediaSniff Offscreen] Native Ytdlp connection error:", err.message);
+            reject(new Error("Host disconnected: " + err.message));
+          } else {
+            resolve({ status: "complete", statusLabel: "Completed by Companion App (yt-dlp)" });
+          }
+        });
+        
+        // Trigger native download via yt-dlp action
+        port.postMessage({
+          action: "download_youtube_ytdlp",
+          url: url,
+          filename: filename,
+          quality: quality
+        });
+        
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  triggerNativeDownload(videoUrl, audioUrl, filename, videoHeaders = null, audioHeaders = null) {
+    return new Promise((resolve, reject) => {
+      try {
+        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
+        
+        port.onMessage.addListener((msg) => {
+          console.log("[MediaSniff Offscreen] Native Companion message:", msg);
+          if (msg.status === 'progress') {
+            this.reportProgress(msg.percent, msg.statusLabel, '');
+          } else if (msg.status === 'complete') {
+            port.disconnect();
+            resolve(msg);
+          } else if (msg.status === 'failed') {
+            port.disconnect();
+            reject(new Error(msg.statusLabel || 'Native Host failed'));
+          }
+        });
+        
+        port.onDisconnect.addListener(() => {
+          const err = chrome.runtime.lastError;
+          if (err) {
+            console.warn("[MediaSniff Offscreen] Native connection error:", err.message);
+            reject(new Error("Host disconnected: " + err.message));
+          } else {
+            resolve({ status: "complete", statusLabel: "Completed by Companion App" });
+          }
+        });
+        
+        // Trigger native download & mux action
+        port.postMessage({
+          action: "download_and_mux",
+          videoUrl: videoUrl,
+          audioUrl: audioUrl,
+          filename: filename,
+          videoHeaders: videoHeaders,
+          audioHeaders: audioHeaders
+        });
+        
+      } catch (err) {
+        reject(err);
+      }
+    });
   }
 
   async triggerSave(blob, filename) {
