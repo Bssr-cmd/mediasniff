@@ -1,14 +1,10 @@
 import urllib.request
 import gzip
-import zipfile
-import io
 import os
 import ssl
-
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
-
 def download_ffmpeg():
     coapp_dir = os.path.dirname(os.path.abspath(__file__))
     output_exe = os.path.join(coapp_dir, "ffmpeg.exe")
@@ -48,35 +44,5 @@ def download_ffmpeg():
                 os.remove(gz_path)
             except:
                 pass
-
-def download_ffprobe():
-    coapp_dir = os.path.dirname(os.path.abspath(__file__))
-    output_exe = os.path.join(coapp_dir, "ffprobe.exe")
-    
-    if os.path.exists(output_exe):
-        print("ffprobe.exe is already present.")
-        return
-        
-    url = "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v4.4.1/ffprobe-4.4.1-win-64.zip"
-    print(f"Downloading compact FFprobe static binary from: {url}")
-    
-    try:
-        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, context=ctx) as response:
-            zip_data = response.read()
-            
-        print("Download complete. Extracting ffprobe.exe...")
-        with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
-            for name in z.namelist():
-                if name.endswith("ffprobe.exe") or name == "ffprobe.exe":
-                    with open(output_exe, 'wb') as f_out:
-                        f_out.write(z.read(name))
-                    print("Success! ffprobe.exe has been extracted successfully.")
-                    return
-            print("ERROR: ffprobe.exe not found in zip archive!")
-    except Exception as e:
-        print(f"Error downloading FFprobe: {e}")
-
 if __name__ == '__main__':
     download_ffmpeg()
-    download_ffprobe()

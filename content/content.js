@@ -23,7 +23,7 @@
   function parseEmbedUrl(url) {
     try {
       const u = new URL(url);
-      
+
       // YouTube Embeds
       if (u.hostname.includes('youtube.com') || u.hostname.includes('youtube-nocookie.com')) {
         const embedMatch = u.pathname.match(/\/embed\/([^/?#]+)/);
@@ -56,7 +56,7 @@
           };
         }
       }
-      
+
       // Vimeo Embeds
       if (u.hostname.includes('vimeo.com')) {
         const embedMatch = u.pathname.match(/\/video\/([^/?#]+)/);
@@ -69,7 +69,7 @@
           };
         }
       }
-      
+
       // Dailymotion Embeds
       if (u.hostname.includes('dailymotion.com')) {
         const embedMatch = u.pathname.match(/\/embed\/video\/([^/?#]+)/);
@@ -140,7 +140,7 @@
           try {
             const resolved = new URL(val, document.baseURI).href;
             if (resolved.startsWith('http')) urls.push(resolved);
-          } catch (_) {}
+          } catch (_) { }
         }
       }
     }
@@ -153,7 +153,7 @@
         try {
           const resolved = new URL(src, document.baseURI).href;
           if (resolved.startsWith('http')) urls.push(resolved);
-        } catch (_) {}
+        } catch (_) { }
       }
     }
 

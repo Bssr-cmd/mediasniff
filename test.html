@@ -1,11 +1,19 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
   <meta charset="UTF-8">
   <title>MediaSniff — Component Tests</title>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap" rel="stylesheet">
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=JetBrains+Mono:wght@400&display=swap"
+    rel="stylesheet">
   <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
     body {
       font-family: 'Inter', sans-serif;
       background: #08080d;
@@ -14,6 +22,7 @@
       max-width: 800px;
       margin: 0 auto;
     }
+
     h1 {
       font-size: 24px;
       background: linear-gradient(135deg, #6366f1, #a855f7);
@@ -21,19 +30,22 @@
       -webkit-text-fill-color: transparent;
       margin-bottom: 8px;
     }
+
     h2 {
       font-size: 16px;
       color: #8b8b9e;
       margin-bottom: 24px;
       font-weight: 400;
     }
+
     .test-group {
-      background: rgba(255,255,255,0.03);
-      border: 1px solid rgba(255,255,255,0.06);
+      background: rgba(255, 255, 255, 0.03);
+      border: 1px solid rgba(255, 255, 255, 0.06);
       border-radius: 12px;
       padding: 20px;
       margin-bottom: 16px;
     }
+
     .test-group h3 {
       font-size: 14px;
       color: #a855f7;
@@ -41,32 +53,69 @@
       text-transform: uppercase;
       letter-spacing: 0.05em;
     }
+
     .test-item {
       display: flex;
       align-items: center;
       gap: 10px;
       padding: 8px 0;
-      border-bottom: 1px solid rgba(255,255,255,0.03);
+      border-bottom: 1px solid rgba(255, 255, 255, 0.03);
       font-size: 13px;
     }
-    .test-item:last-child { border-bottom: none; }
+
+    .test-item:last-child {
+      border-bottom: none;
+    }
+
     .status {
-      width: 22px; height: 22px;
+      width: 22px;
+      height: 22px;
       border-radius: 50%;
-      display: flex; align-items: center; justify-content: center;
+      display: flex;
+      align-items: center;
+      justify-content: center;
       font-size: 12px;
       flex-shrink: 0;
     }
-    .status.pass { background: rgba(52,211,153,0.15); color: #34d399; }
-    .status.fail { background: rgba(248,113,113,0.15); color: #f87171; }
-    .status.running { background: rgba(99,102,241,0.15); color: #6366f1; animation: pulse 1s infinite; }
-    @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.5; } }
-    .test-name { flex: 1; }
+
+    .status.pass {
+      background: rgba(52, 211, 153, 0.15);
+      color: #34d399;
+    }
+
+    .status.fail {
+      background: rgba(248, 113, 113, 0.15);
+      color: #f87171;
+    }
+
+    .status.running {
+      background: rgba(99, 102, 241, 0.15);
+      color: #6366f1;
+      animation: pulse 1s infinite;
+    }
+
+    @keyframes pulse {
+
+      0%,
+      100% {
+        opacity: 1;
+      }
+
+      50% {
+        opacity: 0.5;
+      }
+    }
+
+    .test-name {
+      flex: 1;
+    }
+
     .test-detail {
       font-family: 'JetBrains Mono', monospace;
       font-size: 11px;
       color: #55556a;
     }
+
     .run-btn {
       display: inline-flex;
       align-items: center;
@@ -83,79 +132,163 @@
       margin-bottom: 24px;
       transition: all 0.2s;
     }
-    .run-btn:hover { filter: brightness(1.15); box-shadow: 0 4px 18px rgba(99,102,241,0.4); }
+
+    .run-btn:hover {
+      filter: brightness(1.15);
+      box-shadow: 0 4px 18px rgba(99, 102, 241, 0.4);
+    }
+
     .summary {
       font-size: 14px;
       padding: 12px 16px;
       border-radius: 8px;
       margin-top: 16px;
     }
-    .summary.all-pass { background: rgba(52,211,153,0.1); border: 1px solid rgba(52,211,153,0.2); color: #34d399; }
-    .summary.has-fail { background: rgba(248,113,113,0.1); border: 1px solid rgba(248,113,113,0.2); color: #f87171; }
+
+    .summary.all-pass {
+      background: rgba(52, 211, 153, 0.1);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+      color: #34d399;
+    }
+
+    .summary.has-fail {
+      background: rgba(248, 113, 113, 0.1);
+      border: 1px solid rgba(248, 113, 113, 0.2);
+      color: #f87171;
+    }
   </style>
 </head>
+
 <body>
 
-<h1>MediaSniff Component Tests</h1>
-<h2>Validating HLS parser, DASH parser, WASM muxer, and segment downloader</h2>
+  <h1>MediaSniff Component Tests</h1>
+  <h2>Validating HLS parser, DASH parser, WASM muxer, and segment downloader</h2>
 
-<button class="run-btn" id="runTests" onclick="runAllTests()">▶ Run All Tests</button>
+  <button class="run-btn" id="runTests" onclick="runAllTests()">▶ Run All Tests</button>
 
-<div class="test-group" id="hlsTests">
-  <h3>HLS Parser</h3>
-  <div class="test-item" id="hls-1"><div class="status running">…</div><div class="test-name">Parse master playlist</div><div class="test-detail"></div></div>
-  <div class="test-item" id="hls-2"><div class="status running">…</div><div class="test-name">Extract quality variants</div><div class="test-detail"></div></div>
-  <div class="test-item" id="hls-3"><div class="status running">…</div><div class="test-name">Parse media playlist segments</div><div class="test-detail"></div></div>
-  <div class="test-item" id="hls-4"><div class="status running">…</div><div class="test-name">Resolve relative URLs</div><div class="test-detail"></div></div>
-  <div class="test-item" id="hls-5"><div class="status running">…</div><div class="test-name">Detect encryption</div><div class="test-detail"></div></div>
-</div>
+  <div class="test-group" id="hlsTests">
+    <h3>HLS Parser</h3>
+    <div class="test-item" id="hls-1">
+      <div class="status running">…</div>
+      <div class="test-name">Parse master playlist</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="hls-2">
+      <div class="status running">…</div>
+      <div class="test-name">Extract quality variants</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="hls-3">
+      <div class="status running">…</div>
+      <div class="test-name">Parse media playlist segments</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="hls-4">
+      <div class="status running">…</div>
+      <div class="test-name">Resolve relative URLs</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="hls-5">
+      <div class="status running">…</div>
+      <div class="test-name">Detect encryption</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
 
-<div class="test-group" id="dashTests">
-  <h3>DASH Parser</h3>
-  <div class="test-item" id="dash-1"><div class="status running">…</div><div class="test-name">Parse MPD manifest</div><div class="test-detail"></div></div>
-  <div class="test-item" id="dash-2"><div class="status running">…</div><div class="test-name">Extract video representations</div><div class="test-detail"></div></div>
-  <div class="test-item" id="dash-3"><div class="status running">…</div><div class="test-name">Extract audio adaptation sets</div><div class="test-detail"></div></div>
-  <div class="test-item" id="dash-4"><div class="status running">…</div><div class="test-name">Parse ISO 8601 duration</div><div class="test-detail"></div></div>
-</div>
+  <div class="test-group" id="dashTests">
+    <h3>DASH Parser</h3>
+    <div class="test-item" id="dash-1">
+      <div class="status running">…</div>
+      <div class="test-name">Parse MPD manifest</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="dash-2">
+      <div class="status running">…</div>
+      <div class="test-name">Extract video representations</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="dash-3">
+      <div class="status running">…</div>
+      <div class="test-name">Extract audio adaptation sets</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="dash-4">
+      <div class="status running">…</div>
+      <div class="test-name">Parse ISO 8601 duration</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
 
-<div class="test-group" id="wasmTests">
-  <h3>WASM Muxer</h3>
-  <div class="test-item" id="wasm-1"><div class="status running">…</div><div class="test-name">Compile WASM module</div><div class="test-detail"></div></div>
-  <div class="test-item" id="wasm-2"><div class="status running">…</div><div class="test-name">Instantiate with memory</div><div class="test-detail"></div></div>
-  <div class="test-item" id="wasm-3"><div class="status running">…</div><div class="test-name">memcpy_interleave function</div><div class="test-detail"></div></div>
-  <div class="test-item" id="wasm-4"><div class="status running">…</div><div class="test-name">ISO BMFF box parsing</div><div class="test-detail"></div></div>
-  <div class="test-item" id="wasm-5"><div class="status running">…</div><div class="test-name">Format detection (MP4 vs TS)</div><div class="test-detail"></div></div>
-</div>
+  <div class="test-group" id="wasmTests">
+    <h3>WASM Muxer</h3>
+    <div class="test-item" id="wasm-1">
+      <div class="status running">…</div>
+      <div class="test-name">Compile WASM module</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="wasm-2">
+      <div class="status running">…</div>
+      <div class="test-name">Instantiate with memory</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="wasm-3">
+      <div class="status running">…</div>
+      <div class="test-name">memcpy_interleave function</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="wasm-4">
+      <div class="status running">…</div>
+      <div class="test-name">ISO BMFF box parsing</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="wasm-5">
+      <div class="status running">…</div>
+      <div class="test-name">Format detection (MP4 vs TS)</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
 
-<div class="test-group" id="transmuxTests">
-  <h3>Transmuxer</h3>
-  <div class="test-item" id="tx-1"><div class="status running">…</div><div class="test-name">Merge TS segments</div><div class="test-detail"></div></div>
-  <div class="test-item" id="tx-2"><div class="status running">…</div><div class="test-name">Merge fMP4 segments</div><div class="test-detail"></div></div>
-  <div class="test-item" id="tx-3"><div class="status running">…</div><div class="test-name">Auto-detect format</div><div class="test-detail"></div></div>
-</div>
+  <div class="test-group" id="transmuxTests">
+    <h3>Transmuxer</h3>
+    <div class="test-item" id="tx-1">
+      <div class="status running">…</div>
+      <div class="test-name">Merge TS segments</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tx-2">
+      <div class="status running">…</div>
+      <div class="test-name">Merge fMP4 segments</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tx-3">
+      <div class="status running">…</div>
+      <div class="test-name">Auto-detect format</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
 
-<div id="summary"></div>
+  <div id="summary"></div>
 
-<script type="module">
-import { HLSParser } from './lib/hls-parser.js';
-import { DASHParser } from './lib/dash-parser.js';
-import { WASMMuxer } from './lib/muxer.js';
-import { Transmuxer } from './lib/transmuxer.js';
+  <script type="module">
+    import { HLSParser } from './lib/hls-parser.js';
+    import { DASHParser } from './lib/dash-parser.js';
+    import { WASMMuxer } from './lib/muxer.js';
+    import { Transmuxer } from './lib/transmuxer.js';
 
-let passed = 0, failed = 0;
+    let passed = 0, failed = 0;
 
-function setResult(id, pass, detail = '') {
-  const el = document.getElementById(id);
-  const status = el.querySelector('.status');
-  const detailEl = el.querySelector('.test-detail');
-  status.className = `status ${pass ? 'pass' : 'fail'}`;
-  status.textContent = pass ? '✓' : '✗';
-  detailEl.textContent = detail;
-  if (pass) passed++; else failed++;
-}
+    function setResult(id, pass, detail = '') {
+      const el = document.getElementById(id);
+      const status = el.querySelector('.status');
+      const detailEl = el.querySelector('.test-detail');
+      status.className = `status ${pass ? 'pass' : 'fail'}`;
+      status.textContent = pass ? '✓' : '✗';
+      detailEl.textContent = detail;
+      if (pass) passed++; else failed++;
+    }
 
-// ─── Test Data ──────────────────────────────────────────────────
-const MASTER_M3U8 = `#EXTM3U
+    // ─── Test Data ──────────────────────────────────────────────────
+    const MASTER_M3U8 = `#EXTM3U
 #EXT-X-STREAM-INF:BANDWIDTH=1280000,RESOLUTION=1280x720,CODECS="avc1.640020,mp4a.40.2"
 720p/playlist.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=2560000,RESOLUTION=1920x1080,CODECS="avc1.640028,mp4a.40.2"
@@ -165,7 +298,7 @@ const MASTER_M3U8 = `#EXTM3U
 #EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="English",LANGUAGE="en",DEFAULT=YES,URI="audio/en.m3u8"
 `;
 
-const MEDIA_M3U8 = `#EXTM3U
+    const MEDIA_M3U8 = `#EXTM3U
 #EXT-X-TARGETDURATION:10
 #EXT-X-MEDIA-SEQUENCE:0
 #EXT-X-KEY:METHOD=AES-128,URI="https://example.com/key.bin",IV=0x00000001
@@ -178,7 +311,7 @@ segment2.ts
 #EXT-X-ENDLIST
 `;
 
-const MPD_XML = `<?xml version="1.0" encoding="UTF-8"?>
+    const MPD_XML = `<?xml version="1.0" encoding="UTF-8"?>
 <MPD type="static" mediaPresentationDuration="PT1H30M45.5S">
   <Period>
     <AdaptationSet contentType="video" mimeType="video/mp4">
@@ -197,130 +330,131 @@ const MPD_XML = `<?xml version="1.0" encoding="UTF-8"?>
   </Period>
 </MPD>`;
 
-// ─── Test Runner ────────────────────────────────────────────────
-window.runAllTests = async function() {
-  passed = 0; failed = 0;
-  document.getElementById('summary').innerHTML = '';
+    // ─── Test Runner ────────────────────────────────────────────────
+    window.runAllTests = async function () {
+      passed = 0; failed = 0;
+      document.getElementById('summary').innerHTML = '';
 
-  // Reset all statuses
-  document.querySelectorAll('.status').forEach(s => { s.className = 'status running'; s.textContent = '…'; });
-  document.querySelectorAll('.test-detail').forEach(d => { d.textContent = ''; });
+      // Reset all statuses
+      document.querySelectorAll('.status').forEach(s => { s.className = 'status running'; s.textContent = '…'; });
+      document.querySelectorAll('.test-detail').forEach(d => { d.textContent = ''; });
 
-  // HLS Tests
-  try {
-    const master = HLSParser.parse(MASTER_M3U8, 'https://cdn.example.com/stream/master.m3u8');
-    setResult('hls-1', master.type === 'master', `type=${master.type}`);
-    setResult('hls-2', master.variants.length === 3 && master.variants[0].height === 1080, `${master.variants.length} variants, top=${master.variants[0].label}`);
-  } catch (e) {
-    setResult('hls-1', false, e.message);
-    setResult('hls-2', false, 'skipped');
-  }
+      // HLS Tests
+      try {
+        const master = HLSParser.parse(MASTER_M3U8, 'https://cdn.example.com/stream/master.m3u8');
+        setResult('hls-1', master.type === 'master', `type=${master.type}`);
+        setResult('hls-2', master.variants.length === 3 && master.variants[0].height === 1080, `${master.variants.length} variants, top=${master.variants[0].label}`);
+      } catch (e) {
+        setResult('hls-1', false, e.message);
+        setResult('hls-2', false, 'skipped');
+      }
 
-  try {
-    const media = HLSParser.parse(MEDIA_M3U8, 'https://cdn.example.com/stream/720p/playlist.m3u8');
-    setResult('hls-3', media.segments.length === 3 && Math.abs(media.totalDuration - 27.7) < 0.1, `${media.segments.length} segs, ${media.totalDuration.toFixed(1)}s`);
-    setResult('hls-4', media.segments[0].url === 'https://cdn.example.com/stream/720p/segment0.ts', media.segments[0].url.slice(-20));
-    setResult('hls-5', media.isEncrypted === true && media.encryptionMethod === 'AES-128', `encrypted=${media.isEncrypted}, method=${media.encryptionMethod}`);
-  } catch (e) {
-    setResult('hls-3', false, e.message);
-    setResult('hls-4', false, 'skipped');
-    setResult('hls-5', false, 'skipped');
-  }
+      try {
+        const media = HLSParser.parse(MEDIA_M3U8, 'https://cdn.example.com/stream/720p/playlist.m3u8');
+        setResult('hls-3', media.segments.length === 3 && Math.abs(media.totalDuration - 27.7) < 0.1, `${media.segments.length} segs, ${media.totalDuration.toFixed(1)}s`);
+        setResult('hls-4', media.segments[0].url === 'https://cdn.example.com/stream/720p/segment0.ts', media.segments[0].url.slice(-20));
+        setResult('hls-5', media.isEncrypted === true && media.encryptionMethod === 'AES-128', `encrypted=${media.isEncrypted}, method=${media.encryptionMethod}`);
+      } catch (e) {
+        setResult('hls-3', false, e.message);
+        setResult('hls-4', false, 'skipped');
+        setResult('hls-5', false, 'skipped');
+      }
 
-  // DASH Tests
-  try {
-    const mpd = DASHParser.parse(MPD_XML, 'https://cdn.example.com/dash/manifest.mpd');
-    setResult('dash-1', mpd.type === 'mpd' && mpd.periods.length === 1, `periods=${mpd.periods.length}`);
-    const videoReps = mpd.periods[0].videoSets[0].representations;
-    setResult('dash-2', videoReps.length === 2 && videoReps[0].height === 1080, `${videoReps.length} reps, top=${videoReps[0].label}`);
-    setResult('dash-3', mpd.periods[0].audioSets.length === 1, `${mpd.periods[0].audioSets.length} audio set(s)`);
-    setResult('dash-4', Math.abs(mpd.totalDuration - 5445.5) < 0.1, `${mpd.totalDuration}s`);
-  } catch (e) {
-    setResult('dash-1', false, e.message);
-    setResult('dash-2', false, 'skipped');
-    setResult('dash-3', false, 'skipped');
-    setResult('dash-4', false, 'skipped');
-  }
+      // DASH Tests
+      try {
+        const mpd = DASHParser.parse(MPD_XML, 'https://cdn.example.com/dash/manifest.mpd');
+        setResult('dash-1', mpd.type === 'mpd' && mpd.periods.length === 1, `periods=${mpd.periods.length}`);
+        const videoReps = mpd.periods[0].videoSets[0].representations;
+        setResult('dash-2', videoReps.length === 2 && videoReps[0].height === 1080, `${videoReps.length} reps, top=${videoReps[0].label}`);
+        setResult('dash-3', mpd.periods[0].audioSets.length === 1, `${mpd.periods[0].audioSets.length} audio set(s)`);
+        setResult('dash-4', Math.abs(mpd.totalDuration - 5445.5) < 0.1, `${mpd.totalDuration}s`);
+      } catch (e) {
+        setResult('dash-1', false, e.message);
+        setResult('dash-2', false, 'skipped');
+        setResult('dash-3', false, 'skipped');
+        setResult('dash-4', false, 'skipped');
+      }
 
-  // WASM Muxer Tests
-  try {
-    const wasmBytes = WASMMuxer.getRemuxWASM();
-    const wasmModule = await WebAssembly.compile(wasmBytes);
-    setResult('wasm-1', true, `${wasmBytes.length} bytes compiled`);
+      // WASM Muxer Tests
+      try {
+        const wasmBytes = WASMMuxer.getRemuxWASM();
+        const wasmModule = await WebAssembly.compile(wasmBytes);
+        setResult('wasm-1', true, `${wasmBytes.length} bytes compiled`);
 
-    const memory = new WebAssembly.Memory({ initial: 256, maximum: 1024 });
-    const instance = await WebAssembly.instantiate(wasmModule, { env: { memory } });
-    setResult('wasm-2', 'memcpy_interleave' in instance.exports && 'get_output_size' in instance.exports, 'exports OK');
+        const memory = new WebAssembly.Memory({ initial: 256, maximum: 1024 });
+        const instance = await WebAssembly.instantiate(wasmModule, { env: { memory } });
+        setResult('wasm-2', 'memcpy_interleave' in instance.exports && 'get_output_size' in instance.exports, 'exports OK');
 
-    // Test memcpy_interleave
-    const mem = new Uint8Array(memory.buffer);
-    mem[0] = 0xAA; mem[1] = 0xBB; // src1
-    mem[2] = 0xCC; mem[3] = 0xDD; // src2
-    instance.exports.memcpy_interleave(0, 2, 2, 2, 10);
-    const size = instance.exports.get_output_size();
-    const ok = size === 4 && mem[10] === 0xAA && mem[11] === 0xBB && mem[12] === 0xCC && mem[13] === 0xDD;
-    setResult('wasm-3', ok, `size=${size}, [${mem[10].toString(16)},${mem[11].toString(16)},${mem[12].toString(16)},${mem[13].toString(16)}]`);
-  } catch (e) {
-    setResult('wasm-1', false, e.message);
-    setResult('wasm-2', false, 'skipped');
-    setResult('wasm-3', false, 'skipped');
-  }
+        // Test memcpy_interleave
+        const mem = new Uint8Array(memory.buffer);
+        mem[0] = 0xAA; mem[1] = 0xBB; // src1
+        mem[2] = 0xCC; mem[3] = 0xDD; // src2
+        instance.exports.memcpy_interleave(0, 2, 2, 2, 10);
+        const size = instance.exports.get_output_size();
+        const ok = size === 4 && mem[10] === 0xAA && mem[11] === 0xBB && mem[12] === 0xCC && mem[13] === 0xDD;
+        setResult('wasm-3', ok, `size=${size}, [${mem[10].toString(16)},${mem[11].toString(16)},${mem[12].toString(16)},${mem[13].toString(16)}]`);
+      } catch (e) {
+        setResult('wasm-1', false, e.message);
+        setResult('wasm-2', false, 'skipped');
+        setResult('wasm-3', false, 'skipped');
+      }
 
-  // ISO BMFF box parsing
-  try {
-    const ftyp = new Uint8Array([0,0,0,20, 0x66,0x74,0x79,0x70, 0x69,0x73,0x6f,0x6d, 0,0,0,0, 0x69,0x73,0x6f,0x6d]);
-    const boxes = WASMMuxer.parseBoxes(ftyp);
-    setResult('wasm-4', boxes.length === 1 && boxes[0].type === 'ftyp' && boxes[0].size === 20, `${boxes.length} box(es), type=${boxes[0]?.type}`);
-  } catch (e) {
-    setResult('wasm-4', false, e.message);
-  }
+      // ISO BMFF box parsing
+      try {
+        const ftyp = new Uint8Array([0, 0, 0, 20, 0x66, 0x74, 0x79, 0x70, 0x69, 0x73, 0x6f, 0x6d, 0, 0, 0, 0, 0x69, 0x73, 0x6f, 0x6d]);
+        const boxes = WASMMuxer.parseBoxes(ftyp);
+        setResult('wasm-4', boxes.length === 1 && boxes[0].type === 'ftyp' && boxes[0].size === 20, `${boxes.length} box(es), type=${boxes[0]?.type}`);
+      } catch (e) {
+        setResult('wasm-4', false, e.message);
+      }
 
-  // Format detection
-  try {
-    const mp4Buf = new ArrayBuffer(8);
-    const mp4View = new Uint8Array(mp4Buf);
-    mp4View.set([0,0,0,24, 0x66,0x74,0x79,0x70]); // ftyp
-    const tsBuf = new ArrayBuffer(8);
-    new Uint8Array(tsBuf)[0] = 0x47; // TS sync byte
-    const mp4Fmt = WASMMuxer.detectFormat(mp4Buf);
-    const tsFmt = WASMMuxer.detectFormat(tsBuf);
-    setResult('wasm-5', mp4Fmt === 'mp4' && tsFmt === 'ts', `mp4=${mp4Fmt}, ts=${tsFmt}`);
-  } catch (e) {
-    setResult('wasm-5', false, e.message);
-  }
+      // Format detection
+      try {
+        const mp4Buf = new ArrayBuffer(8);
+        const mp4View = new Uint8Array(mp4Buf);
+        mp4View.set([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]); // ftyp
+        const tsBuf = new ArrayBuffer(8);
+        new Uint8Array(tsBuf)[0] = 0x47; // TS sync byte
+        const mp4Fmt = WASMMuxer.detectFormat(mp4Buf);
+        const tsFmt = WASMMuxer.detectFormat(tsBuf);
+        setResult('wasm-5', mp4Fmt === 'mp4' && tsFmt === 'ts', `mp4=${mp4Fmt}, ts=${tsFmt}`);
+      } catch (e) {
+        setResult('wasm-5', false, e.message);
+      }
 
-  // Transmuxer Tests
-  try {
-    const seg1 = new Uint8Array([0x47, 0x01, 0x02, 0x03]).buffer;
-    const seg2 = new Uint8Array([0x47, 0x04, 0x05, 0x06]).buffer;
-    const blob = Transmuxer.merge(null, [seg1, seg2], 'ts');
-    setResult('tx-1', blob.size === 8 && blob.type === 'video/mp2t', `${blob.size} bytes, ${blob.type}`);
-  } catch (e) { setResult('tx-1', false, e.message); }
+      // Transmuxer Tests
+      try {
+        const seg1 = new Uint8Array([0x47, 0x01, 0x02, 0x03]).buffer;
+        const seg2 = new Uint8Array([0x47, 0x04, 0x05, 0x06]).buffer;
+        const blob = Transmuxer.merge(null, [seg1, seg2], 'ts');
+        setResult('tx-1', blob.size === 8 && blob.type === 'video/mp2t', `${blob.size} bytes, ${blob.type}`);
+      } catch (e) { setResult('tx-1', false, e.message); }
 
-  try {
-    const init = new Uint8Array([0,0,0,8, 0x66,0x74,0x79,0x70]).buffer;
-    const seg = new Uint8Array([0,0,0,8, 0x6d,0x64,0x61,0x74]).buffer;
-    const blob = Transmuxer.merge(init, [seg], 'mp4');
-    setResult('tx-2', blob.size === 16 && blob.type === 'video/mp4', `${blob.size} bytes, ${blob.type}`);
-  } catch (e) { setResult('tx-2', false, e.message); }
+      try {
+        const init = new Uint8Array([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]).buffer;
+        const seg = new Uint8Array([0, 0, 0, 8, 0x6d, 0x64, 0x61, 0x74]).buffer;
+        const blob = Transmuxer.merge(init, [seg], 'mp4');
+        setResult('tx-2', blob.size === 16 && blob.type === 'video/mp4', `${blob.size} bytes, ${blob.type}`);
+      } catch (e) { setResult('tx-2', false, e.message); }
 
-  try {
-    const ftypBuf = new Uint8Array([0,0,0,8, 0x66,0x74,0x79,0x70]).buffer;
-    const tsBuf = new Uint8Array([0x47, 0x00, 0x00, 0x00]).buffer;
-    const fmtMp4 = Transmuxer.detectFormat(ftypBuf, null);
-    const fmtTs = Transmuxer.detectFormat(null, tsBuf);
-    setResult('tx-3', fmtMp4 === 'mp4' && fmtTs === 'ts', `mp4=${fmtMp4}, ts=${fmtTs}`);
-  } catch (e) { setResult('tx-3', false, e.message); }
+      try {
+        const ftypBuf = new Uint8Array([0, 0, 0, 8, 0x66, 0x74, 0x79, 0x70]).buffer;
+        const tsBuf = new Uint8Array([0x47, 0x00, 0x00, 0x00]).buffer;
+        const fmtMp4 = Transmuxer.detectFormat(ftypBuf, null);
+        const fmtTs = Transmuxer.detectFormat(null, tsBuf);
+        setResult('tx-3', fmtMp4 === 'mp4' && fmtTs === 'ts', `mp4=${fmtMp4}, ts=${fmtTs}`);
+      } catch (e) { setResult('tx-3', false, e.message); }
 
-  // Summary
-  const total = passed + failed;
-  const summaryEl = document.getElementById('summary');
-  if (failed === 0) {
-    summaryEl.innerHTML = `<div class="summary all-pass">✓ All ${total} tests passed</div>`;
-  } else {
-    summaryEl.innerHTML = `<div class="summary has-fail">✗ ${failed} of ${total} tests failed</div>`;
-  }
-};
-</script>
+      // Summary
+      const total = passed + failed;
+      const summaryEl = document.getElementById('summary');
+      if (failed === 0) {
+        summaryEl.innerHTML = `<div class="summary all-pass">✓ All ${total} tests passed</div>`;
+      } else {
+        summaryEl.innerHTML = `<div class="summary has-fail">✗ ${failed} of ${total} tests failed</div>`;
+      }
+    };
+  </script>
 </body>
+
 </html>
