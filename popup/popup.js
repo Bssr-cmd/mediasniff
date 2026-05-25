@@ -378,6 +378,19 @@ function getSmartName(item) {
   else if (item.type === 'subtitle') ext = '.vtt';
   else if (item.mimeType?.includes('webm')) ext = '.webm';
 
+  // For YouTube downloads, dynamically determine extension based on selected format
+  if (item.source === 'youtube') {
+    const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
+    const ytQuality = ytQualitySelect ? parseInt(ytQualitySelect.value) : 1080;
+    
+    if (item.rawAdaptiveFormats && item.rawAdaptiveFormats.length > 0) {
+      const selectedFmt = item.rawAdaptiveFormats.find(f => f.height === ytQuality && f.mimeType?.includes('video/'));
+      if (selectedFmt && selectedFmt.mimeType?.includes('webm')) {
+        ext = '.webm';
+      }
+    }
+  }
+
   // Clean name
   name = name
     .replace(/&/g, 'and')

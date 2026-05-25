@@ -79,6 +79,37 @@ def find_ffmpeg():
         pass
         
     return None
+
+def auto_download_ffmpeg():
+    log("Auto-downloading FFmpeg static binary dependency...")
+    coapp_dir = os.path.dirname(os.path.abspath(__file__))
+    output_exe = os.path.join(coapp_dir, "ffmpeg.exe")
+    gz_path = os.path.join(coapp_dir, "ffmpeg.gz")
+    gz_url = "https://github.com/eugeneware/ffmpeg-static/releases/download/b5.0.1/win32-x64.gz"
+    
+    try:
+        import gzip
+        send_message({"status": "progress", "percent": 81, "statusLabel": "Downloading FFmpeg dependency..."})
+        req = urllib.request.Request(gz_url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, context=ctx) as response, open(gz_path, 'wb') as out_file:
+            out_file.write(response.read())
+            
+        send_message({"status": "progress", "percent": 83, "statusLabel": "Extracting FFmpeg binary..."})
+        with gzip.open(gz_path, 'rb') as f_in, open(output_exe, 'wb') as f_out:
+            f_out.write(f_in.read())
+            
+        log("FFmpeg dependency successfully auto-downloaded!")
+        return output_exe
+    except Exception as e:
+        log(f"Failed to auto-download FFmpeg: {e}")
+        return None
+    finally:
+        if os.path.exists(gz_path):
+            try:
+                os.remove(gz_path)
+            except:
+                pass
+
 def handle_download_and_mux(msg):
     video_url = msg.get("videoUrl")
     audio_url = msg.get("audioUrl")
@@ -92,8 +123,10 @@ def handle_download_and_mux(msg):
     output_path = os.path.join(downloads_dir, filename)
     log(f"Output path resolved: {output_path}")
     
-    temp_video = os.path.join(tempfile.gettempdir(), "ms_temp_video.mp4")
-    temp_audio = os.path.join(tempfile.gettempdir(), "ms_temp_audio.m4a")
+    import uuid
+    uid = uuid.uuid4().hex
+    temp_video = os.path.join(tempfile.gettempdir(), f"ms_temp_video_{uid}.mp4")
+    temp_audio = os.path.join(tempfile.gettempdir(), f"ms_temp_audio_{uid}.m4a")
     
     try:
         # 1. Download video
@@ -106,14 +139,17 @@ def handle_download_and_mux(msg):
         # 3. Locate FFmpeg
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
-            log("FFmpeg not found! Falling back to raw video copying.")
+            ffmpeg_bin = auto_download_ffmpeg()
+            
+        if not ffmpeg_bin:
+            log("FFmpeg not found and auto-download failed! Falling back to raw video copying.")
             # If no FFmpeg and no audio, copy video to destination
             if not audio_url:
                 os.replace(temp_video, output_path)
                 send_message({"status": "complete", "statusLabel": f"Saved: {filename}"})
                 return
             else:
-                raise Exception("FFmpeg not found on host system. Merging requires FFmpeg.")
+                raise Exception("FFmpeg not found on host system and auto-download failed. Merging requires FFmpeg.")
                 
         # 4. Mux tracks losslessly using FFmpeg
         send_message({"status": "progress", "percent": 85, "statusLabel": "Muxing tracks natively (FFmpeg)..."})
@@ -128,8 +164,20 @@ def handle_download_and_mux(msg):
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
         if result.returncode != 0:
-            log(f"FFmpeg failed with exit code {result.returncode}. Error: {result.stderr}")
-            raise Exception(f"FFmpeg muxing failed: {result.stderr[:100]}")
+            log(f"FFmpeg copy failed: {result.stderr}. Retrying with auto-encoding...")
+            # Fallback: copy video losslessly, transcode audio to highly compatible aac
+            cmd_fallback = [ffmpeg_bin]
+            if audio_url:
+                cmd_fallback += ["-i", temp_video, "-i", temp_audio, "-c:v", "copy", "-c:a", "aac", "-strict", "experimental", "-y", output_path]
+            else:
+                cmd_fallback += ["-i", temp_video, "-c:v", "copy", "-y", output_path]
+                
+            log(f"Executing fallback: {' '.join(cmd_fallback)}")
+            result = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            
+            if result.returncode != 0:
+                log(f"FFmpeg failed with exit code {result.returncode}. Error: {result.stderr}")
+                raise Exception(f"FFmpeg muxing failed: {result.stderr[:100]}")
             
         log("Lossless muxing completed successfully!")
         send_message({"status": "complete", "statusLabel": f"Saved to Downloads: {filename}"})

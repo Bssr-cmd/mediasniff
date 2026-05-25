@@ -223,7 +223,12 @@ class DownloadTask {
           .filter(f => f.mimeType?.startsWith('video/'))
           .map(f => ({ ...f, resolvedUrl: resolveStreamUrl(f) }))
           .filter(f => f.resolvedUrl)
-          .sort((a, b) => (b.height || 0) - (a.height || 0));
+          .sort((a, b) => {
+            const ha = a.height || 0;
+            const hb = b.height || 0;
+            if (ha !== hb) return hb - ha;
+            return (b.bitrate || 0) - (a.bitrate || 0);
+          });
           
         const audioStreams = adaptiveFormats
           .filter(f => f.mimeType?.startsWith('audio/'))
@@ -234,7 +239,13 @@ class DownloadTask {
         let bestVideo = videoStreams.find(f => (f.height || 0) <= targetHeight) || videoStreams[0];
         if (bestVideo) {
           videoUrl = bestVideo.resolvedUrl;
-          audioUrl = audioStreams[0]?.resolvedUrl || null;
+          
+          // Match the audio stream format container (webm vs mp4) to the video container!
+          const isWebmVideo = bestVideo.mimeType?.includes('webm');
+          const matchedAudio = audioStreams.find(a => isWebmVideo ? a.mimeType?.includes('webm') : a.mimeType?.includes('mp4')) 
+            || audioStreams[0];
+            
+          audioUrl = matchedAudio?.resolvedUrl || null;
           isCombined = false;
         }
       } catch (err) {
@@ -316,11 +327,34 @@ class DownloadTask {
           this.abortController.signal
         );
       }
-      this.reportProgress(80, 'Remuxing tracks (WASM)...', '');
+      this.reportProgress(80, 'Analyzing media format...', '');
       const videoBuffer = await videoBlob.arrayBuffer();
       const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
+
+      // Parse boxes to check if this is a fragmented MP4 stream
+      const videoBoxes = WASMMuxer.parseBoxes(new Uint8Array(videoBuffer));
+      const isFragmented = videoBoxes.some(b => b.type === 'moof');
+
+      if (audioBuffer && !isFragmented) {
+        // Standard MP4 tracks cannot be muxed in-browser without index rewriting.
+        // Save them as separate files to prevent file corruption!
+        this.reportProgress(85, 'Saving separate tracks (No Companion)...', '');
+        
+        // 1. Save video track
+        await this.triggerSave(videoBlob, resultFilename);
+        
+        // 2. Save audio track
+        const audioExt = resultFilename.includes('.webm') ? '.opus' : '.m4a';
+        const audioFilename = resultFilename.replace(/\.[^.]+$/, '') + '.audio' + audioExt;
+        await this.triggerSave(audioBlob, audioFilename);
+        
+        this.reportStatus('complete', 'Saved separate video & audio files!');
+        return;
+      }
+
+      this.reportProgress(85, 'Remuxing tracks (WASM)...', '');
       const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
-        const overall = Math.round(80 + progress * 0.16); // 80% to 96%
+        const overall = Math.round(85 + progress * 0.11); // 85% to 96%
         this.reportProgress(overall, 'Remuxing tracks (WASM)...', '');
       });
       finalBlob = muxedBlob;
@@ -372,20 +406,54 @@ class DownloadTask {
   }
   async triggerSave(blob, filename) {
     const url = URL.createObjectURL(blob);
+    const sanitized = filename
+      .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+      .replace(/\.\./g, '_')
+      .replace(/^\.+/, '')
+      .trim()
+      .substring(0, 200) || 'download.mp4';
+
     return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({
-        type: 'TRIGGER_DOWNLOAD_SAVE',
-        url: url,
-        filename: filename
-      }, (response) => {
-        // Clean up URL
-        setTimeout(() => URL.revokeObjectURL(url), 20000);
-        if (response && response.success) {
-          resolve(response.downloadId);
-        } else {
-          reject(new Error(response?.error || 'Download failed to trigger'));
-        }
-      });
+      if (typeof chrome !== 'undefined' && chrome.downloads && chrome.downloads.download) {
+        chrome.downloads.download({
+          url: url,
+          filename: sanitized,
+          saveAs: false
+        }, (downloadId) => {
+          setTimeout(() => URL.revokeObjectURL(url), 20000);
+          if (chrome.runtime.lastError) {
+            console.warn('[MediaSniff Offscreen] Direct downloads failed, trying background proxy:', chrome.runtime.lastError.message);
+            // Fallback to background page if direct call fails
+            chrome.runtime.sendMessage({
+              type: 'TRIGGER_DOWNLOAD_SAVE',
+              url: url,
+              filename: filename
+            }, (response) => {
+              if (response && response.success) {
+                resolve(response.downloadId);
+              } else {
+                reject(new Error(response?.error || 'Download failed to trigger'));
+              }
+            });
+          } else {
+            resolve(downloadId);
+          }
+        });
+      } else {
+        // Direct download API unavailable in this context, use standard background proxy
+        chrome.runtime.sendMessage({
+          type: 'TRIGGER_DOWNLOAD_SAVE',
+          url: url,
+          filename: filename
+        }, (response) => {
+          setTimeout(() => URL.revokeObjectURL(url), 20000);
+          if (response && response.success) {
+            resolve(response.downloadId);
+          } else {
+            reject(new Error(response?.error || 'Download failed to trigger'));
+          }
+        });
+      }
     });
   }
   cancel() {

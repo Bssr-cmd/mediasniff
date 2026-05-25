@@ -401,12 +401,41 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tabId = sender.tab.id;
       const tabMedia = getTabMedia(tabId);
       const info = message.videoInfo;
-      // Check if we already have this YouTube video
-      const alreadyHas = Array.from(tabMedia.values()).some(m => m.source === 'youtube' && m.youtubeId === info.videoId);
-      if (alreadyHas) return true;
+      // Check if we already have this YouTube video (could be placeholder registered by DOM_EMBED)
+      const existing = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId === info.videoId);
+      if (existing) {
+        if (existing.rawAdaptiveFormats && existing.rawAdaptiveFormats.length > 0) {
+          return true; // Already registered with full formats, skip
+        }
+        // Update placeholder with full player data
+        const videoFormats = (message.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/'));
+        const bestVideo = videoFormats.sort((a, b) => b.height - a.height)[0];
+        const qualityLabel = bestVideo
+          ? `${bestVideo.qualityLabel || bestVideo.height + 'p'} · ${formatBitrate(bestVideo.bitrate)}`
+          : 'Unknown';
+
+        existing.quality = qualityLabel;
+        existing.filename = info.author ? `${info.author} - ${info.title}` : info.title || existing.filename;
+        existing.thumbnail = info.thumbnail || existing.thumbnail;
+        existing.jsUrl = message.jsUrl;
+        existing.rawAdaptiveFormats = message.adaptiveFormats || [];
+        existing.rawFormats = message.formats || [];
+        existing.availableQualities = videoFormats
+          .sort((a, b) => (b.height || 0) - (a.height || 0))
+          .map(f => ({
+            label: f.qualityLabel || `${f.height}p`,
+            height: f.height,
+            width: f.width,
+            bitrate: f.bitrate,
+            itag: f.itag
+          }));
+        updateBadge(tabId);
+        notifyPopup(tabId);
+        return true;
+      }
       // Build quality info from adaptive formats
-      const videoFormats = (message.adaptiveFormats || []).filter(f => f.mimeType.startsWith('video/'));
-      const audioFormats = (message.adaptiveFormats || []).filter(f => f.mimeType.startsWith('audio/'));
+      const videoFormats = (message.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/'));
+      const audioFormats = (message.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('audio/'));
       const watchUrl = `https://www.youtube.com/watch?v=${info.videoId}`;
       // Build quality label for display (best available)
       const bestVideo = videoFormats.sort((a, b) => b.height - a.height)[0];
@@ -441,13 +470,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         jsUrl: message.jsUrl,
         rawAdaptiveFormats: message.adaptiveFormats || [],
         rawFormats: message.formats || [],
-        availableQualities: videoFormats.map(f => ({
-          label: f.qualityLabel || `${f.height}p`,
-          height: f.height,
-          width: f.width,
-          bitrate: f.bitrate,
-          itag: f.itag
-        })),
+        availableQualities: videoFormats
+          .sort((a, b) => (b.height || 0) - (a.height || 0))
+          .map(f => ({
+            label: f.qualityLabel || `${f.height}p`,
+            height: f.height,
+            width: f.width,
+            bitrate: f.bitrate,
+            itag: f.itag
+          })),
         timestamp: Date.now()
       });
       updateBadge(tabId);

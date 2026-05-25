@@ -223,7 +223,10 @@
         const text = script.textContent;
         if (!text) continue;
 
-        const match = text.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});\s*var\s/);
+        const match = text.match(/ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});/)
+          || text.match(/ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\})(?:;|$)/)
+          || text.match(/var\s+ytInitialPlayerResponse\s*=\s*(\{[\s\S]+?\});/)
+          || text.match(/window\[['"]ytInitialPlayerResponse['"]\]\s*=\s*(\{[\s\S]+?\});/);
         if (!match) continue;
 
         try {
@@ -243,11 +246,26 @@
               isLive: videoDetails.isLiveContent || false,
             };
 
-            // Collect adaptive formats — only send MINIMAL data to avoid 64MB message limit
-            // signatureCipher URLs are massive, so we never send raw URL strings
-            const formats = [];
+            const adaptiveFormats = [];
             if (streamingData.adaptiveFormats) {
               for (const fmt of streamingData.adaptiveFormats) {
+                adaptiveFormats.push({
+                  itag: fmt.itag,
+                  mimeType: fmt.mimeType || '',
+                  qualityLabel: fmt.qualityLabel || '',
+                  bitrate: fmt.bitrate || 0,
+                  width: fmt.width || 0,
+                  height: fmt.height || 0,
+                  contentLength: parseInt(fmt.contentLength) || 0,
+                  url: fmt.url || '',
+                  signatureCipher: fmt.signatureCipher || fmt.cipher || '',
+                });
+              }
+            }
+
+            const formats = [];
+            if (streamingData.formats) {
+              for (const fmt of streamingData.formats) {
                 formats.push({
                   itag: fmt.itag,
                   mimeType: fmt.mimeType || '',
@@ -256,8 +274,35 @@
                   width: fmt.width || 0,
                   height: fmt.height || 0,
                   contentLength: parseInt(fmt.contentLength) || 0,
-                  hasUrl: !!fmt.url, // just a flag — don't send actual URL
+                  url: fmt.url || '',
+                  signatureCipher: fmt.signatureCipher || fmt.cipher || '',
                 });
+              }
+            }
+
+            // Extract the player JS URL dynamically from loaded scripts or inline player config config/jsUrl properties
+            const allScripts = Array.from(document.querySelectorAll('script'));
+            let jsUrl = null;
+            for (const s of allScripts) {
+              const src = s.src || '';
+              if (src.includes('/base.js') || src.includes('/player_ias') || src.includes('/s/player/')) {
+                jsUrl = src;
+                break;
+              }
+            }
+            if (!jsUrl) {
+              for (const s of allScripts) {
+                const textContent = s.textContent || '';
+                const m = textContent.match(/"jsUrl"\s*:\s*"([^"]+)"/)
+                  || textContent.match(/"js"\s*:\s*"([^"]+)"/)
+                  || textContent.match(/ytplayer\.config\s*=\s*[\s\S]+?"js"\s*:\s*"([^"]+)"/)
+                  || textContent.match(/\/s\/player\/[a-zA-Z0-9_-]+\/player_ias\.vflset\/[a-zA-Z0-9_/-]+\/base\.js/);
+                if (m) {
+                  jsUrl = m[1] || m[0];
+                  if (jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
+                  else if (jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
+                  break;
+                }
               }
             }
 
@@ -265,8 +310,10 @@
               chrome.runtime.sendMessage({
                 type: 'YOUTUBE_DATA',
                 videoInfo: info,
+                adaptiveFormats: adaptiveFormats,
                 formats: formats,
-                hasAdaptiveFormats: formats.length > 0,
+                jsUrl: jsUrl,
+                hasAdaptiveFormats: adaptiveFormats.length > 0,
               });
             } catch (e) { /* message send failed */ }
           }
