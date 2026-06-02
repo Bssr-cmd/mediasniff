@@ -4,11 +4,37 @@ $ErrorActionPreference = "Stop"
 Write-Host "📡 MediaSniff Companion App Installer Starting..." -ForegroundColor Cyan
 # 1. Resolve paths
 $coappDir = $PSScriptRoot
+if (!$coappDir) {
+    $coappDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+}
+if (!$coappDir) {
+    $coappDir = (Get-Item "coapp").FullName
+}
 $extensionPath = (Get-Item "$coappDir\..").FullName
 $manifestPath = "$coappDir\net.mediasniff.coapp.json"
 $batPath = "$coappDir\coapp.bat"
 Write-Host "  -> Companion directory: $coappDir" -ForegroundColor Gray
 Write-Host "  -> Extension directory: $extensionPath" -ForegroundColor Gray
+
+# 1b. Resolve absolute Python path to bypass Microsoft WindowsApps alias sandbox failures
+Write-Host "Resolving absolute Python executable path..." -ForegroundColor Yellow
+$pythonExe = "python"
+try {
+    $realPython = (python -c 'import sys; print(sys.executable)').Trim()
+    if ($realPython -and (Test-Path $realPython)) {
+        $pythonExe = $realPython
+        Write-Host "  -> Resolved absolute Python: $pythonExe" -ForegroundColor Green
+    }
+} catch {
+    Write-Host "  -> Fallback to standard 'python'" -ForegroundColor Gray
+}
+
+# Write coapp.bat with the absolute Python path
+Write-Host "Configuring coapp.bat with absolute Python path..." -ForegroundColor Yellow
+$batContent = "@echo off`r`n`"$pythonExe`" -u `"%~dp0coapp.py`" %*`r`n"
+[System.IO.File]::WriteAllText($batPath, $batContent)
+Write-Host "  -> coapp.bat written successfully." -ForegroundColor Green
+
 # 2. Mathematically compute the unpacked Extension ID
 # Chrome unpacked IDs are calculated as the first 32 characters of the SHA-256 hash
 # of the absolute path of the extension directory, mapped to characters a-p (0->a, 15->p).

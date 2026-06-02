@@ -98,9 +98,53 @@ class DownloadTask {
     });
     this.downloader.abortController = this.abortController; // share abort controller
     const result = await this.downloader.downloadAll(segments, initUrl);
-    this.reportProgress(95, 'Merging chunks...', '');
-    const blob = Transmuxer.merge(result.init, result.segments);
-    await this.triggerSave(blob, this.options.filename);
+    this.reportProgress(90, 'Assembling video...', '');
+    const format = Transmuxer.detectFormat(result.init, result.segments[0]);
+
+    let finalBlob;
+    let finalFilename = this.options.filename;
+
+    if (format === 'ts') {
+      // MPEG-TS segments: TS already contains muxed audio+video.
+      // Simple concatenation produces a valid TS file.
+      // We MUST ensure the extension is .ts — saving TS data with .mp4
+      // extension causes "can't open this file" because players try to
+      // parse it as ISO BMFF and fail.
+      this.reportProgress(92, 'Merging TS segments...', '');
+      const parts = [];
+      for (const seg of result.segments) {
+        if (seg) parts.push(seg);
+      }
+      finalBlob = new Blob(parts, { type: 'video/mp2t' });
+      // Force .ts extension
+      finalFilename = finalFilename.replace(/\.[^.]+$/, '.ts');
+    } else {
+      // fMP4/CMAF segments: init segment (ftyp+moov) + media segments
+      // (moof+mdat). Build a proper MP4 by concatenating init + segments
+      // through WASMMuxer for correct box-level assembly.
+      this.reportProgress(92, 'Building MP4 container...', '');
+      try {
+        const rawBlob = Transmuxer.merge(result.init, result.segments);
+        const rawBuffer = await rawBlob.arrayBuffer();
+        // Route through WASMMuxer which handles fMP4 box-level assembly
+        // properly (moov merging, track IDs, fragment ordering)
+        finalBlob = await WASMMuxer.mux(rawBuffer, null, (progress) => {
+          const overall = Math.round(92 + progress * 0.06);
+          this.reportProgress(overall, 'Building MP4 container...', '');
+        });
+      } catch (muxErr) {
+        console.warn('[MediaSniff Offscreen] WASMMuxer failed, using direct merge:', muxErr.message);
+        // Fallback: direct concatenation (init + segments) should still
+        // produce a playable fMP4 file for most players
+        finalBlob = Transmuxer.merge(result.init, result.segments);
+      }
+      // Ensure .mp4 extension
+      if (!/\.mp4$/i.test(finalFilename)) {
+        finalFilename = finalFilename.replace(/\.[^.]+$/, '.mp4');
+      }
+    }
+
+    await this.triggerSave(finalBlob, finalFilename);
     this.reportStatus('complete', 'Complete!');
   }
   async downloadMux() {
@@ -172,9 +216,17 @@ class DownloadTask {
       const subName = this.options.filename.replace(/\.[^.]+$/, '') + '.' + (this.item.subtitles[0].format || 'vtt');
       await this.triggerSave(subBlob, subName);
     }
-    // 5. Save video
+    // 5. Save video — detect actual output format and fix extension
     this.reportProgress(98, 'Saving video...', '');
-    await this.triggerSave(muxedBlob, this.options.filename);
+    let muxFilename = this.options.filename;
+    const muxedBuffer = await muxedBlob.arrayBuffer();
+    const outputFormat = WASMMuxer.detectFormat(muxedBuffer);
+    if (outputFormat === 'ts') {
+      muxFilename = muxFilename.replace(/\.[^.]+$/, '.ts');
+    } else if (!/\.mp4$/i.test(muxFilename)) {
+      muxFilename = muxFilename.replace(/\.[^.]+$/, '.mp4');
+    }
+    await this.triggerSave(new Blob([muxedBuffer], { type: outputFormat === 'ts' ? 'video/mp2t' : 'video/mp4' }), muxFilename);
     this.reportStatus('complete', 'Complete!');
   }
   async downloadYouTube() {
@@ -190,23 +242,31 @@ class DownloadTask {
         console.log(`[MediaSniff Offscreen] Resolving stream directly from intercepted formats!`);
         const adaptiveFormats = this.item.rawAdaptiveFormats;
         const formats = this.item.rawFormats || [];
-        
+
+        console.log(`[MediaSniff YouTube] adaptiveFormats count: ${adaptiveFormats.length}, formats count: ${formats.length}`);
+
+        // Log what URL/cipher data we have
+        const withUrl = adaptiveFormats.filter(f => f.url);
+        const withCipher = adaptiveFormats.filter(f => f.signatureCipher || f.cipher);
+        console.log(`[MediaSniff YouTube] Formats with direct URL: ${withUrl.length}, with cipher: ${withCipher.length}`);
+
         const hasCipher = adaptiveFormats.some(f => f.signatureCipher || f.cipher)
           || formats.some(f => f.signatureCipher || f.cipher);
-          
+
         let decipher = null;
         if (hasCipher && this.item.jsUrl) {
           decipher = await YouTubeDownloader.getDecipherFunction(this.item.jsUrl);
+          console.log(`[MediaSniff YouTube] Decipher function: ${decipher ? 'LOADED' : 'FAILED'}`);
         }
-        
+
         const resolveStreamUrl = (fmt) => {
           if (fmt.url) return fmt.url;
           const cipherStr = fmt.signatureCipher || fmt.cipher;
           if (!cipherStr) return null;
-          
+
           const parsed = parseCipher(cipherStr);
           if (!parsed.url) return null;
-          
+
           if (parsed.s && decipher) {
             const signature = decipher(parsed.s);
             const urlObj = new URL(parsed.url);
@@ -218,7 +278,7 @@ class DownloadTask {
         };
 
         const targetHeight = parseInt(this.options.ytQuality) || 1080;
-        
+
         const videoStreams = adaptiveFormats
           .filter(f => f.mimeType?.startsWith('video/'))
           .map(f => ({ ...f, resolvedUrl: resolveStreamUrl(f) }))
@@ -229,28 +289,35 @@ class DownloadTask {
             if (ha !== hb) return hb - ha;
             return (b.bitrate || 0) - (a.bitrate || 0);
           });
-          
+
         const audioStreams = adaptiveFormats
           .filter(f => f.mimeType?.startsWith('audio/'))
           .map(f => ({ ...f, resolvedUrl: resolveStreamUrl(f) }))
           .filter(f => f.resolvedUrl)
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
-          
+
+        console.log(`[MediaSniff YouTube] Resolved video streams: ${videoStreams.length}, audio streams: ${audioStreams.length}`);
+
         let bestVideo = videoStreams.find(f => (f.height || 0) <= targetHeight) || videoStreams[0];
         if (bestVideo) {
           videoUrl = bestVideo.resolvedUrl;
-          
-          // Match the audio stream format container (webm vs mp4) to the video container!
+
+          // Match the audio stream format container (webm vs mp4) to the video container
           const isWebmVideo = bestVideo.mimeType?.includes('webm');
-          const matchedAudio = audioStreams.find(a => isWebmVideo ? a.mimeType?.includes('webm') : a.mimeType?.includes('mp4')) 
+          const matchedAudio = audioStreams.find(a => isWebmVideo ? a.mimeType?.includes('webm') : a.mimeType?.includes('mp4'))
             || audioStreams[0];
-            
+
           audioUrl = matchedAudio?.resolvedUrl || null;
           isCombined = false;
+          console.log(`[MediaSniff YouTube] Selected video: ${bestVideo.height}p ${bestVideo.mimeType}, audio: ${matchedAudio ? matchedAudio.mimeType : 'NONE'}`);
+        } else {
+          console.warn(`[MediaSniff YouTube] No video streams could be resolved from rawAdaptiveFormats`);
         }
       } catch (err) {
         console.warn(`[MediaSniff Offscreen] Direct resolution from memory registry failed:`, err.message);
       }
+    } else {
+      console.log(`[MediaSniff YouTube] No rawAdaptiveFormats available on this item`);
     }
 
     // Fallback: If not resolved directly or failed, fetch via our network signature/Invidious scraper
@@ -265,14 +332,23 @@ class DownloadTask {
 
     if (this.item.directVideoUrls && this.item.directVideoUrls[this.options.ytQuality]) {
       videoUrl = this.item.directVideoUrls[this.options.ytQuality];
-      audioUrl = this.item.directAudioUrls && this.item.directAudioUrls['default'];
-      isCombined = false; // Intercepted player streams are separate formats
+      // Only override audioUrl if a direct intercepted audio URL actually exists.
+      // Otherwise keep the audioUrl already resolved from rawAdaptiveFormats/getDownloadUrl
+      // — overwriting it with undefined was causing no-audio downloads.
+      const directAudio = this.item.directAudioUrls && this.item.directAudioUrls['default'];
+      if (directAudio) {
+        audioUrl = directAudio;
+      }
+      isCombined = false;
       console.log(`[MediaSniff Offscreen] Intercepted stream detected in registry:`, videoUrl);
     }
     
     if (!videoUrl) {
       throw new Error('API_UNAVAILABLE');
     }
+
+    console.log(`[MediaSniff YouTube] Video URL resolved: ${videoUrl ? 'YES' : 'NO'}`);
+    console.log(`[MediaSniff YouTube] Audio URL resolved: ${audioUrl ? 'YES' : 'NO'}, isCombined: ${isCombined}`);
     
     // ─── Pipeline 1: Native Messaging Companion App (Lossless FFmpeg Merging) ───
     try {
@@ -317,47 +393,53 @@ class DownloadTask {
       let audioBlob = null;
 
       if (audioUrl) {
-        this.reportProgress(50, 'Downloading audio stream...', '');
-        audioBlob = await YouTubeDownloader.downloadStream(
-          audioUrl,
-          (p) => {
-            const overall = Math.round(50 + p.percent * 0.30); // 50% to 80%
-            this.reportProgress(overall, `Audio: ${p.sizeLabel}`, p.speedLabel);
-          },
-          this.abortController.signal
-        );
+        try {
+          this.reportProgress(50, 'Downloading audio stream...', '');
+          audioBlob = await YouTubeDownloader.downloadStream(
+            audioUrl,
+            (p) => {
+              const overall = Math.round(50 + p.percent * 0.30); // 50% to 80%
+              this.reportProgress(overall, `Audio: ${p.sizeLabel}`, p.speedLabel);
+            },
+            this.abortController.signal
+          );
+        } catch (audioErr) {
+          console.warn('[MediaSniff YouTube] Audio stream download failed, continuing with video only:', audioErr.message);
+          audioBlob = null;
+        }
       }
-      this.reportProgress(80, 'Analyzing media format...', '');
+
+      this.reportProgress(80, 'Preparing to merge...', '');
       const videoBuffer = await videoBlob.arrayBuffer();
       const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
 
-      // Parse boxes to check if this is a fragmented MP4 stream
-      const videoBoxes = WASMMuxer.parseBoxes(new Uint8Array(videoBuffer));
-      const isFragmented = videoBoxes.some(b => b.type === 'moof');
-
-      if (audioBuffer && !isFragmented) {
-        // Standard MP4 tracks cannot be muxed in-browser without index rewriting.
-        // Save them as separate files to prevent file corruption!
-        this.reportProgress(85, 'Saving separate tracks (No Companion)...', '');
+      // Always attempt muxing through WASMMuxer.mux() — it auto-detects
+      // whether the input is fragmented MP4 or standard MP4 and routes
+      // to the correct muxing path (muxFMP4 or muxStandardMP4).
+      this.reportProgress(85, 'Remuxing tracks (WASM)...', '');
+      try {
+        const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
+          const overall = Math.round(85 + progress * 0.11); // 85% to 96%
+          this.reportProgress(overall, 'Remuxing tracks (WASM)...', '');
+        });
+        finalBlob = muxedBlob;
+      } catch (muxErr) {
+        console.warn('[MediaSniff YouTube] WASM muxing failed, falling back to saving separate files:', muxErr.message);
         
-        // 1. Save video track
+        // Save video file
         await this.triggerSave(videoBlob, resultFilename);
         
-        // 2. Save audio track
-        const audioExt = resultFilename.includes('.webm') ? '.opus' : '.m4a';
-        const audioFilename = resultFilename.replace(/\.[^.]+$/, '') + '.audio' + audioExt;
-        await this.triggerSave(audioBlob, audioFilename);
-        
-        this.reportStatus('complete', 'Saved separate video & audio files!');
+        // Save audio file if available
+        if (audioBlob) {
+          const audioExt = resultFilename.includes('.webm') ? '.opus' : '.m4a';
+          const audioFilename = resultFilename.replace(/\.[^.]+$/, '') + '.audio' + audioExt;
+          await this.triggerSave(audioBlob, audioFilename);
+          this.reportStatus('complete', 'Mux failed — saved separate video & audio files.');
+        } else {
+          this.reportStatus('complete', 'Saved video only (no audio available).');
+        }
         return;
       }
-
-      this.reportProgress(85, 'Remuxing tracks (WASM)...', '');
-      const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
-        const overall = Math.round(85 + progress * 0.11); // 85% to 96%
-        this.reportProgress(overall, 'Remuxing tracks (WASM)...', '');
-      });
-      finalBlob = muxedBlob;
     }
     this.reportProgress(98, 'Saving video...', '');
     await this.triggerSave(finalBlob, resultFilename);
@@ -420,14 +502,14 @@ class DownloadTask {
           filename: sanitized,
           saveAs: false
         }, (downloadId) => {
-          setTimeout(() => URL.revokeObjectURL(url), 20000);
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
           if (chrome.runtime.lastError) {
             console.warn('[MediaSniff Offscreen] Direct downloads failed, trying background proxy:', chrome.runtime.lastError.message);
             // Fallback to background page if direct call fails
             chrome.runtime.sendMessage({
               type: 'TRIGGER_DOWNLOAD_SAVE',
               url: url,
-              filename: filename
+              filename: sanitized
             }, (response) => {
               if (response && response.success) {
                 resolve(response.downloadId);
@@ -444,9 +526,9 @@ class DownloadTask {
         chrome.runtime.sendMessage({
           type: 'TRIGGER_DOWNLOAD_SAVE',
           url: url,
-          filename: filename
+          filename: sanitized
         }, (response) => {
-          setTimeout(() => URL.revokeObjectURL(url), 20000);
+          setTimeout(() => URL.revokeObjectURL(url), 60000);
           if (response && response.success) {
             resolve(response.downloadId);
           } else {

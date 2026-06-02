@@ -404,10 +404,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // Check if we already have this YouTube video (could be placeholder registered by DOM_EMBED)
       const existing = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId === info.videoId);
       if (existing) {
-        if (existing.rawAdaptiveFormats && existing.rawAdaptiveFormats.length > 0) {
-          return true; // Already registered with full formats, skip
-        }
-        // Update placeholder with full player data
+        // Update placeholder or existing card with latest player data
         const videoFormats = (message.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/'));
         const bestVideo = videoFormats.sort((a, b) => b.height - a.height)[0];
         const qualityLabel = bestVideo
@@ -417,18 +414,24 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         existing.quality = qualityLabel;
         existing.filename = info.author ? `${info.author} - ${info.title}` : info.title || existing.filename;
         existing.thumbnail = info.thumbnail || existing.thumbnail;
-        existing.jsUrl = message.jsUrl;
-        existing.rawAdaptiveFormats = message.adaptiveFormats || [];
-        existing.rawFormats = message.formats || [];
-        existing.availableQualities = videoFormats
-          .sort((a, b) => (b.height || 0) - (a.height || 0))
-          .map(f => ({
-            label: f.qualityLabel || `${f.height}p`,
-            height: f.height,
-            width: f.width,
-            bitrate: f.bitrate,
-            itag: f.itag
-          }));
+        if (message.jsUrl) existing.jsUrl = message.jsUrl;
+        if (message.adaptiveFormats && message.adaptiveFormats.length > 0) {
+          existing.rawAdaptiveFormats = message.adaptiveFormats;
+        }
+        if (message.formats && message.formats.length > 0) {
+          existing.rawFormats = message.formats;
+        }
+        if (videoFormats.length > 0) {
+          existing.availableQualities = videoFormats
+            .sort((a, b) => (b.height || 0) - (a.height || 0))
+            .map(f => ({
+              label: f.qualityLabel || `${f.height}p`,
+              height: f.height,
+              width: f.width,
+              bitrate: f.bitrate,
+              itag: f.itag
+            }));
+        }
         updateBadge(tabId);
         notifyPopup(tabId);
         return true;

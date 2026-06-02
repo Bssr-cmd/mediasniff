@@ -212,11 +212,153 @@
 
   // ─── YouTube Detection ──────────────────────────────────────────────
   let ytDataReported = false;
+  let lastReportedVideoId = null;
+  let lastReportedJsUrl = null;
+  let lastReportedFormatCount = 0;
+
+  // Listen for the player response from the page context
+  window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'MS_YT_RESPONSE') {
+      processYouTubePlayerResponse(event.data.data, event.data.jsUrl);
+    }
+  });
+
+  function injectPlayerResponseScraper() {
+    if (!location.hostname.includes('youtube.com')) return;
+    if (ytDataReported) return;
+    
+    try {
+      const script = document.createElement('script');
+      script.textContent = `
+        (function() {
+          try {
+            const moviePlayer = document.getElementById('movie_player');
+            const response = window.ytInitialPlayerResponse 
+              || (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function' && moviePlayer.getPlayerResponse());
+            if (response && response.streamingData) {
+              window.postMessage({ type: 'MS_YT_RESPONSE', data: response }, '*');
+            }
+          } catch(e) {}
+        })();
+      `;
+      (document.head || document.documentElement).appendChild(script);
+      script.remove();
+    } catch (e) { /* ignore */ }
+  }
+
+  function processYouTubePlayerResponse(data, mainWorldJsUrl) {
+    if (!data) return;
+    
+    const streamingData = data.streamingData;
+    const videoDetails = data.videoDetails;
+    if (!streamingData || !videoDetails) return;
+    
+    const videoId = videoDetails.videoId;
+    if (!videoId) return;
+
+    const adaptiveFormats = [];
+    if (streamingData.adaptiveFormats) {
+      for (const fmt of streamingData.adaptiveFormats) {
+        adaptiveFormats.push({
+          itag: fmt.itag,
+          mimeType: fmt.mimeType || '',
+          qualityLabel: fmt.qualityLabel || '',
+          bitrate: fmt.bitrate || 0,
+          width: fmt.width || 0,
+          height: fmt.height || 0,
+          contentLength: parseInt(fmt.contentLength) || 0,
+          url: fmt.url || '',
+          signatureCipher: fmt.signatureCipher || fmt.cipher || '',
+        });
+      }
+    }
+
+    const formats = [];
+    if (streamingData.formats) {
+      for (const fmt of streamingData.formats) {
+        formats.push({
+          itag: fmt.itag,
+          mimeType: fmt.mimeType || '',
+          qualityLabel: fmt.qualityLabel || '',
+          bitrate: fmt.bitrate || 0,
+          width: fmt.width || 0,
+          height: fmt.height || 0,
+          contentLength: parseInt(fmt.contentLength) || 0,
+          url: fmt.url || '',
+          signatureCipher: fmt.signatureCipher || fmt.cipher || '',
+        });
+      }
+    }
+
+    // Extract the player JS URL dynamically from loaded scripts or main world parameter
+    const allScripts = Array.from(document.querySelectorAll('script'));
+    let jsUrl = mainWorldJsUrl || null;
+    if (!jsUrl) {
+      for (const s of allScripts) {
+        const src = s.src || '';
+        if (src.includes('/base.js') || src.includes('/player_ias') || src.includes('/s/player/')) {
+          jsUrl = src;
+          break;
+        }
+      }
+    }
+    if (!jsUrl) {
+      for (const s of allScripts) {
+        const textContent = s.textContent || '';
+        const m = textContent.match(/"jsUrl"\s*:\s*"([^"]+)"/)
+          || textContent.match(/"js"\s*:\s*"([^"]+)"/)
+          || textContent.match(/ytplayer\.config\s*=\s*[\s\S]+?"js"\s*:\s*"([^"]+)"/)
+          || textContent.match(/\/s\/player\/[a-zA-Z0-9_-]+\/player_ias\.vflset\/[a-zA-Z0-9_/-]+\/base\.js/);
+        if (m) {
+          jsUrl = m[1] || m[0];
+          if (jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
+          else if (jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
+          break;
+        }
+      }
+    }
+
+    const formatCount = adaptiveFormats.length + formats.length;
+
+    // Check if we already reported this identical video & state to avoid spamming the background registry
+    if (lastReportedVideoId === videoId && lastReportedJsUrl === jsUrl && lastReportedFormatCount === formatCount && formatCount > 0) {
+      return;
+    }
+
+    lastReportedVideoId = videoId;
+    lastReportedJsUrl = jsUrl;
+    lastReportedFormatCount = formatCount;
+    ytDataReported = true;
+
+    const info = {
+      title: videoDetails.title || '',
+      author: videoDetails.author || '',
+      videoId: videoId,
+      lengthSeconds: parseInt(videoDetails.lengthSeconds) || 0,
+      thumbnail: videoDetails.thumbnail?.thumbnails?.pop()?.url || '',
+      isLive: videoDetails.isLiveContent || false,
+    };
+
+    try {
+      chrome.runtime.sendMessage({
+        type: 'YOUTUBE_DATA',
+        videoInfo: info,
+        adaptiveFormats: adaptiveFormats,
+        formats: formats,
+        jsUrl: jsUrl,
+        hasAdaptiveFormats: adaptiveFormats.length > 0,
+      });
+    } catch (e) { /* message send failed */ }
+  }
 
   function extractYouTubeData() {
     if (!location.hostname.includes('youtube.com')) return;
     if (ytDataReported) return;
 
+    // 1. Try dynamic main-world injection scraper (highest reliability)
+    injectPlayerResponseScraper();
+
+    // 2. Fallback: Parse static script tags (if injection failed or not executed yet)
     try {
       const scripts = document.querySelectorAll('script');
       for (const script of scripts) {
@@ -231,92 +373,7 @@
 
         try {
           const data = JSON.parse(match[1]);
-          const streamingData = data?.streamingData;
-          const videoDetails = data?.videoDetails;
-
-          if (streamingData && videoDetails) {
-            ytDataReported = true;
-
-            const info = {
-              title: videoDetails.title || '',
-              author: videoDetails.author || '',
-              videoId: videoDetails.videoId || '',
-              lengthSeconds: parseInt(videoDetails.lengthSeconds) || 0,
-              thumbnail: videoDetails.thumbnail?.thumbnails?.pop()?.url || '',
-              isLive: videoDetails.isLiveContent || false,
-            };
-
-            const adaptiveFormats = [];
-            if (streamingData.adaptiveFormats) {
-              for (const fmt of streamingData.adaptiveFormats) {
-                adaptiveFormats.push({
-                  itag: fmt.itag,
-                  mimeType: fmt.mimeType || '',
-                  qualityLabel: fmt.qualityLabel || '',
-                  bitrate: fmt.bitrate || 0,
-                  width: fmt.width || 0,
-                  height: fmt.height || 0,
-                  contentLength: parseInt(fmt.contentLength) || 0,
-                  url: fmt.url || '',
-                  signatureCipher: fmt.signatureCipher || fmt.cipher || '',
-                });
-              }
-            }
-
-            const formats = [];
-            if (streamingData.formats) {
-              for (const fmt of streamingData.formats) {
-                formats.push({
-                  itag: fmt.itag,
-                  mimeType: fmt.mimeType || '',
-                  qualityLabel: fmt.qualityLabel || '',
-                  bitrate: fmt.bitrate || 0,
-                  width: fmt.width || 0,
-                  height: fmt.height || 0,
-                  contentLength: parseInt(fmt.contentLength) || 0,
-                  url: fmt.url || '',
-                  signatureCipher: fmt.signatureCipher || fmt.cipher || '',
-                });
-              }
-            }
-
-            // Extract the player JS URL dynamically from loaded scripts or inline player config config/jsUrl properties
-            const allScripts = Array.from(document.querySelectorAll('script'));
-            let jsUrl = null;
-            for (const s of allScripts) {
-              const src = s.src || '';
-              if (src.includes('/base.js') || src.includes('/player_ias') || src.includes('/s/player/')) {
-                jsUrl = src;
-                break;
-              }
-            }
-            if (!jsUrl) {
-              for (const s of allScripts) {
-                const textContent = s.textContent || '';
-                const m = textContent.match(/"jsUrl"\s*:\s*"([^"]+)"/)
-                  || textContent.match(/"js"\s*:\s*"([^"]+)"/)
-                  || textContent.match(/ytplayer\.config\s*=\s*[\s\S]+?"js"\s*:\s*"([^"]+)"/)
-                  || textContent.match(/\/s\/player\/[a-zA-Z0-9_-]+\/player_ias\.vflset\/[a-zA-Z0-9_/-]+\/base\.js/);
-                if (m) {
-                  jsUrl = m[1] || m[0];
-                  if (jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
-                  else if (jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
-                  break;
-                }
-              }
-            }
-
-            try {
-              chrome.runtime.sendMessage({
-                type: 'YOUTUBE_DATA',
-                videoInfo: info,
-                adaptiveFormats: adaptiveFormats,
-                formats: formats,
-                jsUrl: jsUrl,
-                hasAdaptiveFormats: adaptiveFormats.length > 0,
-              });
-            } catch (e) { /* message send failed */ }
-          }
+          processYouTubePlayerResponse(data);
         } catch (e) { /* JSON parse failed */ }
         break;
       }

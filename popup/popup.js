@@ -69,7 +69,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     if (msg.type === 'BACKGROUND_DOWNLOAD_PROGRESS') {
       const { itemId, status, percent, statusLabel, speedLabel } = msg;
-      
+
       const progressEl = document.getElementById(`progress-${itemId}`);
       const fillEl = document.getElementById(`progressFill-${itemId}`);
       const statusEl = document.getElementById(`progressStatus-${itemId}`);
@@ -88,7 +88,7 @@ document.addEventListener('DOMContentLoaded', async () => {
             const item = mediaItems.find(m => m.id === itemId);
             if (item) {
               const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
-              navigator.clipboard.writeText(cmd).catch(() => {});
+              navigator.clipboard.writeText(cmd).catch(() => { });
               showToast('YouTube API failed. yt-dlp command copied!');
             }
           } else {
@@ -384,8 +384,9 @@ function getSmartName(item) {
     const ytQuality = ytQualitySelect ? parseInt(ytQualitySelect.value) : 1080;
     
     if (item.rawAdaptiveFormats && item.rawAdaptiveFormats.length > 0) {
-      const selectedFmt = item.rawAdaptiveFormats.find(f => f.height === ytQuality && f.mimeType?.includes('video/'));
-      if (selectedFmt && selectedFmt.mimeType?.includes('webm')) {
+      const webmFmt = item.rawAdaptiveFormats.find(f => f.height === ytQuality && f.mimeType?.includes('video/webm'));
+      const mp4Fmt = item.rawAdaptiveFormats.find(f => f.height === ytQuality && f.mimeType?.includes('video/mp4'));
+      if (webmFmt && !mp4Fmt) {
         ext = '.webm';
       }
     }
@@ -423,6 +424,12 @@ async function handleDownload(item) {
     return;
   }
 
+  // If HLS/DASH stream has separate audio renditions, we MUST mux it to get audio!
+  if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url)) {
+    await handleMuxDownload(item);
+    return;
+  }
+
   // Streaming download — delegate to background
   const qualitySelect = document.getElementById(`quality-${item.id}`);
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
@@ -445,9 +452,9 @@ async function handleYouTubeDownload(item) {
   chrome.runtime.sendMessage({
     type: 'START_DOWNLOAD',
     itemId: item.id,
-    item: { ...item, tabId: currentTabId },
+    item,
     downloadType: 'youtube',
-    options: { filename, ytQuality, tabId: currentTabId }
+    options: { filename, ytQuality }
   });
 }
 

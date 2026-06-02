@@ -134,7 +134,11 @@ def handle_download_and_mux(msg):
         
         # 2. Download audio if present
         if audio_url:
-            download_file(audio_url, temp_audio, "audio", 50, 80)
+            try:
+                download_file(audio_url, temp_audio, "audio", 50, 80)
+            except Exception as audio_err:
+                log(f"Audio download failed, falling back to video only: {audio_err}")
+                audio_url = None
         
         # 3. Locate FFmpeg
         ffmpeg_bin = find_ffmpeg()
