@@ -189,7 +189,7 @@ function createMediaCard(item) {
     <div class="card-header">
       ${item.thumbnail || pageThumbnail ? `
         <div class="card-thumb">
-          <img src="${escHtml(item.thumbnail || pageThumbnail)}" alt="" loading="lazy">
+          <img src="${escHtml(item.thumbnail || pageThumbnail)}" alt="" loading="lazy" onerror="if(this.src.includes('maxresdefault')){this.src=this.src.replace('maxresdefault','hqdefault')}else{this.style.display='none'}">
         </div>
       ` : ''}
       <div class="media-icon ${iconClass}">${iconSvg}</div>

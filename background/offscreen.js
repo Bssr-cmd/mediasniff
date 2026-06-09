@@ -3,6 +3,16 @@ import { Transmuxer } from '../lib/transmuxer.js';
 import { WASMMuxer } from '../lib/muxer.js';
 import { YouTubeDownloader } from '../lib/youtube-downloader.js';
 
+function remoteLog(msg, data = {}) {
+  try {
+    fetch('http://localhost:9999/log', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ msg, data })
+    }).catch(() => {});
+  } catch (e) {}
+}
+
 function parseCipher(cipherStr) {
   const params = {};
   const parts = cipherStr.split('&');
@@ -248,6 +258,7 @@ class DownloadTask {
         // Log what URL/cipher data we have
         const withUrl = adaptiveFormats.filter(f => f.url);
         const withCipher = adaptiveFormats.filter(f => f.signatureCipher || f.cipher);
+        remoteLog('offscreen: rawAdaptiveFormats available', { withUrl: withUrl.length, withCipher: withCipher.length });
         console.log(`[MediaSniff YouTube] Formats with direct URL: ${withUrl.length}, with cipher: ${withCipher.length}`);
 
         const hasCipher = adaptiveFormats.some(f => f.signatureCipher || f.cipher)
@@ -255,9 +266,23 @@ class DownloadTask {
 
         let decipher = null;
         if (hasCipher && this.item.jsUrl) {
-          decipher = await YouTubeDownloader.getDecipherFunction(this.item.jsUrl);
+          try {
+            decipher = await YouTubeDownloader.getDecipherFunction(this.item.jsUrl);
+            remoteLog('offscreen: getDecipherFunction success', { hasDecipher: !!decipher });
+          } catch(e) {
+            remoteLog('offscreen: getDecipherFunction CRASH', { error: e.message });
+          }
           console.log(`[MediaSniff YouTube] Decipher function: ${decipher ? 'LOADED' : 'FAILED'}`);
         }
+
+        const parseCipher = (cipher) => {
+          const params = new URLSearchParams(cipher);
+          return {
+            url: params.get('url'),
+            s: params.get('s'),
+            sp: params.get('sp') || 'sig'
+          };
+        };
 
         const resolveStreamUrl = (fmt) => {
           if (fmt.url) return fmt.url;
@@ -267,12 +292,18 @@ class DownloadTask {
           const parsed = parseCipher(cipherStr);
           if (!parsed.url) return null;
 
+
           if (parsed.s && decipher) {
-            const signature = decipher(parsed.s);
-            const urlObj = new URL(parsed.url);
-            urlObj.searchParams.set(parsed.sp, signature);
-            urlObj.searchParams.set('ratebypass', 'yes');
-            return urlObj.href;
+            try {
+              const signature = decipher(parsed.s);
+              const urlObj = new URL(parsed.url);
+              urlObj.searchParams.set(parsed.sp, signature);
+              urlObj.searchParams.set('ratebypass', 'yes');
+              return urlObj.href;
+            } catch (err) {
+              remoteLog('offscreen: decipher evaluation crashed', { error: err.message });
+              return parsed.url;
+            }
           }
           return parsed.url;
         };
@@ -280,8 +311,15 @@ class DownloadTask {
         const targetHeight = parseInt(this.options.ytQuality) || 1080;
 
         const videoStreams = adaptiveFormats
-          .filter(f => f.mimeType?.startsWith('video/'))
-          .map(f => ({ ...f, resolvedUrl: resolveStreamUrl(f) }))
+          .filter(f => f.mimeType?.startsWith('video/') && f.mimeType?.includes('mp4'))
+          .map(f => {
+             try {
+                return { ...f, resolvedUrl: resolveStreamUrl(f) };
+             } catch(e) {
+                remoteLog('offscreen: resolveStreamUrl CRASH', { error: e.message, f: f });
+                return { ...f, resolvedUrl: null };
+             }
+          })
           .filter(f => f.resolvedUrl)
           .sort((a, b) => {
             const ha = a.height || 0;
@@ -291,12 +329,20 @@ class DownloadTask {
           });
 
         const audioStreams = adaptiveFormats
-          .filter(f => f.mimeType?.startsWith('audio/'))
-          .map(f => ({ ...f, resolvedUrl: resolveStreamUrl(f) }))
+          .filter(f => f.mimeType?.startsWith('audio/') && f.mimeType?.includes('mp4'))
+          .map(f => {
+             try {
+                return { ...f, resolvedUrl: resolveStreamUrl(f) };
+             } catch(e) {
+                return { ...f, resolvedUrl: null };
+             }
+          })
           .filter(f => f.resolvedUrl)
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
         console.log(`[MediaSniff YouTube] Resolved video streams: ${videoStreams.length}, audio streams: ${audioStreams.length}`);
+
+        remoteLog('offscreen: resolved video/audio streams', { video: videoStreams.length, audio: audioStreams.length });
 
         let bestVideo = videoStreams.find(f => (f.height || 0) <= targetHeight) || videoStreams[0];
         if (bestVideo) {
@@ -309,21 +355,30 @@ class DownloadTask {
 
           audioUrl = matchedAudio?.resolvedUrl || null;
           isCombined = false;
-          console.log(`[MediaSniff YouTube] Selected video: ${bestVideo.height}p ${bestVideo.mimeType}, audio: ${matchedAudio ? matchedAudio.mimeType : 'NONE'}`);
+          
+          const title = this.item.title || 'Video';
+          resultFilename = `${title}${isWebmVideo ? '.webm' : '.mp4'}`;
+          
+          console.log(`[MediaSniff YouTube] Selected video: ${bestVideo.height}p ${bestVideo.mimeType}, audio: ${matchedAudio ? matchedAudio.mimeType : 'NONE'}, file: ${resultFilename}`);
         } else {
+          remoteLog('offscreen: bestVideo is missing', {});
           console.warn(`[MediaSniff YouTube] No video streams could be resolved from rawAdaptiveFormats`);
         }
       } catch (err) {
+        remoteLog('offscreen: rawAdaptiveFormats resolution block CRASHED', { error: err.message });
         console.warn(`[MediaSniff Offscreen] Direct resolution from memory registry failed:`, err.message);
       }
     } else {
+      remoteLog('offscreen: rawAdaptiveFormats is empty/null', { rawAdaptiveFormats: this.item.rawAdaptiveFormats });
       console.log(`[MediaSniff YouTube] No rawAdaptiveFormats available on this item`);
     }
 
     // Fallback: If not resolved directly or failed, fetch via our network signature/Invidious scraper
     if (!videoUrl) {
+      remoteLog('offscreen: videoUrl still null, falling back to getDownloadUrl', {});
       console.log(`[MediaSniff Offscreen] Direct memory resolution unavailable, starting network download url request`);
       const result = await YouTubeDownloader.getDownloadUrl(this.item.url, this.options.ytQuality || '1080');
+      remoteLog('offscreen: getDownloadUrl result', { resultUrl: result?.url });
       videoUrl = result?.url;
       audioUrl = result?.audioUrl;
       isCombined = result?.isCombined;
@@ -344,6 +399,7 @@ class DownloadTask {
     }
     
     if (!videoUrl) {
+      remoteLog('offscreen: API_UNAVAILABLE throwing now!', {});
       throw new Error('API_UNAVAILABLE');
     }
 

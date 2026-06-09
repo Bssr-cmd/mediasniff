@@ -10,8 +10,13 @@
   function getPlayerResponse() {
     try {
       const moviePlayer = document.getElementById('movie_player');
-      const response = window.ytInitialPlayerResponse 
-        || (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function' && moviePlayer.getPlayerResponse());
+      let response = null;
+      if (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function') {
+        response = moviePlayer.getPlayerResponse();
+      }
+      if (!response) {
+        response = window.ytInitialPlayerResponse;
+      }
       
       if (response && response.streamingData) {
         // Retrieve player base.js URL directly from global configuration (ytcfg) or script elements
