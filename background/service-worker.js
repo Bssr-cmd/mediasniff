@@ -4,6 +4,8 @@
  */
 import { HLSParser } from '../lib/hls-parser.js';
 import { DASHParser } from '../lib/dash-parser.js';
+import { MSG_TYPE, generateMediaId } from '../shared/protocol.js';
+import { handleUnifiedMessage } from '../shared/unified.js';
 // ─── Per-Tab Media Registry & Storage Sync ───────────────────────────
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
 let idCounter = 0;
@@ -671,18 +673,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'MANIFEST_DETECTED') {
-    if (sender.tab) {
-      const tabId = sender.tab.id;
-      handleManifestDetected({
-        tabId,
+  if (sender.tab) {
+    const tabId = sender.tab.id;
+    const mediaId = generateMediaId(message.manifestType || 'hls', message.url);
+    const unifiedMsg = {
+      type: MSG_TYPE.DETECT,
+      mediaId,
+      mediaInfo: {
+        source: message.manifestType || 'hls',
         url: message.url,
         content: message.content,
         manifestType: message.manifestType || 'hls',
         pageUrl: message.pageUrl || sender.tab.url,
-        title: message.title
-      });
-    }
-    return true;
+        title: message.title,
+      }
+    };
+    handleUnifiedMessage(unifiedMsg, tabId, mediaRegistry);
+    handleManifestDetected({
+      tabId,
+      url: message.url,
+      content: message.content,
+      manifestType: message.manifestType || 'hls',
+      pageUrl: message.pageUrl || sender.tab.url,
+      title: message.title
+    });
+  }
+  return true;
+}
+
+// duplicate block removed
   }
   if (message.type === 'DOM_MEDIA') {
     if (sender.tab) {
