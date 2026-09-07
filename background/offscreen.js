@@ -381,6 +381,9 @@ class DownloadTask {
           .filter(f => f.resolvedUrl)
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
 
+        this._resolvedVideoStreams = videoStreams;
+        this._resolvedAudioStreams = audioStreams;
+
         console.log(`[MediaSniff YouTube] Resolved video streams: ${videoStreams.length}, audio streams: ${audioStreams.length}`);
 
         let bestVideo = videoStreams.find(f => (f.height || 0) <= targetHeight) || videoStreams[0];
@@ -463,18 +466,21 @@ class DownloadTask {
       console.warn('[MediaSniff Offscreen] WASM Muxer cannot process WebM. Re-resolving to MP4 fallback.');
       try {
         const targetHeight = parseInt(this.options.ytQuality) || 1080;
-        const mp4V = this.item.rawAdaptiveFormats
+        // Rely on our already resolved streams if available, otherwise raw
+        const resolvedVideos = this._resolvedVideoStreams || this.item.rawAdaptiveFormats;
+        const resolvedAudios = this._resolvedAudioStreams || this.item.rawAdaptiveFormats;
+
+        const mp4V = resolvedVideos
           .filter(f => f.mimeType?.startsWith('video/') && f.mimeType?.includes('mp4'))
           .sort((a, b) => ((b.height || 0) - (a.height || 0)) || ((b.bitrate || 0) - (a.bitrate || 0)));
         const bestMp4 = mp4V.find(f => (f.height || 0) <= targetHeight) || mp4V[0];
 
-        const mp4A = this.item.rawAdaptiveFormats
+        const mp4A = resolvedAudios
           .filter(f => f.mimeType?.startsWith('audio/') && f.mimeType?.includes('mp4'))
           .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
         
         if (bestMp4) {
-          // Re-resolve URLs using basic fallback if no decipher available here
-          const getUrl = (f) => f.url || new URLSearchParams(f.signatureCipher || f.cipher).get('url');
+          const getUrl = (f) => f.resolvedUrl || f.url || new URLSearchParams(f.signatureCipher || f.cipher).get('url');
           videoUrl = getUrl(bestMp4);
           audioUrl = mp4A.length > 0 ? getUrl(mp4A[0]) : null;
           resultFilename = resultFilename.replace(/\.webm$/, '.mp4');
