@@ -1,76 +1,58 @@
-# 📡 MediaSniff Chrome Extension
+<div align="center">
+  <img src="icons/icon128.png" alt="MediaSniff Logo" width="128">
+  <h1>MediaSniff</h1>
+  <p><strong>A robust, ultra-fast browser extension for intercepting, processing, and multiplexing streaming media.</strong></p>
+</div>
 
-An advanced, high-performance browser extension (Manifest V3) designed to sniff, parse, and download video and audio streams. Featuring concurrent chunk downloading, in-browser WASM multiplexing, smart dynamic naming, and a premium glassmorphic dark-mode interface.
+<br />
 
----
+MediaSniff is an advanced Manifest V3 browser extension built for modern streaming protocols. Designed with performance and privacy in mind, it analyzes network traffic on-the-fly to intercept HLS and DASH streaming manifests, downloads segmented data concurrently, and merges audio/video tracks entirely inside the browser using WebAssembly. 
 
-## ✨ Features
+No external servers, no cloud processing, no bloated dependencies.
 
-- **📡 Advanced Network Sniffing**
-  - Live traffic interception of HLS (`.m3u8`) and DASH (`.mpd`) streaming playlists.
-  - Automatic detection of standard media types (`.mp4`, `.mp3`, `.webm`, etc.) and subtitles (`.vtt`, `.srt`).
-  - Native signature-protected stream analysis and resolution-tier retrieval.
+## 🌟 Core Capabilities
 
-- **⚡ Concurrent Segment Downloader**
-  - Downloads tiny `.ts` / `.m4s` chunks asynchronously using **8x parallel execution**.
-  - Auto-retries failed chunks with dynamic bandwidth speed estimation (MB/s).
+* **Intelligent Network Interception:** Monitors network traffic to sniff `.m3u8` and `.mpd` playlists, automatically filtering out dummy child nodes and cross-CDN duplicates to present a clean, unified view.
+* **Concurrent Chunk Harvesting:** Employs an asynchronous download pool (8x concurrency) to fetch video and audio segments in parallel, drastically reducing download times.
+* **In-Browser WASM Multiplexing:** Utilizes a custom WebAssembly muxer to interleave disparate audio and video streams into standard ISO BMFF `.mp4` containers right in your browser's memory.
+* **Segmented Subtitle Assembly:** Automatically detects HLS segmented subtitles, downloads individual `.vtt` chunks, strips out redundant headers, and seamlessly concatenates them into valid, player-ready subtitle files.
+* **Fallback Stream Resolution:** Gracefully handles unsupported codecs (like WebM) by intelligently falling back to the highest available MP4 equivalent.
+* **Premium UI:** A meticulously crafted, responsive popup interface featuring real-time bandwidth metrics, progress monitoring, and dynamic thumbnail extraction.
 
-- **🧩 In-Browser WASM Multiplexing**
-  - Seamlessly interleaves separate audio and video tracks into a unified `.mp4` file on the fly.
-  - Done entirely inside your browser using **WebAssembly**—zero server dependencies!
+## 🚀 Installation
 
-- **🖼️ Rich Media Previews**
-  - Dynamic thumbnail generation utilizing page-level OpenGraph, Twitter Cards, and schema markup.
-  - Standalone quality select badges and custom media card views.
+1. Clone or download this repository.
+2. Navigate to `chrome://extensions/` in your Chromium-based browser (Chrome, Edge, Brave, etc.).
+3. Toggle **Developer mode** in the top right corner.
+4. Click **Load unpacked** and select the `mediasniff` directory.
+5. Pin the extension to your toolbar.
 
-- **🧹 Smart Context Naming**
-  - Automatically sanitizes and generates friendly filenames (e.g. `Creator - Video Title (1080p).mp4`) using document metadata and stream resolution details.
-  - Smart deduplication filters out repetitive caching, CDN variations, and raw chunk listings.
+## 🏗️ Architecture & Stack
 
----
+MediaSniff is structured for maximum modularity and strictly adheres to modern Chrome Extension guidelines.
 
-## 🚀 Installation & Getting Started
+| Component | Responsibility |
+| :--- | :--- |
+| **Service Worker** | Network interception, state management, background download orchestration. |
+| **Offscreen Document** | Houses the WASM Muxer, DOMParser for DASH manifests, and memory-heavy segment assembly to keep the background worker lightweight. |
+| **Content Script** | Interrogates the DOM for rich metadata (OpenGraph/Twitter cards) to dynamically generate context-aware filenames and thumbnails. |
+| **Popup UI** | Communicates with the service worker via Message Passing to reflect real-time network discoveries and active background download states. |
 
-1. **Download / Clone** this repository to your local machine.
-2. Open Google Chrome and navigate to `chrome://extensions/`.
-3. Enable **Developer mode** using the toggle switch in the top-right corner.
-4. Click **Load unpacked** in the top-left corner.
-5. Select the `mediasniff` extension directory containing `manifest.json`.
-6. Pin **MediaSniff** to your extension bar and navigate to any page with media players to start sniffing!
+### Technical Highlights
+- **Manifest V3:** Fully compliant with Chrome's strictest security and background lifecycle rules.
+- **Zero-Dependency Core:** HLS/DASH parsing and TS transmuxing engines are written from scratch to minimize bundle size.
+- **Auto-Deduplication Engine:** Employs aggressive URL pathname analysis to ensure parent-child playlist relationships are respected and the UI remains clutter-free.
 
----
+## 🤝 Contributing
 
-## 📂 Project Architecture
+We welcome contributions from the community. Whether it's expanding codec support, optimizing the WASM pipeline, or refining the UI, please feel free to submit a Pull Request.
 
-```
-mediasniff/
-├── manifest.json                 # Manifest V3 Configuration
-├── background/
-│   └── service-worker.js         # Intercepts requests, handles badge counts & downloads
-├── content/
-│   └── content.js                # DOM mutation scanner, YouTube player scraper, and thumbnails
-├── lib/
-│   ├── dash-parser.js            # Standard-compliant DASH parser
-│   ├── hls-parser.js             # Standard-compliant HLS playlist parser
-│   ├── muxer.js                  # High-performance WASM Muxing layer
-│   ├── segment-downloader.js     # Asynchronous chunk manager with 8x concurrency
-│   └── transmuxer.js             # MPEG-TS to fMP4 repackager
-├── popup/
-│   ├── popup.html                # Premium glassmorphic structure
-│   ├── popup.css                 # Stunning styling, animations & radar sweeps
-│   └── popup.js                  # Popup view controller and variant select pipeline
-├── test.html                     # Visual automated component test runner
-└── preview.html                  # Component mock layout prototyping
-```
+1. Fork the repository
+2. Create your feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
----
+## 📄 License
 
-## 🛠️ Verification & Testing
-
-Open `test.html` directly in your browser or run it through local server hosting to validate HLS master parsers, DASH segment lists, WebAssembly memory bounds, and the transmuxer binary engine.
-
----
-
-## 📜 License
-
-This project is open-source and available under the [MIT License](LICENSE).
+Distributed under the MIT License. See `LICENSE` for more information.
