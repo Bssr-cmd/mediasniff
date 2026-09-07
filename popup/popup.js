@@ -801,6 +801,8 @@ async function handleDownload(item) {
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
   const filename = getSmartName(item);
 
+  downloadSubtitles(item, filename);
+
   setCardDownloadStarting(item.id, 'Starting stream download...');
 
   chrome.runtime.sendMessage({
@@ -816,7 +818,7 @@ async function handleYouTubeDownload(item) {
   const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
   const ytQuality = ytQualitySelect ? ytQualitySelect.value : '1080';
   const filename = getSmartName(item);
-
+  downloadSubtitles(item, filename);
   setCardDownloadStarting(item.id, 'Starting YouTube download...');
 
   chrome.runtime.sendMessage({
@@ -840,8 +842,9 @@ async function handleMuxDownload(item) {
 
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
   const audioIndex = audioSelect ? parseInt(audioSelect.value) : 0;
-  const embedSub = !!embedSubCheckbox?.checked;
   const filename = getSmartName(item);
+
+  downloadSubtitles(item, filename);
 
   setCardDownloadStarting(item.id, 'Starting mux download...');
 
@@ -850,7 +853,7 @@ async function handleMuxDownload(item) {
     itemId: item.id,
     item,
     downloadType: 'mux',
-    options: { filename, qualityIndex, audioIndex, embedSub }
+    options: { filename, qualityIndex, audioIndex }
   });
 }
 

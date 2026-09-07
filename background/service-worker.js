@@ -1348,7 +1348,8 @@ chrome.tabs.query({}, (tabs) => {
     for (const t of tabs) {
       if (t.id && t.url) {
         try {
-          tabLastOrigin.set(t.id, new URL(t.url).origin);
+          const urlObj = new URL(t.url);
+          tabLastOrigin.set(t.id, urlObj.origin + urlObj.pathname + urlObj.search);
         } catch (_) {}
       }
     }
@@ -1358,12 +1359,14 @@ chrome.tabs.query({}, (tabs) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.url) {
     try {
-      const newOrigin = new URL(changeInfo.url).origin;
-      const oldOrigin = tabLastOrigin.get(tabId);
-      tabLastOrigin.set(tabId, newOrigin);
-      // If user navigates to a different site/origin, clear previous site media
-      if (oldOrigin && oldOrigin !== newOrigin) {
-        console.log(`[MediaSniff] Tab ${tabId} changed site from ${oldOrigin} to ${newOrigin}, clearing media.`);
+      const newUrlObj = new URL(changeInfo.url);
+      const newUrlPath = newUrlObj.origin + newUrlObj.pathname + newUrlObj.search;
+      const oldUrlPath = tabLastOrigin.get(tabId);
+      tabLastOrigin.set(tabId, newUrlPath);
+      
+      // If user navigates to a different page, clear previous media
+      if (oldUrlPath && oldUrlPath !== newUrlPath) {
+        console.log(`[MediaSniff] Tab ${tabId} navigated from ${oldUrlPath} to ${newUrlPath}, clearing media.`);
         mediaRegistry.delete(tabId);
         clearTabMediaStorage(tabId);
         updateBadge(tabId);

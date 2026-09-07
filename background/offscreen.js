@@ -370,7 +370,7 @@ class DownloadTask {
           });
 
         const audioStreams = adaptiveFormats
-          .filter(f => f.mimeType?.startsWith('audio/') && f.mimeType?.includes('mp4'))
+          .filter(f => f.mimeType?.startsWith('audio/') && (f.mimeType?.includes('mp4') || f.mimeType?.includes('webm')))
           .map(f => {
              try {
                 return { ...f, resolvedUrl: resolveStreamUrl(f) };
@@ -458,6 +458,31 @@ class DownloadTask {
     }
     // ─── Pipeline 2: In-Browser WASM Muxer / Downloader Fallback ───
     let finalBlob;
+
+    if (!isCombined && resultFilename.endsWith('.webm') && this.item.rawAdaptiveFormats?.length > 0) {
+      console.warn('[MediaSniff Offscreen] WASM Muxer cannot process WebM. Re-resolving to MP4 fallback.');
+      try {
+        const targetHeight = parseInt(this.options.ytQuality) || 1080;
+        const mp4V = this.item.rawAdaptiveFormats
+          .filter(f => f.mimeType?.startsWith('video/') && f.mimeType?.includes('mp4'))
+          .sort((a, b) => ((b.height || 0) - (a.height || 0)) || ((b.bitrate || 0) - (a.bitrate || 0)));
+        const bestMp4 = mp4V.find(f => (f.height || 0) <= targetHeight) || mp4V[0];
+
+        const mp4A = this.item.rawAdaptiveFormats
+          .filter(f => f.mimeType?.startsWith('audio/') && f.mimeType?.includes('mp4'))
+          .sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+        
+        if (bestMp4) {
+          // Re-resolve URLs using basic fallback if no decipher available here
+          const getUrl = (f) => f.url || new URLSearchParams(f.signatureCipher || f.cipher).get('url');
+          videoUrl = getUrl(bestMp4);
+          audioUrl = mp4A.length > 0 ? getUrl(mp4A[0]) : null;
+          resultFilename = resultFilename.replace(/\.webm$/, '.mp4');
+        }
+      } catch (e) {
+        console.warn('[MediaSniff Offscreen] Failed to fallback to MP4:', e.message);
+      }
+    }
 
     if (isCombined) {
       // Combined stream: download in one go
