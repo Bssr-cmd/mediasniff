@@ -1808,11 +1808,24 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
           }
           item.parsed = true;
 
+          const isSamePlaylist = (url1, url2) => {
+            if (!url1 || !url2) return false;
+            if (url1 === url2) return true;
+            try {
+              const u1 = new URL(url1);
+              const u2 = new URL(url2);
+              if (u1.pathname === u2.pathname) return true;
+              return url1.includes(url2.split('?')[0]) || url2.includes(url1.split('?')[0]);
+            } catch {
+              return url1.includes(url2) || url2.includes(url1);
+            }
+          };
+
           if (item.variants?.length > 0) {
             for (const [mId, m] of tabMedia.entries()) {
               if (mId !== item.id && (!m.variants || m.variants.length === 0)) {
                 let isChild = false;
-                const matchVariant = item.variants.find(v => v.url && m.url && (v.url === m.url || getBaseUrl(v.url) === getBaseUrl(m.url) || m.url.includes(v.url.split('?')[0]) || v.url.includes(m.url.split('?')[0])));
+                const matchVariant = item.variants.find(v => isSamePlaylist(v.url, m.url));
                 if (matchVariant) {
                   isChild = true;
                   if (m.segments?.length > 0 && !matchVariant.segments) {
@@ -1820,13 +1833,17 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
                     matchVariant.initUrl = m.initUrl;
                   }
                 }
-                const matchAudio = item.audioRenditions?.find(a => a.url && m.url && (a.url === m.url || getBaseUrl(a.url) === getBaseUrl(m.url) || m.url.includes(a.url.split('?')[0]) || a.url.includes(m.url.split('?')[0])));
+                const matchAudio = item.audioRenditions?.find(a => isSamePlaylist(a.url, m.url));
                 if (matchAudio) {
                   isChild = true;
                   if (m.segments?.length > 0 && !matchAudio.segments) {
                     matchAudio.segments = m.segments;
                     matchAudio.initUrl = m.initUrl;
                   }
+                }
+                const matchSub = item.subtitles?.find(s => isSamePlaylist(s.url, m.url));
+                if (matchSub) {
+                  isChild = true;
                 }
                 if (isChild) {
                   tabMedia.delete(mId);
@@ -1837,9 +1854,10 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
             let isChild = false;
             for (const [mId, m] of tabMedia.entries()) {
               if (mId !== item.id && m.variants?.length > 0) {
-                const isVariant = m.variants.some(v => v.url && item.url && (v.url === item.url || getBaseUrl(v.url) === getBaseUrl(item.url) || item.url.includes(v.url.split('?')[0]) || v.url.includes(item.url.split('?')[0])));
-                const isAudio = m.audioRenditions?.some(a => a.url && item.url && (a.url === item.url || getBaseUrl(a.url) === getBaseUrl(item.url) || item.url.includes(a.url.split('?')[0]) || a.url.includes(item.url.split('?')[0])));
-                if (isVariant || isAudio) {
+                const isVariant = m.variants.some(v => isSamePlaylist(v.url, item.url));
+                const isAudio = m.audioRenditions?.some(a => isSamePlaylist(a.url, item.url));
+                const isSub = m.subtitles?.some(s => isSamePlaylist(s.url, item.url));
+                if (isVariant || isAudio || isSub) {
                   isChild = true;
                   break;
                 }
