@@ -365,7 +365,7 @@ segment2.ts
         const mpd = DASHParser.parse(MPD_XML, 'https://cdn.example.com/dash/manifest.mpd');
         setResult('dash-1', mpd.type === 'mpd' && mpd.periods.length === 1, `periods=${mpd.periods.length}`);
         const videoReps = mpd.periods[0].videoSets[0].representations;
-        setResult('dash-2', videoReps.length === 2 && videoReps[0].height === 1080, `${videoReps.length} reps, top=${videoReps[0].label}`);
+        setResult('dash-2', videoReps.length === 2 && videoReps[0].height === 1080 && videoReps[0].segments.length === 1362 && videoReps[0].segmentCount === 1362, `${videoReps.length} reps, top=${videoReps[0].label}, segs=${videoReps[0].segmentCount}`);
         setResult('dash-3', mpd.periods[0].audioSets.length === 1, `${mpd.periods[0].audioSets.length} audio set(s)`);
         setResult('dash-4', Math.abs(mpd.totalDuration - 5445.5) < 0.1, `${mpd.totalDuration}s`);
       } catch (e) {
@@ -454,6 +454,8 @@ segment2.ts
         summaryEl.innerHTML = `<div class="summary has-fail">✗ ${failed} of ${total} tests failed</div>`;
       }
     };
+
+    runAllTests();
   </script>
 </body>
 

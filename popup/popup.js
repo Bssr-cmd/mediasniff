@@ -32,43 +32,27 @@ const ICONS = {
 
 // ─── Init ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
-  const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (tab) {
-    currentTabId = tab.id;
-    pageTitle = tab.title || '';
-    pageUrl = tab.url || '';
-  }
-
-  loadMedia();
-
-  // Fetch page thumbnail
-  if (currentTabId) {
-    chrome.runtime.sendMessage({ type: 'GET_THUMBNAIL', tabId: currentTabId }, (resp) => {
-      if (resp?.thumbnail) pageThumbnail = resp.thumbnail;
-    });
-  }
-
-  settingsBtn.addEventListener('click', () => {
-    settingsPanel.classList.toggle('open');
-  });
-
-  clearBtn.addEventListener('click', async () => {
-    if (currentTabId) {
-      await chrome.runtime.sendMessage({ type: 'CLEAR_MEDIA', tabId: currentTabId });
-      mediaItems = [];
-      renderMediaList();
-      showToast('Cleared all detected media');
-    }
-  });
-
-  // Listen for real-time updates from background
+  // Listen for real-time updates from background immediately with debounce
+  let mediaUpdateTimer = null;
   chrome.runtime.onMessage.addListener((msg) => {
-    if (msg.type === 'MEDIA_UPDATED' && msg.tabId === currentTabId) {
-      loadMedia();
+    if (msg.type === 'MEDIA_UPDATED' && (!currentTabId || msg.tabId === currentTabId)) {
+      if (mediaUpdateTimer) clearTimeout(mediaUpdateTimer);
+      mediaUpdateTimer = setTimeout(() => {
+        loadMedia();
+      }, 300);
     }
 
     if (msg.type === 'BACKGROUND_DOWNLOAD_PROGRESS') {
       const { itemId, status, percent, statusLabel, speedLabel } = msg;
+
+      if (status === 'complete' || status === 'failed' || status === 'cancelled') {
+        activeDownloads.delete(itemId);
+        activeDownloads.delete(String(itemId));
+      } else {
+        const entry = { itemId, status, percent, statusLabel, speedLabel };
+        activeDownloads.set(itemId, entry);
+        activeDownloads.set(String(itemId), entry);
+      }
 
       const progressEl = document.getElementById(`progress-${itemId}`);
       const fillEl = document.getElementById(`progressFill-${itemId}`);
@@ -103,8 +87,65 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (muxBtn) muxBtn.disabled = true;
         if (fillEl) fillEl.style.width = `${percent}%`;
         if (percentEl) percentEl.textContent = `${percent}%`;
-        if (statusEl) statusEl.textContent = statusLabel + (speedLabel ? ' · ' + speedLabel : '');
+        if (statusEl) statusEl.textContent = (statusLabel || 'Downloading...') + (speedLabel ? ' · ' + speedLabel : '');
       }
+    }
+  });
+
+  let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    tab = tabs[0];
+  }
+  if (tab) {
+    currentTabId = tab.id;
+    pageTitle = tab.title || '';
+    pageUrl = tab.url || '';
+  }
+
+  await loadMedia();
+
+  // Actively trigger on-demand scan across all frames
+  if (currentTabId) {
+    chrome.tabs.sendMessage(currentTabId, { type: 'SCAN_MEDIA_NOW' }, () => {
+      if (chrome.runtime.lastError) {
+        chrome.scripting.executeScript({
+          target: { tabId: currentTabId, allFrames: true },
+          files: ['content/content.js']
+        }).catch(() => {});
+        chrome.scripting.executeScript({
+          target: { tabId: currentTabId, allFrames: true },
+          files: ['content/inject.js'],
+          world: 'MAIN'
+        }).then(() => {
+          setTimeout(() => {
+            chrome.tabs.sendMessage(currentTabId, { type: 'SCAN_MEDIA_NOW' }).catch(() => {});
+          }, 100);
+        }).catch(() => {});
+      }
+    });
+    setTimeout(loadMedia, 300);
+    setTimeout(loadMedia, 800);
+    setTimeout(loadMedia, 1500);
+  }
+
+  // Fetch page thumbnail
+  if (currentTabId) {
+    chrome.runtime.sendMessage({ type: 'GET_THUMBNAIL', tabId: currentTabId }, (resp) => {
+      if (resp?.thumbnail) pageThumbnail = resp.thumbnail;
+    });
+  }
+
+  settingsBtn.addEventListener('click', () => {
+    settingsPanel.classList.toggle('open');
+  });
+
+  clearBtn.addEventListener('click', async () => {
+    if (currentTabId) {
+      await chrome.runtime.sendMessage({ type: 'CLEAR_MEDIA', tabId: currentTabId });
+      mediaItems = [];
+      renderMediaList();
+      showToast('Cleared all detected media');
     }
   });
 });
@@ -112,16 +153,21 @@ document.addEventListener('DOMContentLoaded', async () => {
 // ─── Load Media from Background ─────────────────────────────────────
 async function loadMedia() {
   if (!currentTabId) return;
-  const response = await chrome.runtime.sendMessage({ type: 'GET_MEDIA', tabId: currentTabId });
-  mediaItems = response.media || [];
-  renderMediaList();
-
-  // Restore UI states for any active background downloads
-  const activeDownloadsResponse = await chrome.runtime.sendMessage({ type: 'GET_ACTIVE_DOWNLOADS' });
-  if (activeDownloadsResponse?.downloads) {
-    for (const dl of activeDownloadsResponse.downloads) {
-      restoreDownloadUI(dl);
+  try {
+    const [mediaResp, activeDlResp] = await Promise.all([
+      chrome.runtime.sendMessage({ type: 'GET_MEDIA', tabId: currentTabId }).catch(() => null),
+      chrome.runtime.sendMessage({ type: 'GET_ACTIVE_DOWNLOADS' }).catch(() => null)
+    ]);
+    if (activeDlResp?.downloads) {
+      for (const dl of activeDlResp.downloads) {
+        activeDownloads.set(dl.itemId, dl);
+        activeDownloads.set(String(dl.itemId), dl);
+      }
     }
+    mediaItems = mediaResp?.media || [];
+    renderMediaList();
+  } catch (e) {
+    console.warn('[MediaSniff] Failed to load media from background:', e);
   }
 }
 
@@ -140,7 +186,7 @@ function restoreDownloadUI(dl) {
     if (muxBtn) muxBtn.disabled = true;
     if (fillEl) fillEl.style.width = `${dl.percent}%`;
     if (percentEl) percentEl.textContent = `${dl.percent}%`;
-    if (statusEl) statusEl.textContent = dl.statusLabel + (dl.speedLabel ? ' · ' + dl.speedLabel : '');
+    if (statusEl) statusEl.textContent = (dl.statusLabel || 'Downloading...') + (dl.speedLabel ? ' · ' + dl.speedLabel : '');
   }
 }
 
@@ -151,14 +197,13 @@ function renderMediaList() {
     ? `${count} media item${count !== 1 ? 's' : ''} detected`
     : 'Scanning for media...';
 
-  if (count === 0) {
+  if (count === 0 && activeDownloads.size === 0) {
     mediaListEl.innerHTML = '';
     emptyStateEl.classList.add('visible');
     return;
   }
 
   emptyStateEl.classList.remove('visible');
-  mediaListEl.innerHTML = '';
 
   // Sort: streams first, then by size/timestamp
   const sorted = [...mediaItems].sort((a, b) => {
@@ -169,9 +214,67 @@ function renderMediaList() {
     return b.timestamp - a.timestamp;
   });
 
+  const currentItemCardIds = new Set();
+
   for (const item of sorted) {
-    const card = createMediaCard(item);
-    mediaListEl.appendChild(card);
+    const cardId = `card-${item.id}`;
+    currentItemCardIds.add(cardId);
+    let card = document.getElementById(cardId);
+
+    if (!card) {
+      card = createMediaCard(item);
+      mediaListEl.appendChild(card);
+    } else {
+      if (card.parentElement !== mediaListEl) {
+        mediaListEl.appendChild(card);
+      }
+      updateMediaCard(card, item);
+    }
+
+    // Ensure active download state is applied to this card
+    const activeDl = activeDownloads.get(item.id) || activeDownloads.get(String(item.id));
+    if (activeDl) {
+      restoreDownloadUI(activeDl);
+    }
+  }
+
+  // Remove cards that no longer exist (unless they have an active download)
+  for (const child of Array.from(mediaListEl.children)) {
+    if (child.id && child.id.startsWith('card-') && !currentItemCardIds.has(child.id)) {
+      const rawId = child.id.replace('card-', '');
+      const hasActive = activeDownloads.has(rawId) || activeDownloads.has(parseInt(rawId));
+      if (!hasActive) {
+        child.remove();
+      }
+    }
+  }
+}
+
+function updateMediaCard(card, item) {
+  // Update segment count badge if changed
+  let segBadge = card.querySelector('.badge.segments');
+  if (item.segmentCount > 0) {
+    const text = `${item.segmentCount} segs`;
+    if (segBadge) {
+      if (segBadge.textContent !== text) {
+        segBadge.textContent = text;
+      }
+    } else {
+      const badgesContainer = card.querySelector('.card-badges');
+      if (badgesContainer) {
+        const span = document.createElement('span');
+        span.className = 'badge segments';
+        span.textContent = text;
+        badgesContainer.appendChild(span);
+      }
+    }
+  }
+  // Update size badge if available
+  if (item.sizeLabel && item.sizeLabel !== 'Unknown') {
+    let sizeBadge = card.querySelector('.badge.size');
+    if (sizeBadge && sizeBadge.textContent !== item.sizeLabel) {
+      sizeBadge.textContent = item.sizeLabel;
+    }
   }
 }
 
@@ -209,7 +312,7 @@ function createMediaCard(item) {
     </div>`;
 
   // Quality selector for variants (HLS/DASH)
-  if (item.variants && item.variants.length > 1) {
+  if (item.variants && item.variants.length >= 1) {
     html += `
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
@@ -330,8 +433,35 @@ function createMediaCard(item) {
 
   // Cancel button
   card.querySelector(`#cancel-${item.id}`).addEventListener('click', () => {
+    activeDownloads.delete(item.id);
+    activeDownloads.delete(String(item.id));
     chrome.runtime.sendMessage({ type: 'CANCEL_DOWNLOAD', itemId: item.id });
+    const progressEl = card.querySelector(`#progress-${item.id}`);
+    const dlBtn = card.querySelector(`#dl-${item.id}`);
+    const muxBtn = card.querySelector(`#mux-${item.id}`);
+    if (progressEl) progressEl.classList.remove('active');
+    if (dlBtn) dlBtn.disabled = false;
+    if (muxBtn) muxBtn.disabled = false;
+    showToast('Download cancelled');
   });
+
+  // If this item is actively downloading, restore its UI state immediately
+  const initialActiveDl = activeDownloads.get(item.id) || activeDownloads.get(String(item.id));
+  if (initialActiveDl) {
+    const progressEl = card.querySelector(`#progress-${item.id}`);
+    const fillEl = card.querySelector(`#progressFill-${item.id}`);
+    const statusEl = card.querySelector(`#progressStatus-${item.id}`);
+    const percentEl = card.querySelector(`#progressPercent-${item.id}`);
+    const dlBtn = card.querySelector(`#dl-${item.id}`);
+    const muxBtn = card.querySelector(`#mux-${item.id}`);
+
+    if (progressEl) progressEl.classList.add('active');
+    if (dlBtn) dlBtn.disabled = true;
+    if (muxBtn) muxBtn.disabled = true;
+    if (fillEl) fillEl.style.width = `${initialActiveDl.percent}%`;
+    if (percentEl) percentEl.textContent = `${initialActiveDl.percent}%`;
+    if (statusEl) statusEl.textContent = (initialActiveDl.statusLabel || 'Downloading...') + (initialActiveDl.speedLabel ? ' · ' + initialActiveDl.speedLabel : '');
+  }
 
   return card;
 }
@@ -340,14 +470,18 @@ function createMediaCard(item) {
 function getSmartName(item) {
   let name = '';
 
-  // Try page title first
-  if (pageTitle) {
+  // 1. If item has its own sniffed title, prioritize that so it never takes the wrong page's title
+  if (item.title && item.title !== 'Live Video Stream' && item.title !== 'HLS Video' && item.title !== 'DASH Video') {
+    name = item.title;
+  } else if (pageTitle) {
     // Clean up common page title suffixes
     name = pageTitle
       .replace(/\s*[-–—|]\s*(YouTube|Vimeo|Dailymotion|Twitch|Facebook|Twitter|X).*$/i, '')
       .replace(/\s*[-–—|]\s*Watch.*$/i, '')
       .replace(/[<>:"/\\|?*]/g, '')
       .trim();
+  } else if (item.filename && item.filename !== 'Live Video Stream') {
+    name = item.filename;
   }
 
   // Fallback to URL-based name
@@ -404,6 +538,32 @@ function getSmartName(item) {
 }
 
 // ─── Download Handlers ──────────────────────────────────────────────
+function setCardDownloadStarting(itemId, label = 'Starting download...') {
+  const entry = {
+    itemId,
+    status: 'downloading',
+    percent: 0,
+    statusLabel: label,
+    speedLabel: ''
+  };
+  activeDownloads.set(itemId, entry);
+  activeDownloads.set(String(itemId), entry);
+
+  const progressEl = document.getElementById(`progress-${itemId}`);
+  const fillEl = document.getElementById(`progressFill-${itemId}`);
+  const statusEl = document.getElementById(`progressStatus-${itemId}`);
+  const percentEl = document.getElementById(`progressPercent-${itemId}`);
+  const dlBtn = document.getElementById(`dl-${itemId}`);
+  const muxBtn = document.getElementById(`mux-${itemId}`);
+
+  if (progressEl) progressEl.classList.add('active');
+  if (dlBtn) dlBtn.disabled = true;
+  if (muxBtn) muxBtn.disabled = true;
+  if (fillEl) fillEl.style.width = '0%';
+  if (percentEl) percentEl.textContent = '0%';
+  if (statusEl) statusEl.textContent = label;
+}
+
 async function handleDownload(item) {
   if (item.isEncrypted) {
     showToast('Cannot download DRM-protected content');
@@ -426,6 +586,16 @@ async function handleDownload(item) {
 
   // If HLS/DASH stream has separate audio renditions, we MUST mux it to get audio!
   if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url)) {
+    const qualitySelect = document.getElementById(`quality-${item.id}`);
+    const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
+    const variant = item.variants?.[qualityIndex];
+    const height = variant?.height;
+    if (item.directMp4Urls && height && item.directMp4Urls[height]) {
+      const filename = getSmartName(item);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: item.directMp4Urls[height], filename });
+      showToast('Downloading direct MP4...');
+      return;
+    }
     await handleMuxDownload(item);
     return;
   }
@@ -434,6 +604,8 @@ async function handleDownload(item) {
   const qualitySelect = document.getElementById(`quality-${item.id}`);
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
   const filename = getSmartName(item);
+
+  setCardDownloadStarting(item.id, 'Starting stream download...');
 
   chrome.runtime.sendMessage({
     type: 'START_DOWNLOAD',
@@ -448,6 +620,8 @@ async function handleYouTubeDownload(item) {
   const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
   const ytQuality = ytQualitySelect ? ytQualitySelect.value : '1080';
   const filename = getSmartName(item);
+
+  setCardDownloadStarting(item.id, 'Starting YouTube download...');
 
   chrome.runtime.sendMessage({
     type: 'START_DOWNLOAD',
@@ -472,6 +646,8 @@ async function handleMuxDownload(item) {
   const audioIndex = audioSelect ? parseInt(audioSelect.value) : 0;
   const embedSub = !!embedSubCheckbox?.checked;
   const filename = getSmartName(item);
+
+  setCardDownloadStarting(item.id, 'Starting mux download...');
 
   chrome.runtime.sendMessage({
     type: 'START_DOWNLOAD',

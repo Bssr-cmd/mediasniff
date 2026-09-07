@@ -192,7 +192,6 @@ body {
   border-radius: var(--radius-lg);
   padding: 12px;
   transition: all var(--transition);
-  animation: cardSlideIn 0.3s ease backwards;
   position: relative;
   overflow: hidden;
   flex-shrink: 0;

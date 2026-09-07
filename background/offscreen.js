@@ -3,16 +3,6 @@ import { Transmuxer } from '../lib/transmuxer.js';
 import { WASMMuxer } from '../lib/muxer.js';
 import { YouTubeDownloader } from '../lib/youtube-downloader.js';
 
-function remoteLog(msg, data = {}) {
-  try {
-    fetch('http://localhost:9999/log', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ msg, data })
-    }).catch(() => {});
-  } catch (e) {}
-}
-
 function parseCipher(cipherStr) {
   const params = {};
   const parts = cipherStr.split('&');
@@ -64,6 +54,28 @@ class DownloadTask {
       activeDownloads.delete(this.itemId);
     }
   }
+  async fetchPlaylist(url, referer) {
+    try {
+      const response = await new Promise((resolve) => {
+        chrome.runtime.sendMessage({ type: 'FETCH_MANIFEST', url, referer }, (resp) => {
+          if (chrome.runtime.lastError) {
+            resolve(null);
+          } else {
+            resolve(resp);
+          }
+        });
+      });
+      if (response && response.success && response.text) {
+        return response.text;
+      }
+    } catch (_) {}
+
+    const resp = await fetch(url, { signal: this.abortController.signal, credentials: 'include' });
+    if (!resp.ok) {
+      throw new Error(`Failed to fetch playlist (${resp.status} ${resp.statusText || 'Error'})`);
+    }
+    return await resp.text();
+  }
   async downloadStream() {
     let targetUrl = this.item.url;
     let segments = null;
@@ -74,23 +86,25 @@ class DownloadTask {
       targetUrl = variant.url;
       segments = variant.segments;
       initUrl = variant.initUrl;
+    } else if (this.item.segments && this.item.segments.length > 0) {
+      segments = this.item.segments;
+      initUrl = this.item.initUrl;
     }
-    if (!segments) {
+    const referer = this.options.referer || this.item.referer || null;
+    if (!segments || segments.length === 0) {
       this.reportProgress(5, 'Parsing stream...', '');
-      const resp = await fetch(targetUrl, { signal: this.abortController.signal });
-      const text = await resp.text();
+      const text = await this.fetchPlaylist(targetUrl, referer);
       const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
       const parsed = HLSParser.parse(text, targetUrl);
-      if (parsed.type === 'media') {
+      if (parsed.type === 'media' || (parsed.segments && parsed.segments.length > 0)) {
         segments = parsed.segments;
-        initUrl = parsed.initSegment?.url || null;
-      } else {
+        initUrl = parsed.initSegment || null;
+      } else if (parsed.variants && parsed.variants.length > 0) {
         const firstVariant = parsed.variants[0];
-        const resp2 = await fetch(firstVariant.url, { signal: this.abortController.signal });
-        const text2 = await resp2.text();
+        const text2 = await this.fetchPlaylist(firstVariant.url, referer);
         const parsed2 = HLSParser.parse(text2, firstVariant.url);
         segments = parsed2.segments;
-        initUrl = parsed2.initSegment?.url || null;
+        initUrl = parsed2.initSegment || null;
       }
     }
     if (!segments || segments.length === 0) {
@@ -98,6 +112,7 @@ class DownloadTask {
     }
     this.downloader = new SegmentDownloader({
       concurrency: 8,
+      referer,
       onProgress: (p) => {
         this.reportProgress(
           p.percent,
@@ -161,21 +176,35 @@ class DownloadTask {
     const qualityIndex = this.options.qualityIndex !== undefined ? parseInt(this.options.qualityIndex) : 0;
     const audioIndex = this.options.audioIndex !== undefined ? parseInt(this.options.audioIndex) : 0;
     const videoVariant = this.item.variants[qualityIndex];
-    const audioRendition = this.item.audioRenditions[audioIndex];
+    const audioRendition = this.item.audioRenditions?.[audioIndex];
+    const referer = this.options.referer || this.item.referer || null;
+
     // 1. Download video
     this.reportProgress(5, 'Downloading video...', '');
-    let videoSegments = videoVariant.segments;
-    let videoInitUrl = videoVariant.initUrl;
-    if (!videoSegments) {
-      const resp = await fetch(videoVariant.url, { signal: this.abortController.signal });
-      const text = await resp.text();
+    let videoSegments = videoVariant?.segments;
+    let videoInitUrl = videoVariant?.initUrl;
+    if ((!videoSegments || videoSegments.length === 0) && videoVariant?.url) {
+      this.reportProgress(6, 'Fetching video playlist...', '');
+      const text = await this.fetchPlaylist(videoVariant.url, referer);
       const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
       const parsed = HLSParser.parse(text, videoVariant.url);
-      videoSegments = parsed.segments;
-      videoInitUrl = parsed.initSegment?.url;
+      if (parsed.segments && parsed.segments.length > 0) {
+        videoSegments = parsed.segments;
+        videoInitUrl = parsed.initSegment || null;
+      } else if (parsed.variants && parsed.variants.length > 0) {
+        const vFirst = parsed.variants[0];
+        const vText2 = await this.fetchPlaylist(vFirst.url, referer);
+        const vParsed2 = HLSParser.parse(vText2, vFirst.url);
+        videoSegments = vParsed2.segments;
+        videoInitUrl = vParsed2.initSegment || null;
+      }
+    }
+    if (!videoSegments || videoSegments.length === 0) {
+      throw new Error('No video segments found');
     }
     const videoDownloader = new SegmentDownloader({
       concurrency: 8,
+      referer,
       onProgress: (p) => {
         const overall = Math.round(p.percent * 0.4);
         this.reportProgress(overall, `Video: ${p.completed}/${p.total}`, p.speedLabel);
@@ -186,20 +215,29 @@ class DownloadTask {
     const videoBlob = Transmuxer.merge(videoResult.init, videoResult.segments);
     // 2. Download audio
     this.reportProgress(40, 'Downloading audio...', '');
-    let audioSegments = audioRendition.segments;
-    let audioInitUrl = audioRendition.initUrl;
-    if (!audioSegments && audioRendition.url) {
-      const resp = await fetch(audioRendition.url, { signal: this.abortController.signal });
-      const text = await resp.text();
+    let audioSegments = audioRendition?.segments;
+    let audioInitUrl = audioRendition?.initUrl;
+    if ((!audioSegments || audioSegments.length === 0) && audioRendition?.url) {
+      this.reportProgress(41, 'Fetching audio playlist...', '');
+      const text = await this.fetchPlaylist(audioRendition.url, referer);
       const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
       const parsed = HLSParser.parse(text, audioRendition.url);
-      audioSegments = parsed.segments;
-      audioInitUrl = parsed.initSegment?.url;
+      if (parsed.segments && parsed.segments.length > 0) {
+        audioSegments = parsed.segments;
+        audioInitUrl = parsed.initSegment || null;
+      } else if (parsed.variants && parsed.variants.length > 0) {
+        const aFirst = parsed.variants[0];
+        const aText2 = await this.fetchPlaylist(aFirst.url, referer);
+        const aParsed2 = HLSParser.parse(aText2, aFirst.url);
+        audioSegments = aParsed2.segments;
+        audioInitUrl = aParsed2.initSegment || null;
+      }
     }
     let audioBlob = null;
     if (audioSegments) {
       const audioDownloader = new SegmentDownloader({
         concurrency: 8,
+        referer,
         onProgress: (p) => {
           const overall = Math.round(40 + p.percent * 0.3);
           this.reportProgress(overall, `Audio: ${p.completed}/${p.total}`, p.speedLabel);
@@ -258,7 +296,6 @@ class DownloadTask {
         // Log what URL/cipher data we have
         const withUrl = adaptiveFormats.filter(f => f.url);
         const withCipher = adaptiveFormats.filter(f => f.signatureCipher || f.cipher);
-        remoteLog('offscreen: rawAdaptiveFormats available', { withUrl: withUrl.length, withCipher: withCipher.length });
         console.log(`[MediaSniff YouTube] Formats with direct URL: ${withUrl.length}, with cipher: ${withCipher.length}`);
 
         const hasCipher = adaptiveFormats.some(f => f.signatureCipher || f.cipher)
@@ -268,9 +305,7 @@ class DownloadTask {
         if (hasCipher && this.item.jsUrl) {
           try {
             decipher = await YouTubeDownloader.getDecipherFunction(this.item.jsUrl);
-            remoteLog('offscreen: getDecipherFunction success', { hasDecipher: !!decipher });
           } catch(e) {
-            remoteLog('offscreen: getDecipherFunction CRASH', { error: e.message });
           }
           console.log(`[MediaSniff YouTube] Decipher function: ${decipher ? 'LOADED' : 'FAILED'}`);
         }
@@ -301,7 +336,6 @@ class DownloadTask {
               urlObj.searchParams.set('ratebypass', 'yes');
               return urlObj.href;
             } catch (err) {
-              remoteLog('offscreen: decipher evaluation crashed', { error: err.message });
               return parsed.url;
             }
           }
@@ -316,7 +350,6 @@ class DownloadTask {
              try {
                 return { ...f, resolvedUrl: resolveStreamUrl(f) };
              } catch(e) {
-                remoteLog('offscreen: resolveStreamUrl CRASH', { error: e.message, f: f });
                 return { ...f, resolvedUrl: null };
              }
           })
@@ -342,8 +375,6 @@ class DownloadTask {
 
         console.log(`[MediaSniff YouTube] Resolved video streams: ${videoStreams.length}, audio streams: ${audioStreams.length}`);
 
-        remoteLog('offscreen: resolved video/audio streams', { video: videoStreams.length, audio: audioStreams.length });
-
         let bestVideo = videoStreams.find(f => (f.height || 0) <= targetHeight) || videoStreams[0];
         if (bestVideo) {
           videoUrl = bestVideo.resolvedUrl;
@@ -361,24 +392,19 @@ class DownloadTask {
           
           console.log(`[MediaSniff YouTube] Selected video: ${bestVideo.height}p ${bestVideo.mimeType}, audio: ${matchedAudio ? matchedAudio.mimeType : 'NONE'}, file: ${resultFilename}`);
         } else {
-          remoteLog('offscreen: bestVideo is missing', {});
           console.warn(`[MediaSniff YouTube] No video streams could be resolved from rawAdaptiveFormats`);
         }
       } catch (err) {
-        remoteLog('offscreen: rawAdaptiveFormats resolution block CRASHED', { error: err.message });
         console.warn(`[MediaSniff Offscreen] Direct resolution from memory registry failed:`, err.message);
       }
     } else {
-      remoteLog('offscreen: rawAdaptiveFormats is empty/null', { rawAdaptiveFormats: this.item.rawAdaptiveFormats });
       console.log(`[MediaSniff YouTube] No rawAdaptiveFormats available on this item`);
     }
 
     // Fallback: If not resolved directly or failed, fetch via our network signature/Invidious scraper
     if (!videoUrl) {
-      remoteLog('offscreen: videoUrl still null, falling back to getDownloadUrl', {});
       console.log(`[MediaSniff Offscreen] Direct memory resolution unavailable, starting network download url request`);
       const result = await YouTubeDownloader.getDownloadUrl(this.item.url, this.options.ytQuality || '1080');
-      remoteLog('offscreen: getDownloadUrl result', { resultUrl: result?.url });
       videoUrl = result?.url;
       audioUrl = result?.audioUrl;
       isCombined = result?.isCombined;
@@ -399,7 +425,6 @@ class DownloadTask {
     }
     
     if (!videoUrl) {
-      remoteLog('offscreen: API_UNAVAILABLE throwing now!', {});
       throw new Error('API_UNAVAILABLE');
     }
 
@@ -552,46 +577,20 @@ class DownloadTask {
       .substring(0, 200) || 'download.mp4';
 
     return new Promise((resolve, reject) => {
-      if (typeof chrome !== 'undefined' && chrome.downloads && chrome.downloads.download) {
-        chrome.downloads.download({
-          url: url,
-          filename: sanitized,
-          saveAs: false
-        }, (downloadId) => {
-          setTimeout(() => URL.revokeObjectURL(url), 60000);
-          if (chrome.runtime.lastError) {
-            console.warn('[MediaSniff Offscreen] Direct downloads failed, trying background proxy:', chrome.runtime.lastError.message);
-            // Fallback to background page if direct call fails
-            chrome.runtime.sendMessage({
-              type: 'TRIGGER_DOWNLOAD_SAVE',
-              url: url,
-              filename: sanitized
-            }, (response) => {
-              if (response && response.success) {
-                resolve(response.downloadId);
-              } else {
-                reject(new Error(response?.error || 'Download failed to trigger'));
-              }
-            });
-          } else {
-            resolve(downloadId);
-          }
-        });
-      } else {
-        // Direct download API unavailable in this context, use standard background proxy
-        chrome.runtime.sendMessage({
-          type: 'TRIGGER_DOWNLOAD_SAVE',
-          url: url,
-          filename: sanitized
-        }, (response) => {
-          setTimeout(() => URL.revokeObjectURL(url), 60000);
-          if (response && response.success) {
-            resolve(response.downloadId);
-          } else {
-            reject(new Error(response?.error || 'Download failed to trigger'));
-          }
-        });
-      }
+      chrome.runtime.sendMessage({
+        type: 'TRIGGER_DOWNLOAD_SAVE',
+        url: url,
+        filename: sanitized
+      }, (response) => {
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (response && response.success) {
+          resolve(response.downloadId);
+        } else {
+          reject(new Error(response?.error || 'Download failed to trigger'));
+        }
+      });
     });
   }
   cancel() {

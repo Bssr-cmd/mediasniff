@@ -11,7 +11,8 @@
     "storage",
     "scripting",
     "offscreen",
-    "nativeMessaging"
+    "nativeMessaging",
+    "declarativeNetRequest"
   ],
   "host_permissions": [
     "<all_urls>"
@@ -33,12 +34,12 @@
     },
     {
       "matches": [
-        "*://*.youtube.com/*"
+        "<all_urls>"
       ],
       "js": [
         "content/inject.js"
       ],
-      "run_at": "document_end",
+      "run_at": "document_start",
       "world": "MAIN",
       "all_frames": true
     }

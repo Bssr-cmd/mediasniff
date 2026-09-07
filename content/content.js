@@ -18,7 +18,7 @@
   const reportedUrls = new Set();
   const reportedEmbedIds = new Set();
 
-  const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|flv|wmv|m4v|mp3|aac|ogg|opus|flac|wav|m4a)(\?|#|$)/i;
+  const MEDIA_REGEX = /\.(mp4|webm|mkv|avi|mov|flv|wmv|m4v|mp3|aac|ogg|opus|flac|wav|m4a|m3u8|mpd)(\?|#|$)/i;
 
   function parseEmbedUrl(url) {
     try {
@@ -65,7 +65,8 @@
             type: 'vimeo',
             id: embedMatch[1],
             url: `https://vimeo.com/${embedMatch[1]}`,
-            title: 'Embedded Vimeo Video'
+            title: 'Embedded Vimeo Video',
+            search: u.search || ''
           };
         }
       }
@@ -89,18 +90,31 @@
   function extractEmbeds() {
     const embeds = [];
 
-    // 1. Scan iframes on the current page for video embed embeds
+    // 1. Scan iframes on the current page for video embeds
     const iframes = document.querySelectorAll('iframe');
     for (const iframe of iframes) {
       const src = iframe.src || iframe.getAttribute('data-src');
       if (src) {
         const parsed = parseEmbedUrl(src);
         if (parsed) {
-          const titleAttr = iframe.getAttribute('title') || iframe.getAttribute('aria-label') || '';
-          if (titleAttr && titleAttr.trim()) {
-            parsed.title = titleAttr.trim();
+          if (parsed.type === 'vimeo') {
+            try {
+              chrome.runtime.sendMessage({
+                type: 'RESOLVE_VIMEO_EMBED',
+                vimeoId: parsed.id,
+                search: parsed.search || '',
+                title: parsed.title,
+                pageUrl: location.href
+              });
+            } catch (e) { }
+            resolveVimeoFromContentScript(parsed.id, parsed.search || '', parsed.title);
+          } else {
+            const titleAttr = iframe.getAttribute('title') || iframe.getAttribute('aria-label') || '';
+            if (titleAttr && titleAttr.trim()) {
+              parsed.title = titleAttr.trim();
+            }
+            embeds.push(parsed);
           }
-          embeds.push(parsed);
         }
       }
     }
@@ -108,11 +122,27 @@
     // 2. Scan self location (in case we run inside the embed iframe itself)
     const parsedSelf = parseEmbedUrl(location.href);
     if (parsedSelf) {
-      parsedSelf.title = document.title || parsedSelf.title;
-      embeds.push(parsedSelf);
+      if (parsedSelf.type === 'vimeo') {
+        resolveVimeoFromContentScript(parsedSelf.id, parsedSelf.search || '', document.title || parsedSelf.title);
+      } else {
+        parsedSelf.title = document.title || parsedSelf.title;
+        embeds.push(parsedSelf);
+      }
     }
 
     return embeds;
+  }
+
+  async function resolveVimeoFromContentScript(vimeoId, search = '', defaultTitle = '') {
+    if (!vimeoId) return;
+    try {
+      const configUrl = `https://player.vimeo.com/video/${vimeoId}/config${search || ''}`;
+      const resp = await fetch(configUrl, { credentials: 'include' });
+      if (resp.ok) {
+        const config = await resp.json();
+        processVimeoPlayerResponse(config);
+      }
+    } catch (_) {}
   }
 
   function extractMediaUrls() {
@@ -133,7 +163,7 @@
         }
       }
       // Check common data attributes for source URLs (often used by custom players)
-      const dataAttrs = ['data-src', 'data-video', 'data-mp4', 'data-stream', 'data-url'];
+      const dataAttrs = ['data-src', 'data-video', 'data-mp4', 'data-stream', 'data-url', 'data-hls', 'data-hls-url', 'data-playlist', 'data-stream-src', 'data-file', 'data-media'];
       for (const attr of dataAttrs) {
         const val = el.getAttribute(attr);
         if (val && !val.startsWith('blob:') && !val.startsWith('data:')) {
@@ -183,19 +213,85 @@
       }
     } catch (e) { /* ignore */ }
 
+    // Scan inline scripts for .m3u8 and .mpd manifests
+    try {
+      const scripts = document.querySelectorAll('script');
+      for (const s of scripts) {
+        const text = s.textContent;
+        if (!text || text.length > 500000) continue;
+        const m3u8Matches = text.matchAll(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/gi);
+        for (const m of m3u8Matches) {
+          urls.push(m[0]);
+        }
+        const mpdMatches = text.matchAll(/https?:\/\/[^\s"'<>]+\.mpd[^\s"'<>]*/gi);
+        for (const m of mpdMatches) {
+          urls.push(m[0]);
+        }
+      }
+    } catch (_) {}
+
+    // Scan Resource Timing API for manifests and media streams
+    try {
+      if (typeof performance !== 'undefined' && performance.getEntriesByType) {
+        const entries = performance.getEntriesByType('resource');
+        for (const entry of entries) {
+          const name = entry.name;
+          if (!name || typeof name !== 'string') continue;
+          const nameLower = name.toLowerCase();
+          if (nameLower.includes('.m3u8') || nameLower.includes('.mpd') || nameLower.includes('master.json') ||
+              (name.includes('vimeocdn.com') && (name.includes('playlist.m3u8') || name.includes('/v2/playlist/av/') || name.includes('/avf/')))) {
+            urls.push(name);
+          } else if (MEDIA_REGEX.test(name) && !/\.(ts|m4s|m4f|m4v|m4a|cmfv|cmfa|js|css|png|jpg|jpeg|gif|webp|woff|woff2|svg|ico)(\?|#|$)/i.test(name)) {
+            urls.push(name);
+          }
+        }
+      }
+    } catch (_) {}
+
     return [...new Set(urls)];
   }
 
   function reportMedia() {
-    // 1. Report regular direct URLs
+    // 1. Report regular direct URLs & manifests
     const urls = extractMediaUrls();
     const newUrls = urls.filter(u => !reportedUrls.has(u));
 
     if (newUrls.length > 0) {
       newUrls.forEach(u => reportedUrls.add(u));
-      try {
-        chrome.runtime.sendMessage({ type: 'DOM_MEDIA', urls: newUrls });
-      } catch (e) { /* Extension context invalidated */ }
+
+      const m3u8Urls = newUrls.filter(u => /\.m3u8(\?|#|$)/i.test(u));
+      const mpdUrls = newUrls.filter(u => /\.mpd(\?|#|$)/i.test(u));
+      const directUrls = newUrls.filter(u => !/\.(m3u8|mpd)(\?|#|$)/i.test(u));
+
+      for (const u of m3u8Urls) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'MANIFEST_DETECTED',
+            url: u,
+            manifestType: 'hls',
+            pageUrl: location.href,
+            title: document.title || 'HLS Video'
+          });
+        } catch (_) { }
+      }
+
+      for (const u of mpdUrls) {
+        try {
+          chrome.runtime.sendMessage({
+            type: 'MANIFEST_DETECTED',
+            url: u,
+            manifestType: 'dash',
+            pageUrl: location.href,
+            title: document.title || 'DASH Video'
+          });
+        } catch (_) { }
+      }
+
+      if (directUrls.length > 0) {
+        try {
+          chrome.runtime.sendMessage({ type: 'DOM_MEDIA', urls: directUrls });
+        } catch (e) { /* Extension context invalidated */ }
+      }
     }
 
     // 2. Report embed platforms (YouTube, Vimeo, Dailymotion)
@@ -210,40 +306,42 @@
     }
   }
 
-  // ─── YouTube Detection ──────────────────────────────────────────────
+  // ─── Stream & Platform Detection ──────────────────────────────────
   let ytDataReported = false;
   let lastReportedVideoId = null;
   let lastReportedJsUrl = null;
   let lastReportedFormatCount = 0;
 
-  // Listen for the player response from the page context
+  // Listen for messages from the MAIN execution world (inject.js)
   window.addEventListener('message', (event) => {
+    if (event.data && event.data.type === 'MS_MANIFEST_DETECTED') {
+      const { url, content, manifestType } = event.data;
+      if (!url) return;
+      try {
+        chrome.runtime.sendMessage({
+          type: 'MANIFEST_DETECTED',
+          url,
+          content: content || null,
+          manifestType: manifestType || 'hls',
+          pageUrl: location.href,
+          title: document.title || ''
+        });
+      } catch (e) { /* Extension context invalidated */ }
+    }
     if (event.data && event.data.type === 'MS_YT_RESPONSE') {
       processYouTubePlayerResponse(event.data.data, event.data.jsUrl);
+    }
+    if (event.data && event.data.type === 'MS_VIMEO_RESPONSE') {
+      processVimeoPlayerResponse(event.data.data);
     }
   });
 
   function injectPlayerResponseScraper() {
     if (!location.hostname.includes('youtube.com')) return;
     if (ytDataReported) return;
-    
-    try {
-      const script = document.createElement('script');
-      script.textContent = `
-        (function() {
-          try {
-            const moviePlayer = document.getElementById('movie_player');
-            const response = window.ytInitialPlayerResponse 
-              || (moviePlayer && typeof moviePlayer.getPlayerResponse === 'function' && moviePlayer.getPlayerResponse());
-            if (response && response.streamingData) {
-              window.postMessage({ type: 'MS_YT_RESPONSE', data: response }, '*');
-            }
-          } catch(e) {}
-        })();
-      `;
-      (document.head || document.documentElement).appendChild(script);
-      script.remove();
-    } catch (e) { /* ignore */ }
+
+    // Request player response from MAIN-world inject.js without violating CSP or Trusted Types
+    window.postMessage({ type: 'MS_REQUEST_YT_DATA' }, '*');
   }
 
   function processYouTubePlayerResponse(data, mainWorldJsUrl) {
@@ -380,6 +478,94 @@
     } catch (e) { /* ignore */ }
   }
 
+  // ─── Vimeo Detection ────────────────────────────────────────────────
+  let vimeoDataReported = false;
+
+  function injectVimeoScraper() {
+    if (vimeoDataReported) return;
+    window.postMessage({ type: 'MS_REQUEST_VIMEO_DATA' }, '*');
+  }
+
+  function processVimeoPlayerResponse(config) {
+    if (!config) return;
+    const video = config.video || {};
+    const files = config.request?.files || video.files || {};
+    const hls = files.hls || {};
+    const cdns = hls.cdns || {};
+
+    let masterHlsUrl = null;
+    for (const cdnName of Object.keys(cdns)) {
+      const cdn = cdns[cdnName];
+      if (cdn.avc_url) { masterHlsUrl = cdn.avc_url; break; }
+      if (cdn.url && !masterHlsUrl) masterHlsUrl = cdn.url;
+    }
+
+    const progressive = (files.progressive || []).map(p => ({
+      quality: p.quality || `${p.height}p`,
+      height: p.height || 0,
+      width: p.width || 0,
+      url: p.url || '',
+      mime: p.mime || 'video/mp4'
+    })).filter(p => p.url);
+
+    if (!masterHlsUrl && progressive.length === 0) return;
+
+    vimeoDataReported = true;
+    const vimeoId = String(video.id || '');
+    const title = video.title || document.title || 'Vimeo Video';
+    const duration = parseInt(video.duration) || 0;
+    const thumbs = video.thumbs || {};
+    const thumbnail = thumbs['1280'] || thumbs['960'] || thumbs['640'] || thumbs['base'] || `https://vumbnail.com/${vimeoId}.jpg`;
+
+    try {
+      chrome.runtime.sendMessage({
+        type: 'VIMEO_DATA',
+        vimeoId,
+        title,
+        duration,
+        thumbnail,
+        masterHlsUrl,
+        progressive,
+        pageUrl: location.href
+      });
+    } catch (e) { /* message send failed */ }
+  }
+
+  function extractVimeoData() {
+    if (vimeoDataReported) return;
+
+    injectVimeoScraper();
+
+    try {
+      const scripts = document.querySelectorAll('script');
+      for (const script of scripts) {
+        const text = script.textContent;
+        if (!text) continue;
+
+        let cfg = null;
+        const match = text.match(/window\.playerConfig\s*=\s*(\{[\s\S]+?\});\s*(?:var\s|window|<)/)
+          || text.match(/var\s+config\s*=\s*(\{[\s\S]+?\});/)
+          || text.match(/vimeo\.config\s*=\s*(\{[\s\S]+?\});/);
+        if (match) {
+          try { cfg = JSON.parse(match[1]); } catch (e) { }
+        }
+        if (!cfg && text.includes('"files"') && (text.includes('"hls"') || text.includes('"progressive"'))) {
+          const mFiles = text.match(/(\{[\s\S]*?"files"\s*:\s*\{[\s\S]*?\}\s*[\s\S]*?\})/);
+          if (mFiles) {
+            try {
+              const parsed = JSON.parse(mFiles[1]);
+              if (parsed.request?.files || parsed.files) cfg = parsed;
+            } catch (e) { }
+          }
+        }
+        if (cfg) {
+          processVimeoPlayerResponse(cfg);
+          break;
+        }
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   // ─── Thumbnail Extraction ───────────────────────────────────────────
   function extractThumbnail() {
     // 1. og:image meta tag (most sites including YouTube)
@@ -408,23 +594,33 @@
   }
 
   // ─── Message Listener ──────────────────────────────────────────────
-  chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    if (message.type === 'EXTRACT_THUMBNAIL') {
-      const thumbnail = extractThumbnail();
-      sendResponse({ thumbnail });
-      return true;
-    }
-  });
+  if (typeof chrome !== 'undefined' && chrome.runtime?.onMessage) {
+    chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+      if (message.type === 'SCAN_MEDIA_NOW') {
+        fullRescan();
+        sendResponse({ status: 'scanned' });
+        return true;
+      }
+      if (message.type === 'EXTRACT_THUMBNAIL') {
+        const thumbnail = extractThumbnail();
+        sendResponse({ thumbnail });
+        return true;
+      }
+    });
+  }
 
   // ─── Init ──────────────────────────────────────────────────────────
   function fullRescan() {
     reportedUrls.clear();
     reportedEmbedIds.clear();
+    ytDataReported = false;
+    vimeoDataReported = false;
+    try {
+      window.postMessage({ type: 'MS_TRIGGER_INJECT_SCAN' }, '*');
+    } catch (_) {}
     reportMedia();
-    if (location.hostname.includes('youtube.com')) {
-      ytDataReported = false;
-      extractYouTubeData();
-    }
+    extractYouTubeData();
+    extractVimeoData();
   }
 
   // Expose for re-injection
@@ -434,10 +630,12 @@
     document.addEventListener('DOMContentLoaded', () => {
       setTimeout(reportMedia, 500);
       setTimeout(extractYouTubeData, 1500);
+      setTimeout(extractVimeoData, 1500);
     });
   } else {
     setTimeout(reportMedia, 500);
     setTimeout(extractYouTubeData, 1500);
+    setTimeout(extractVimeoData, 1500);
   }
 
   // Watch for dynamically added media elements
@@ -463,13 +661,15 @@
   // Periodic re-scan for SPAs
   setInterval(reportMedia, 5000);
 
-  // Re-check YouTube data on SPA navigation
+  // Re-check YouTube/Vimeo data on SPA navigation
   let lastUrl = location.href;
   setInterval(() => {
     if (location.href !== lastUrl) {
       lastUrl = location.href;
       ytDataReported = false;
+      vimeoDataReported = false;
       setTimeout(extractYouTubeData, 2000);
+      setTimeout(extractVimeoData, 2000);
     }
   }, 1000);
 })();
