@@ -603,92 +603,25 @@ class DownloadTask {
   }
   triggerNativeDownload(videoUrl, audioUrl, filename) {
     return new Promise((resolve, reject) => {
-      try {
-        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
-
-        port.onMessage.addListener((msg) => {
-          console.log("[MediaSniff Offscreen] Native Companion message:", msg);
-          if (msg.status === 'progress') {
-            this.reportProgress(msg.percent, msg.statusLabel, '');
-          } else if (msg.status === 'complete') {
-            port.disconnect();
-            resolve(msg);
-          } else if (msg.status === 'failed') {
-            port.disconnect();
-            reject(new Error(msg.statusLabel || 'Native Host failed'));
-          }
-        });
-
-        port.onDisconnect.addListener(() => {
-          const err = chrome.runtime.lastError;
-          if (err) {
-            console.warn("[MediaSniff Offscreen] Native connection error:", err.message);
-            reject(new Error("Host disconnected: " + err.message));
-          } else {
-            resolve({ status: "complete", statusLabel: "Completed by Companion App" });
-          }
-        });
-
-        // Trigger native download & mux action
-        port.postMessage({
-          action: "download_and_mux",
-          videoUrl: videoUrl,
-          audioUrl: audioUrl,
-          filename: filename
-        });
-
-      } catch (err) {
-        reject(err);
-      }
+      chrome.runtime.sendMessage({
+        type: 'TRIGGER_NATIVE_MUX',
+        itemId: this.itemId,
+        videoUrl,
+        audioUrl,
+        filename
+      }, (response) => {
+        if (chrome.runtime.lastError) {
+          reject(new Error(chrome.runtime.lastError.message));
+        } else if (response && response.success) {
+          resolve({ status: "complete", statusLabel: response.statusLabel });
+        } else {
+          reject(new Error(response?.error || 'Native muxing failed'));
+        }
+      });
     });
   }
 
-  async downloadYTDLP() {
-    return new Promise((resolve, reject) => {
-      try {
-        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
-        let hasResolved = false;
 
-        port.onMessage.addListener((msg) => {
-          if (hasResolved) return;
-          if (msg.status === "progress") {
-            this.reportProgress(msg.percent || 0, msg.statusLabel || "Downloading...", "");
-          } else if (msg.status === "complete") {
-            hasResolved = true;
-            this.reportStatus("complete", msg.statusLabel || "Completed by yt-dlp!");
-            resolve();
-          } else if (msg.status === "failed") {
-            hasResolved = true;
-            this.reportStatus("failed", msg.statusLabel || "Failed");
-            reject(new Error(msg.statusLabel || "Host error"));
-          }
-        });
-
-        port.onDisconnect.addListener(() => {
-          const err = chrome.runtime.lastError;
-          if (!hasResolved) {
-            if (err) {
-              reject(new Error("Host disconnected: " + err.message));
-            } else {
-              this.reportStatus("complete", "Completed!");
-              resolve();
-            }
-          }
-        });
-
-        // Trigger native yt-dlp action
-        const url = this.item.streamType === 'direct' ? this.item.url : (this.item.masterUrl || this.item.url);
-        port.postMessage({
-          action: "ytdlp_download",
-          url: url,
-          filename: this.options.filename || 'download.mp4'
-        });
-
-      } catch (err) {
-        reject(err);
-      }
-    });
-  }
 
   async triggerSave(blob, filename) {
     const url = URL.createObjectURL(blob);

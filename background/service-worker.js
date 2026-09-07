@@ -1271,6 +1271,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         speedLabel: ''
       }).catch(() => {});
 
+      if (downloadType === 'ytdlp') {
+        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
+        let hasResolved = false;
+
+        port.onMessage.addListener((msg) => {
+          if (hasResolved) return;
+          if (msg.status === "progress") {
+            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'downloading', percent: msg.percent || 0, statusLabel: msg.statusLabel || "Downloading...", speedLabel: '' }).catch(() => {});
+          } else if (msg.status === "complete") {
+            hasResolved = true;
+            activeDownloads.delete(itemId);
+            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'complete', percent: 100, statusLabel: msg.statusLabel || "Completed by yt-dlp!", speedLabel: '' }).catch(() => {});
+          } else if (msg.status === "failed") {
+            hasResolved = true;
+            activeDownloads.delete(itemId);
+            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'failed', percent: 0, statusLabel: msg.statusLabel || "Failed", speedLabel: '' }).catch(() => {});
+          }
+        });
+
+        port.onDisconnect.addListener(() => {
+          const err = chrome.runtime.lastError;
+          if (!hasResolved) {
+            hasResolved = true;
+            activeDownloads.delete(itemId);
+            if (err) {
+              chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'failed', percent: 0, statusLabel: "Host disconnected: " + err.message, speedLabel: '' }).catch(() => {});
+            } else {
+              chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'complete', percent: 100, statusLabel: "Completed!", speedLabel: '' }).catch(() => {});
+            }
+          }
+        });
+
+        const url = item.streamType === 'direct' ? item.url : (item.masterUrl || item.url);
+        port.postMessage({
+          action: "ytdlp_download",
+          url: url,
+          filename: options.filename || 'download.mp4'
+        });
+        return; // Don't forward to offscreen
+      }
+
       await ensureOffscreen();
       await new Promise(r => setTimeout(r, 500));
       chrome.runtime.sendMessage({
@@ -1292,6 +1333,47 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
     return true;
   }
+  
+  if (message.type === 'TRIGGER_NATIVE_MUX') {
+    const { itemId, videoUrl, audioUrl, filename } = message;
+    try {
+      const port = chrome.runtime.connectNative("net.mediasniff.coapp");
+      
+      port.onMessage.addListener((msg) => {
+        if (msg.status === "progress") {
+          // Offscreen document is listening for BACKGROUND_DOWNLOAD_PROGRESS to bubble it up
+          // But it's easier if we just let the offscreen document handle progress itself, OR we just bubble it globally
+          chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'downloading', percent: msg.percent || 0, statusLabel: msg.statusLabel || "Muxing natively...", speedLabel: '' }).catch(() => {});
+        } else if (msg.status === "complete") {
+          sendResponse({ success: true, statusLabel: msg.statusLabel || "Completed by Companion App" });
+          port.disconnect();
+        } else if (msg.status === "failed") {
+          sendResponse({ success: false, error: msg.statusLabel || "Host error" });
+          port.disconnect();
+        }
+      });
+      
+      port.onDisconnect.addListener(() => {
+        const err = chrome.runtime.lastError;
+        if (err) {
+          sendResponse({ success: false, error: "Host disconnected: " + err.message });
+        } else {
+          sendResponse({ success: true, statusLabel: "Completed by Companion App" });
+        }
+      });
+      
+      port.postMessage({
+        action: "download_and_mux",
+        videoUrl,
+        audioUrl,
+        filename
+      });
+    } catch (err) {
+      sendResponse({ success: false, error: err.message });
+    }
+    return true; // keep alive for async response
+  }
+
   // Cancel background download
   if (message.type === 'CANCEL_DOWNLOAD') {
     const { itemId } = message;
