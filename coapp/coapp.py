@@ -110,6 +110,103 @@ def auto_download_ffmpeg():
             except:
                 pass
 
+def find_ytdlp():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    local_ytdlp = os.path.join(base_dir, "yt-dlp.exe" if os.name == 'nt' else "yt-dlp")
+    if os.path.exists(local_ytdlp):
+        return local_ytdlp
+    if shutil.which("yt-dlp"):
+        return shutil.which("yt-dlp")
+    return None
+
+def auto_download_ytdlp():
+    log("Auto-downloading yt-dlp dependency...")
+    send_message({"status": "progress", "percent": 5, "statusLabel": "Downloading yt-dlp dependency..."})
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    if os.name == 'nt':
+        url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+        output_exe = os.path.join(base_dir, "yt-dlp.exe")
+    else:
+        url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp"
+        output_exe = os.path.join(base_dir, "yt-dlp")
+        
+    try:
+        urllib.request.urlretrieve(url, output_exe)
+        if os.name != 'nt':
+            os.chmod(output_exe, os.stat(output_exe).st_mode | 0o111)
+        log("yt-dlp dependency successfully auto-downloaded!")
+        return output_exe
+    except Exception as e:
+        log(f"Failed to auto-download yt-dlp: {e}")
+        return None
+
+def handle_ytdlp_download(msg):
+    url = msg.get("url")
+    filename = msg.get("filename", "download.mp4")
+    
+    downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+    if not os.path.exists(downloads_dir):
+        downloads_dir = os.getcwd()
+        
+    output_path = os.path.join(downloads_dir, filename)
+    log(f"yt-dlp Output path: {output_path}")
+    
+    ytdlp_bin = find_ytdlp()
+    if not ytdlp_bin:
+        ytdlp_bin = auto_download_ytdlp()
+        
+    if not ytdlp_bin:
+        log("yt-dlp not found and auto-download failed.")
+        send_message({"status": "failed", "statusLabel": "yt-dlp dependency missing."})
+        return
+        
+    # We also need ffmpeg for yt-dlp to merge formats
+    ffmpeg_bin = find_ffmpeg()
+    if not ffmpeg_bin:
+        ffmpeg_bin = auto_download_ffmpeg()
+
+    send_message({"status": "progress", "percent": 10, "statusLabel": "Starting yt-dlp..."})
+    cmd = [
+        ytdlp_bin,
+        "--no-playlist",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "--merge-output-format", "mp4",
+        "-o", output_path,
+        url
+    ]
+    if ffmpeg_bin:
+        cmd.extend(["--ffmpeg-location", os.path.dirname(ffmpeg_bin)])
+        
+    log(f"Executing: {' '.join(cmd)}")
+    try:
+        # Run yt-dlp and capture output for progress
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        import re
+        progress_pattern = re.compile(r'\[download\]\s+([0-9.]+)%')
+        
+        for line in process.stdout:
+            match = progress_pattern.search(line)
+            if match:
+                try:
+                    pct = float(match.group(1))
+                    overall = int(10 + pct * 0.85) # scale from 10% to 95%
+                    send_message({"status": "progress", "percent": overall, "statusLabel": f"yt-dlp downloading: {pct}%"})
+                except:
+                    pass
+        
+        process.wait()
+        if process.returncode == 0:
+            log("yt-dlp download completed successfully!")
+            send_message({"status": "complete", "statusLabel": f"Saved to Downloads: {filename}"})
+        else:
+            log(f"yt-dlp failed with exit code {process.returncode}")
+            send_message({"status": "failed", "statusLabel": f"yt-dlp failed (Code {process.returncode})"})
+            
+    except Exception as e:
+        log(f"yt-dlp task error: {e}")
+        send_message({"status": "failed", "statusLabel": f"yt-dlp Error: {str(e)}"})
+
 def handle_download_and_mux(msg):
     video_url = msg.get("videoUrl")
     audio_url = msg.get("audioUrl")
@@ -211,6 +308,8 @@ def main():
             
             if action == "ping":
                 send_message({"status": "pong"})
+            elif action == "ytdlp_download":
+                handle_ytdlp_download(msg)
             elif action == "download_and_mux":
                 handle_download_and_mux(msg)
             else:

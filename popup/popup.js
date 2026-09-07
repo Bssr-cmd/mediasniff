@@ -108,9 +108,15 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (statusLabel === 'Error: API_UNAVAILABLE') {
             const item = mediaItems.find(m => m.id === itemId);
             if (item) {
-              const cmd = `yt-dlp "${item.url}" -o "${getSmartName(item)}"`;
-              navigator.clipboard.writeText(cmd).catch(() => { });
-              showToast('YouTube API failed. yt-dlp command copied!');
+              showToast('YouTube API failed. Falling back to native yt-dlp...');
+              setCardDownloadStarting(item.id, 'Connecting to yt-dlp...');
+              chrome.runtime.sendMessage({
+                type: 'START_DOWNLOAD',
+                itemId: item.id,
+                item,
+                downloadType: 'ytdlp',
+                options: { filename: getSmartName(item) }
+              });
             }
           } else {
             showToast(statusLabel);
@@ -501,7 +507,7 @@ function createMediaCard(item) {
       <button class="btn btn-secondary" id="copy-${item.id}" title="Copy URL">
         ${ICONS.copy}
       </button>
-      <button class="btn btn-secondary" id="ytdlp-${item.id}" title="Copy yt-dlp command">
+      <button class="btn btn-secondary" id="ytdlp-${item.id}" title="Download via yt-dlp native app">
         <span style="font-family:var(--font-mono);font-size:10px;font-weight:600;">yt-dlp</span>
       </button>
     </div>
@@ -598,12 +604,17 @@ function createMediaCard(item) {
     showToast('URL copied to clipboard');
   });
 
-  // Copy yt-dlp command
+  // Native yt-dlp download
   card.querySelector(`#ytdlp-${item.id}`).addEventListener('click', () => {
-    const url = item.streamType === 'direct' ? item.url : getSelectedUrl(item);
-    const cmd = `yt-dlp "${url}" -o "${getSmartName(item)}"`;
-    navigator.clipboard.writeText(cmd);
-    showToast('yt-dlp command copied');
+    const filename = getSmartName(item);
+    setCardDownloadStarting(item.id, 'Connecting to yt-dlp...');
+    chrome.runtime.sendMessage({
+      type: 'START_DOWNLOAD',
+      itemId: item.id,
+      item,
+      downloadType: 'ytdlp',
+      options: { filename }
+    });
   });
 
   // Cancel button

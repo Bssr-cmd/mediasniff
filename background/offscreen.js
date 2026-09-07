@@ -36,6 +36,8 @@ class DownloadTask {
       this.reportProgress(0, 'Preparing...', '');
       if (this.downloadType === 'youtube') {
         await this.downloadYouTube();
+      } else if (this.downloadType === 'ytdlp') {
+        await this.downloadYTDLP();
       } else if (this.downloadType === 'mux') {
         await this.downloadMux();
       } else if (this.downloadType === 'stream') {
@@ -640,6 +642,54 @@ class DownloadTask {
       }
     });
   }
+
+  async downloadYTDLP() {
+    return new Promise((resolve, reject) => {
+      try {
+        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
+        let hasResolved = false;
+
+        port.onMessage.addListener((msg) => {
+          if (hasResolved) return;
+          if (msg.status === "progress") {
+            this.reportProgress(msg.percent || 0, msg.statusLabel || "Downloading...", "");
+          } else if (msg.status === "complete") {
+            hasResolved = true;
+            this.reportStatus("complete", msg.statusLabel || "Completed by yt-dlp!");
+            resolve();
+          } else if (msg.status === "failed") {
+            hasResolved = true;
+            this.reportStatus("failed", msg.statusLabel || "Failed");
+            reject(new Error(msg.statusLabel || "Host error"));
+          }
+        });
+
+        port.onDisconnect.addListener(() => {
+          const err = chrome.runtime.lastError;
+          if (!hasResolved) {
+            if (err) {
+              reject(new Error("Host disconnected: " + err.message));
+            } else {
+              this.reportStatus("complete", "Completed!");
+              resolve();
+            }
+          }
+        });
+
+        // Trigger native yt-dlp action
+        const url = this.item.streamType === 'direct' ? this.item.url : (this.item.masterUrl || this.item.url);
+        port.postMessage({
+          action: "ytdlp_download",
+          url: url,
+          filename: this.options.filename || 'download.mp4'
+        });
+
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
   async triggerSave(blob, filename) {
     const url = URL.createObjectURL(blob);
     const sanitized = filename
