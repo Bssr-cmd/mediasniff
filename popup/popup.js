@@ -11,6 +11,9 @@ let pageTitle = '';
 let pageUrl = '';
 let pageThumbnail = null;
 
+let currentMinSize = 0;
+let currentQualityPref = 'highest';
+
 // ─── DOM References ─────────────────────────────────────────────────
 const mediaListEl = document.getElementById('mediaList');
 const emptyStateEl = document.getElementById('emptyState');
@@ -18,6 +21,7 @@ const headerSubtitle = document.getElementById('headerSubtitle');
 const settingsBtn = document.getElementById('settingsBtn');
 const settingsPanel = document.getElementById('settingsPanel');
 const clearBtn = document.getElementById('clearBtn');
+const scanBtn = document.getElementById('scanBtn'); // new
 const toastEl = document.getElementById('toast');
 
 // ─── Icons ──────────────────────────────────────────────────────────
@@ -27,11 +31,44 @@ const ICONS = {
   subtitle: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 15h4M13 15h4M7 11h10"/></svg>`,
   download: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7,10 12,15 17,10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>`,
   copy: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>`,
-  mux: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 01-2 2H3m18 0h-3a2 2 0 01-2-2V3m0 18v-3a2 2 0 012-2h3M3 16h3a2 2 0 012 2v3"/></svg>`
+  mux: `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3v3a2 2 0 01-2 2H3m18 0h-3a2 2 0 01-2-2V3m0 18v-3a2 2 0 012-2h3M3 16h3a2 2 0 012 2v3"/></svg>`,
+  rename: `<svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>`
 };
 
 // ─── Init ───────────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+  let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  if (!tab) {
+    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+    tab = tabs[0];
+  }
+  if (tab) {
+    currentTabId = tab.id;
+    pageTitle = tab.title || '';
+    pageUrl = tab.url || '';
+  }
+
+  // Load settings
+  const settings = await chrome.storage.local.get({ minSizeFilter: '0', qualityPref: 'highest' });
+  currentMinSize = parseInt(settings.minSizeFilter, 10);
+  currentQualityPref = settings.qualityPref;
+  
+  const minSizeSelect = document.getElementById('minSizeFilter');
+  const qualitySelect = document.getElementById('qualityPref');
+  if (minSizeSelect) minSizeSelect.value = settings.minSizeFilter;
+  if (qualitySelect) qualitySelect.value = settings.qualityPref;
+
+  minSizeSelect?.addEventListener('change', (e) => {
+    currentMinSize = parseInt(e.target.value, 10);
+    chrome.storage.local.set({ minSizeFilter: e.target.value });
+    renderMediaList();
+  });
+  qualitySelect?.addEventListener('change', (e) => {
+    currentQualityPref = e.target.value;
+    chrome.storage.local.set({ qualityPref: e.target.value });
+    renderMediaList();
+  });
+
   // Listen for real-time updates from background immediately with debounce
   let mediaUpdateTimer = null;
   chrome.runtime.onMessage.addListener((msg) => {
@@ -92,17 +129,6 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   });
 
-  let [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (!tab) {
-    const tabs = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-    tab = tabs[0];
-  }
-  if (tab) {
-    currentTabId = tab.id;
-    pageTitle = tab.title || '';
-    pageUrl = tab.url || '';
-  }
-
   await loadMedia();
 
   // Actively trigger on-demand scan across all frames
@@ -140,12 +166,78 @@ document.addEventListener('DOMContentLoaded', async () => {
     settingsPanel.classList.toggle('open');
   });
 
-  clearBtn.addEventListener('click', async () => {
+  // Advanced features toggle handling
+  const advancedToggle = document.getElementById('advancedToggle');
+
+  // Initialize toggle state based on stored preference and permissions
+  chrome.storage.local.get({ advancedEnabled: false }, async (data) => {
+    const hasPerm = await chrome.permissions.contains({ permissions: ['nativeMessaging', 'tabs'] });
+    if (hasPerm) {
+      if (!data.advancedEnabled) {
+        chrome.storage.local.set({ advancedEnabled: true });
+      }
+      advancedToggle.checked = true;
+    } else {
+      if (data.advancedEnabled) {
+        chrome.storage.local.set({ advancedEnabled: false });
+      }
+      advancedToggle.checked = false;
+    }
+    updateAdvancedUIState();
+  });
+
+  // Handle toggle changes
+  advancedToggle.addEventListener('change', async () => {
+    if (advancedToggle.checked) {
+      const granted = await chrome.permissions.request({
+        permissions: ['nativeMessaging', 'tabs']
+      });
+      if (granted) {
+        chrome.storage.local.set({ advancedEnabled: true });
+      } else {
+        advancedToggle.checked = false;
+        chrome.storage.local.set({ advancedEnabled: false });
+      }
+    } else {
+      await chrome.permissions.remove({ permissions: ['nativeMessaging', 'tabs'] });
+      chrome.storage.local.set({ advancedEnabled: false });
+    }
+    updateAdvancedUIState();
+  });
+
+  // Update UI based on permissions and native host availability
+  async function updateAdvancedUIState() {
+    const permGranted = await chrome.permissions.contains({ permissions: ['nativeMessaging', 'tabs'] });
+    let nativeHostAvailable = false;
+    if (permGranted) {
+      try {
+        const port = chrome.runtime.connectNative('net.mediasniff.coapp');
+        port.onDisconnect.addListener(() => {
+          // native host not available
+        });
+        nativeHostAvailable = true;
+        port.disconnect();
+      } catch (e) {
+        nativeHostAvailable = false;
+      }
+    }
+    console.log('Advanced features:', { permGranted, nativeHostAvailable });
+  }
+
+  clearBtn?.addEventListener('click', async () => {
     if (currentTabId) {
       await chrome.runtime.sendMessage({ type: 'CLEAR_MEDIA', tabId: currentTabId });
       mediaItems = [];
       renderMediaList();
       showToast('Cleared all detected media');
+    }
+  });
+
+  scanBtn?.addEventListener('click', () => {
+    if (currentTabId) {
+      chrome.tabs.sendMessage(currentTabId, { type: 'SCAN_MEDIA_NOW' }).catch(() => {});
+      showToast('Scanning for media...');
+      setTimeout(loadMedia, 500);
     }
   });
 });
@@ -192,7 +284,13 @@ function restoreDownloadUI(dl) {
 
 // ─── Render ─────────────────────────────────────────────────────────
 function renderMediaList() {
-  const count = mediaItems.length;
+  // Apply minSizeFilter
+  const filteredItems = mediaItems.filter(item => {
+    if (currentMinSize > 0 && item.size && item.size < currentMinSize) return false;
+    return true;
+  });
+
+  const count = filteredItems.length;
   headerSubtitle.textContent = count > 0
     ? `${count} media item${count !== 1 ? 's' : ''} detected`
     : 'Scanning for media...';
@@ -206,7 +304,7 @@ function renderMediaList() {
   emptyStateEl.classList.remove('visible');
 
   // Sort: streams first, then by size/timestamp
-  const sorted = [...mediaItems].sort((a, b) => {
+  const sorted = [...filteredItems].sort((a, b) => {
     const typeOrder = { stream: 0, video: 1, audio: 2, subtitle: 3 };
     const ta = typeOrder[a.type] ?? 9;
     const tb = typeOrder[b.type] ?? 9;
@@ -221,14 +319,22 @@ function renderMediaList() {
     currentItemCardIds.add(cardId);
     let card = document.getElementById(cardId);
 
-    if (!card) {
+    if (card) {
+      const prevParsed = card.dataset.parsed;
+      const prevVariants = card.dataset.variants;
+      if (prevParsed !== String(item.parsed) || prevVariants !== String(item.variants?.length || 0)) {
+        const newCard = createMediaCard(item);
+        card.replaceWith(newCard);
+        card = newCard;
+      } else {
+        if (card.parentElement !== mediaListEl) {
+          mediaListEl.appendChild(card);
+        }
+        updateMediaCard(card, item);
+      }
+    } else {
       card = createMediaCard(item);
       mediaListEl.appendChild(card);
-    } else {
-      if (card.parentElement !== mediaListEl) {
-        mediaListEl.appendChild(card);
-      }
-      updateMediaCard(card, item);
     }
 
     // Ensure active download state is applied to this card
@@ -283,10 +389,15 @@ function createMediaCard(item) {
   const card = document.createElement('div');
   card.className = 'media-card';
   card.id = `card-${item.id}`;
+  card.dataset.parsed = String(item.parsed);
+  card.dataset.variants = String(item.variants?.length || 0);
 
   const smartName = getSmartName(item);
   const iconClass = item.type === 'audio' ? 'audio' : item.type === 'subtitle' ? 'subtitle' : '';
   const iconSvg = ICONS[item.type] || ICONS.video;
+
+  const isDrm = !!(item.isEncrypted || item.isProtected);
+  const lockIcon = isDrm ? '🔒 ' : '';
 
   let html = `
     <div class="card-header">
@@ -297,7 +408,10 @@ function createMediaCard(item) {
       ` : ''}
       <div class="media-icon ${iconClass}">${iconSvg}</div>
       <div class="card-info">
-        <div class="card-filename" title="${escHtml(smartName)}">${escHtml(smartName)}</div>
+        <div class="card-filename-row" id="filename-row-${item.id}">
+          <div class="card-filename" id="filename-text-${item.id}" title="${escHtml(smartName)}">${escHtml(smartName)}</div>
+          <button class="rename-btn" id="rename-btn-${item.id}" title="Rename">${ICONS.rename}</button>
+        </div>
         <div class="card-url" title="${escHtml(item.url)}">${escHtml(truncateUrl(item.url))}</div>
       </div>
     </div>
@@ -307,7 +421,8 @@ function createMediaCard(item) {
       ${item.sizeLabel && item.sizeLabel !== 'Unknown' ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
       ${item.totalDuration ? `<span class="badge duration">${formatDuration(item.totalDuration)}</span>` : ''}
       ${item.segmentCount > 0 ? `<span class="badge segments">${item.segmentCount} segs</span>` : ''}
-      ${item.isEncrypted ? `<span class="badge encrypted">🔒 DRM</span>` : ''}
+      ${isDrm ? `<span class="badge drm">${lockIcon}DRM</span>` : ''}
+      ${item.subtitleTracks?.length > 0 ? `<span class="badge subtitle">CC</span>` : ''}
       ${item.isLive ? `<span class="badge live">● LIVE</span>` : ''}
     </div>`;
 
@@ -403,11 +518,71 @@ function createMediaCard(item) {
 
   card.innerHTML = html;
 
+  // Apply qualityPref
+  const qualitySelect = card.querySelector(`#quality-${item.id}`) || card.querySelector(`#ytquality-${item.id}`);
+  if (qualitySelect && currentQualityPref) {
+    let targetOption = null;
+    const opts = Array.from(qualitySelect.options);
+    if (currentQualityPref === 'highest') {
+      targetOption = opts[0];
+    } else if (currentQualityPref === 'lowest') {
+      targetOption = opts[opts.length - 1];
+    } else {
+      const targetHeight = parseInt(currentQualityPref);
+      for (const opt of opts) {
+        if (opt.textContent.includes(`${targetHeight}p`) || opt.text.includes(targetHeight)) {
+          targetOption = opt;
+          break;
+        }
+      }
+      if (!targetOption) targetOption = opts[0];
+    }
+    if (targetOption) targetOption.selected = true;
+  }
+
   // ─── Event Listeners ────────────────────────
   // Download button
   const dlBtn = card.querySelector(`#dl-${item.id}`);
   if (dlBtn) {
-    dlBtn.addEventListener('click', () => handleDownload(item));
+    if (isDrm) {
+      dlBtn.disabled = true;
+      dlBtn.title = 'Protected by DRM';
+    } else {
+      dlBtn.addEventListener('click', () => handleDownload(item));
+    }
+  }
+
+  // Rename Inline
+  const renameBtn = card.querySelector(`#rename-btn-${item.id}`);
+  const filenameText = card.querySelector(`#filename-text-${item.id}`);
+  if (renameBtn && filenameText) {
+    renameBtn.addEventListener('click', () => {
+      const currentName = filenameText.textContent;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.value = currentName;
+      input.className = 'rename-input';
+      
+      const saveName = () => {
+        const newName = input.value.trim() || currentName;
+        item.filename = newName;
+        filenameText.textContent = newName;
+        filenameText.title = newName;
+        input.replaceWith(filenameText);
+      };
+      
+      input.addEventListener('blur', saveName);
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          input.blur();
+        }
+      });
+      
+      filenameText.replaceWith(input);
+      input.focus();
+      input.select();
+    });
   }
 
   // Mux button
@@ -470,8 +645,10 @@ function createMediaCard(item) {
 function getSmartName(item) {
   let name = '';
 
-  // 1. If item has its own sniffed title, prioritize that so it never takes the wrong page's title
-  if (item.title && item.title !== 'Live Video Stream' && item.title !== 'HLS Video' && item.title !== 'DASH Video') {
+  // 1. If item has its own sniffed filename, prioritize that
+  if (item.filename && item.filename !== 'Live Video Stream' && item.filename !== 'HLS Video' && item.filename !== 'DASH Video') {
+    name = item.filename;
+  } else if (item.title && item.title !== 'Live Video Stream' && item.title !== 'HLS Video' && item.title !== 'DASH Video') {
     name = item.title;
   } else if (pageTitle) {
     // Clean up common page title suffixes
@@ -480,8 +657,6 @@ function getSmartName(item) {
       .replace(/\s*[-–—|]\s*Watch.*$/i, '')
       .replace(/[<>:"/\\|?*]/g, '')
       .trim();
-  } else if (item.filename && item.filename !== 'Live Video Stream') {
-    name = item.filename;
   }
 
   // Fallback to URL-based name
@@ -543,9 +718,19 @@ function getSmartName(item) {
     .replace(/\s+/g, ' ')
     .trim();
 
-  if (name.length > 80) name = name.substring(0, 80).trim();
+  // Sanitize Windows reserved names
+  const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+  if (reservedRegex.test(name)) {
+    name = name + '_media';
+  }
 
-  return quality ? `${name} (${quality})${ext}` : `${name}${ext}`;
+  const suffix = quality ? ` (${quality})` : '';
+  const totalExtLen = suffix.length + ext.length;
+  if (name.length + totalExtLen > 80) {
+    name = name.substring(0, 80 - totalExtLen).trim();
+  }
+
+  return `${name}${suffix}${ext}`;
 }
 
 // ─── Download Handlers ──────────────────────────────────────────────
@@ -738,18 +923,15 @@ function showToast(message) {
 
 // Reliable blob download with proper filename — works for any size
 function triggerBlobDownload(blob, filename) {
-  const url = URL.createObjectURL(blob);
-  const a = document.createElement('a');
-  a.href = url;
-  a.download = sanitizeFilename(filename);
-  a.style.display = 'none';
-  document.body.appendChild(a);
-  a.click();
-  // Clean up after a delay
-  setTimeout(() => {
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }, 10000);
+  const reader = new FileReader();
+  reader.onload = () => {
+    chrome.runtime.sendMessage({
+      type: 'DOWNLOAD_BLOB',
+      dataUrl: reader.result,
+      filename: sanitizeFilename(filename)
+    }).catch(() => {});
+  };
+  reader.readAsDataURL(blob);
 }
 
 function sanitizeFilename(name) {

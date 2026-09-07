@@ -6,13 +6,15 @@
   "permissions": [
     "webRequest",
     "activeTab",
-    "tabs",
     "downloads",
     "storage",
     "scripting",
     "offscreen",
-    "nativeMessaging",
     "declarativeNetRequest"
+  ],
+  "optional_permissions": [
+    "tabs",
+    "nativeMessaging"
   ],
   "host_permissions": [
     "<all_urls>"

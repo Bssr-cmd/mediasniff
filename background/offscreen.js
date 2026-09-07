@@ -94,8 +94,16 @@ class DownloadTask {
     if (!segments || segments.length === 0) {
       this.reportProgress(5, 'Parsing stream...', '');
       const text = await this.fetchPlaylist(targetUrl, referer);
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, targetUrl);
+      let parsed;
+      if (text.trim().startsWith('#EXTM3U')) {
+        const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
+        parsed = HLSParser.parse(text, targetUrl);
+      } else if (text.trim().startsWith('<') && text.includes('<MPD')) {
+        const { DASHParser } = await import(chrome.runtime.getURL('lib/dash-parser.js'));
+        parsed = DASHParser.parse(text, targetUrl);
+      } else {
+        throw new Error('Unknown manifest format');
+      }
       if (parsed.type === 'media' || (parsed.segments && parsed.segments.length > 0)) {
         segments = parsed.segments;
         initUrl = parsed.initSegment || null;
@@ -127,7 +135,7 @@ class DownloadTask {
     const format = Transmuxer.detectFormat(result.init, result.segments[0]);
 
     let finalBlob;
-    let finalFilename = this.options.filename;
+    let finalFilename = this.options.filename || 'download';
 
     if (format === 'ts') {
       // MPEG-TS segments: TS already contains muxed audio+video.
@@ -211,8 +219,9 @@ class DownloadTask {
       }
     });
     videoDownloader.abortController = this.abortController;
-    const videoResult = await videoDownloader.downloadAll(videoSegments, videoInitUrl);
-    const videoBlob = Transmuxer.merge(videoResult.init, videoResult.segments);
+    let videoResult = await videoDownloader.downloadAll(videoSegments, videoInitUrl);
+    const videoBuffer = await Transmuxer.merge(videoResult.init, videoResult.segments).arrayBuffer();
+    videoResult = null;
     // 2. Download audio
     this.reportProgress(40, 'Downloading audio...', '');
     let audioSegments = audioRendition?.segments;
@@ -233,7 +242,7 @@ class DownloadTask {
         audioInitUrl = aParsed2.initSegment || null;
       }
     }
-    let audioBlob = null;
+    let audioBuffer = null;
     if (audioSegments) {
       const audioDownloader = new SegmentDownloader({
         concurrency: 8,
@@ -244,13 +253,12 @@ class DownloadTask {
         }
       });
       audioDownloader.abortController = this.abortController;
-      const audioResult = await audioDownloader.downloadAll(audioSegments, audioInitUrl);
-      audioBlob = Transmuxer.merge(audioResult.init, audioResult.segments);
+      let audioResult = await audioDownloader.downloadAll(audioSegments, audioInitUrl);
+      audioBuffer = await Transmuxer.merge(audioResult.init, audioResult.segments).arrayBuffer();
+      audioResult = null;
     }
     // 3. Mux
     this.reportProgress(75, 'Muxing tracks (WASM)...', '');
-    const videoBuffer = await videoBlob.arrayBuffer();
-    const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
     const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
       const overall = Math.round(75 + progress * 0.20);
       this.reportProgress(overall, 'Muxing tracks (WASM)...', '');
@@ -345,7 +353,7 @@ class DownloadTask {
         const targetHeight = parseInt(this.options.ytQuality) || 1080;
 
         const videoStreams = adaptiveFormats
-          .filter(f => f.mimeType?.startsWith('video/') && f.mimeType?.includes('mp4'))
+          .filter(f => f.mimeType?.startsWith('video/') && (f.mimeType?.includes('mp4') || f.mimeType?.includes('webm')))
           .map(f => {
              try {
                 return { ...f, resolvedUrl: resolveStreamUrl(f) };
@@ -622,7 +630,7 @@ class DownloadTask {
     });
   }
 }
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'START_BACKGROUND_DOWNLOAD') {
     const { itemId, item, downloadType, options } = message;
     if (activeDownloads.has(itemId)) return;
@@ -636,5 +644,19 @@ chrome.runtime.onMessage.addListener((message) => {
     if (task) {
       task.cancel();
     }
+  }
+  if (message.type === 'PARSE_DASH_OFFSCREEN') {
+    const { content, url } = message;
+    import(chrome.runtime.getURL('lib/dash-parser.js')).then(({ DASHParser }) => {
+      try {
+        const parsed = DASHParser.parse(content, url);
+        sendResponse({ parsed });
+      } catch (err) {
+        sendResponse({ error: err.message });
+      }
+    }).catch(err => {
+      sendResponse({ error: err.message });
+    });
+    return true; // async response
   }
 });

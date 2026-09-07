@@ -107,6 +107,10 @@
         if (jsUrl && jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
         else if (jsUrl && jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
 
+        const videoId = response.videoDetails?.videoId;
+        if (videoId && window._lastSentYtVideoId === videoId) return;
+        window._lastSentYtVideoId = videoId;
+
         window.postMessage({ type: 'MS_YT_RESPONSE', data: response, jsUrl }, '*');
       }
     } catch (e) { /* ignore */ }
@@ -117,6 +121,9 @@
     try {
       const config = window.playerConfig || (window.__vimeo && window.__vimeo.config) || (window.vimeo && window.vimeo.config);
       if (config && (config.request?.files || config.files || config.video)) {
+        const vimeoId = config.video?.id;
+        if (vimeoId && window._lastSentVimeoId === vimeoId) return;
+        window._lastSentVimeoId = vimeoId;
         window.postMessage({ type: 'MS_VIMEO_RESPONSE', data: config }, '*');
         return;
       }
@@ -131,6 +138,9 @@
             try {
               const parsed = JSON.parse(m[1]);
               if (parsed && (parsed.request?.files || parsed.files || parsed.video)) {
+                const parsedVimeoId = parsed.video?.id;
+                if (parsedVimeoId && window._lastSentVimeoId === parsedVimeoId) return;
+                window._lastSentVimeoId = parsedVimeoId;
                 window.postMessage({ type: 'MS_VIMEO_RESPONSE', data: parsed }, '*');
                 return;
               }
@@ -145,7 +155,7 @@
   try {
     const originalFetch = window.fetch;
     window.fetch = function (...args) {
-      const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+      const url = typeof args[0] === 'string' ? args[0] : (args[0] instanceof URL ? args[0].href : args[0]?.url);
       if (url && typeof url === 'string') {
         const urlLower = url.toLowerCase();
         // Immediately report HLS/DASH requests without waiting for network completion
@@ -199,7 +209,9 @@
           result.then(response => {
             if (!response.ok) return;
             const ct = (response.headers.get('content-type') || '').toLowerCase();
-            if (ct.includes('mpegurl') || ct.includes('x-mpegurl') || urlLower.includes('.m3u8') || urlLower.includes('master.json')) {
+            const cl = parseInt(response.headers.get('content-length') || '0');
+            if (cl > 0 && cl > 2 * 1024 * 1024) { /* skip, too large */ }
+            else if (ct.includes('mpegurl') || ct.includes('x-mpegurl') || urlLower.includes('.m3u8') || urlLower.includes('master.json')) {
               response.clone().text().then(content => {
                 reportManifest(url, content, 'hls');
               }).catch(() => {});
@@ -256,7 +268,10 @@
             if (!this.responseType || this.responseType === 'text') {
               responseText = this.responseText;
             } else if (this.responseType === 'arraybuffer' && this.response) {
-              responseText = new TextDecoder('utf-8').decode(this.response);
+              const urlLower = this._msUrl?.toLowerCase() || '';
+              if (urlLower.includes('.m3u8') || urlLower.includes('.mpd') || urlLower.includes('master.json') || urlLower.includes('player.vimeo.com') || urlLower.includes('/manifest')) {
+                responseText = new TextDecoder('utf-8').decode(new Uint8Array(this.response, 0, Math.min(this.response.byteLength, 65536)));
+              }
             }
           } catch (_) {}
 
@@ -408,11 +423,9 @@
       getPlayerResponse();
     }
     getVimeoConfig();
-    scanScriptsForManifests();
-    scanPerformanceEntries();
   }
 
   setTimeout(runScrapers, 500);
   setTimeout(runScrapers, 1500);
-  setInterval(runScrapers, 3000);
+  setInterval(runScrapers, 5000);
 })();

@@ -25,6 +25,7 @@ const storageInitPromise = (async () => {
               map.set(item.id, item);
             }
             mediaRegistry.set(tabId, map);
+            idCounter = Math.max(idCounter, ...Array.from(map.keys()).map(k => parseInt(k.replace('media_', '')) || 0));
           }
         }
       }
@@ -44,14 +45,16 @@ async function ensureOffscreen() {
     return;
   }
 
-  offscreenCreating = chrome.offscreen.createDocument({
-    url: 'background/offscreen.html',
-    reasons: ['DOM_SCRAPING'],
-    justification: 'Media downloading, stream multiplexing, and assembling'
-  });
-
-  await offscreenCreating;
-  offscreenCreating = null;
+  try {
+    offscreenCreating = chrome.offscreen.createDocument({
+      url: 'background/offscreen.html',
+      reasons: ['BLOBS'],
+      justification: 'Media downloading, stream multiplexing, and assembling'
+    });
+    await offscreenCreating;
+  } finally {
+    offscreenCreating = null;
+  }
 }
 // ─── Media Detection Patterns ───────────────────────────────────────
 const MEDIA_EXTENSIONS = /\.(mp4|webm|mkv|avi|mov|flv|wmv|m4v|3gp|ogv)(\?|#|$)/i;
@@ -60,7 +63,7 @@ const HLS_EXTENSIONS = /\.(m3u8)(\?|#|$)/i;
 const DASH_EXTENSIONS = /\.(mpd)(\?|#|$)/i;
 const SUBTITLE_EXTENSIONS = /\.(vtt|srt|ass|ssa|sub|ttml)(\?|#|$)/i;
 // Streaming segments — these are chunks, NOT standalone files
-const SEGMENT_PATTERNS = /\.(ts|m4s|m4f|m4v|m4a|cmfv|cmfa|cmft)(\?|#|$)/i;
+const SEGMENT_PATTERNS = /\.(ts|m4s|m4f|cmfv|cmfa|cmft)(\?|#|$)/i;
 const SEGMENT_URL_PATTERNS = [
   /\/seg-\d+/i,          // seg-1, seg-2...
   /\/segment\d+/i,       // segment0, segment1...
@@ -90,22 +93,18 @@ const MIN_CONTENT_LENGTH = 50000; // 50KB minimum for direct files
 // ─── Request Monitoring ─────────────────────────────────────────────
 chrome.webRequest.onCompleted.addListener(
   handleRequest,
-  { urls: ['<all_urls>'] },
-  ['responseHeaders']
-);
-chrome.webRequest.onResponseStarted.addListener(
-  handleRequest,
-  { urls: ['<all_urls>'] },
+  { urls: ['<all_urls>'], types: ['media', 'xmlhttprequest', 'other'] },
   ['responseHeaders']
 );
 const inFlightRequests = new Set();
 async function handleRequest(details) {
+  await storageInitPromise;
   // Skip extension/internal requests
   if (details.tabId < 0) return;
   if (IGNORE_PATTERNS.some(p => p.test(details.url))) return;
   if (details.type === 'image' || details.type === 'stylesheet' || details.type === 'font') return;
 
-  const reqKey = `${details.tabId}_${getBaseUrl(details.url)}`;
+  const reqKey = `${details.tabId}_${details.url}`;
   if (inFlightRequests.has(reqKey)) return;
   inFlightRequests.add(reqKey);
   setTimeout(() => inFlightRequests.delete(reqKey), 4000);
@@ -158,7 +157,8 @@ async function handleRequest(details) {
   // 0b. Check for Vimeo player config
   else if (url.includes('player.vimeo.com/video/') && url.includes('/config')) {
     try {
-      const resp = await fetch(url, { credentials: 'include', headers: { Referer: details.initiator || url } });
+      // Referer must be set via declarativeNetRequest
+      const resp = await fetch(url, { credentials: 'include' });
       if (resp.ok) {
         const config = await resp.json();
         await processVimeoConfig(config, details.tabId, details.initiator || url);
@@ -204,13 +204,13 @@ async function handleRequest(details) {
     streamType = 'direct';
     mimeType = contentType || 'text/vtt';
   }
-  if (!mediaType) return;
   // ─── Detect or attach individual streaming segments ───────────────
   const isSegment = SEGMENT_PATTERNS.test(url) || SEGMENT_URL_PATTERNS.some(p => p.test(url)) || contentType.includes('mp2t');
   if (isSegment) {
     handleSegmentRequest(details, url, contentType);
     return;
   }
+  if (!mediaType) return;
   // ─── Smart deduplication ──────────────────────────────────────────
   const tabMedia = getTabMedia(details.tabId);
   const baseUrl = getBaseUrl(url);
@@ -503,13 +503,18 @@ async function parseHLSManifest(item, content, url) {
       segments: v.segments || null,
       initUrl: v.initSegment || null
     }));
-    item.audioRenditions = parsed.audioRenditions.map(a => ({
-      url: a.uri,
+    item.audioRenditions = (parsed.audioTracks || parsed.audioRenditions || []).map(a => ({
+      url: a.uri || a.url,
       name: a.name,
       language: a.language,
       isDefault: a.isDefault,
       segments: a.segments || null,
       initUrl: a.initSegment || null
+    }));
+    item.subtitles = (parsed.subtitleTracks || parsed.subtitleRenditions || []).map(s => ({
+      url: s.uri || s.url,
+      language: s.language || s.name,
+      format: 'vtt'
     }));
     item.quality = item.variants.length > 0 ? item.variants[0].label : null;
     item.isLive = false;
@@ -600,14 +605,37 @@ async function tryUpgradeToMasterPlaylist(item, url) {
   }
 }
 // ─── DASH Manifest Parsing ──────────────────────────────────────────
-function parseDASHManifest(item, content, url) {
-  const parsed = DASHParser.parse(content, url);
+async function parseDASHManifest(item, content, url) {
+  let parsed = DASHParser.parse(content, url);
+  
+  if (parsed.needsOffscreenParsing) {
+    await ensureOffscreen();
+    try {
+      parsed = await new Promise((resolve, reject) => {
+        chrome.runtime.sendMessage({
+          type: 'PARSE_DASH_OFFSCREEN',
+          content,
+          url
+        }, (response) => {
+          if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+          else if (response?.error) reject(new Error(response.error));
+          else resolve(response?.parsed);
+        });
+      });
+    } catch (e) {
+      console.warn('[MediaSniff] Offscreen DASH parsing failed:', e);
+      return;
+    }
+  }
+
+  if (!parsed) return;
+
   item.totalDuration = parsed.totalDuration;
   item.isLive = parsed.isLive;
-  if (parsed.periods.length > 0) {
+  if (parsed.periods && parsed.periods.length > 0) {
     const period = parsed.periods[0];
     // Video variants
-    if (period.videoSets.length > 0) {
+    if (period.videoSets && period.videoSets.length > 0) {
       for (const vs of period.videoSets) {
         item.isEncrypted = item.isEncrypted || vs.isEncrypted;
         for (const rep of vs.representations) {
@@ -627,7 +655,7 @@ function parseDASHManifest(item, content, url) {
       }
     }
     // Audio renditions
-    if (period.audioSets.length > 0) {
+    if (period.audioSets && period.audioSets.length > 0) {
       for (const as of period.audioSets) {
         for (const rep of as.representations) {
           item.audioRenditions.push({
@@ -640,6 +668,19 @@ function parseDASHManifest(item, content, url) {
             initUrl: rep.initUrl,
             segments: rep.segments,
             segmentCount: rep.segmentCount
+          });
+        }
+      }
+    }
+    // Subtitle renditions
+    const textSets = period.adaptationSets ? period.adaptationSets.filter(a => a.contentType === 'text' || a.contentType === 'subtitle') : [];
+    if (textSets.length > 0) {
+      for (const ts of textSets) {
+        for (const rep of ts.representations) {
+          item.subtitles.push({
+            url: rep.baseUrl,
+            language: ts.lang || rep.label,
+            format: 'vtt'
           });
         }
       }
@@ -675,20 +716,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'MANIFEST_DETECTED') {
   if (sender.tab) {
     const tabId = sender.tab.id;
-    const mediaId = generateMediaId(message.manifestType || 'hls', message.url);
-    const unifiedMsg = {
-      type: MSG_TYPE.DETECT,
-      mediaId,
-      mediaInfo: {
-        source: message.manifestType || 'hls',
-        url: message.url,
-        content: message.content,
-        manifestType: message.manifestType || 'hls',
-        pageUrl: message.pageUrl || sender.tab.url,
-        title: message.title,
-      }
-    };
-    handleUnifiedMessage(unifiedMsg, tabId, mediaRegistry);
     handleManifestDetected({
       tabId,
       url: message.url,
@@ -698,11 +725,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       title: message.title
     });
   }
-  return true;
+  return;
 }
 
-// duplicate block removed
-  }
   if (message.type === 'DOM_MEDIA') {
     if (sender.tab) {
       const tabId = sender.tab.id;
@@ -742,7 +767,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       updateBadge(tabId);
       notifyPopup(tabId);
     }
-    return true;
+    return;
   }
   if (message.type === 'DOM_EMBED') {
     if (sender.tab) {
@@ -817,7 +842,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       updateBadge(tabId);
       notifyPopup(tabId);
     }
-    return true;
+    return;
   }
   // YouTube player data from content script
   if (message.type === 'YOUTUBE_DATA') {
@@ -911,7 +936,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       updateBadge(tabId);
       notifyPopup(tabId);
     }
-    return true;
+    return;
   }
   // Vimeo player data from content script
   if (message.type === 'VIMEO_DATA') {
@@ -1013,7 +1038,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         notifyPopup(tabId);
       }
     }
-    return true;
+    return;
   }
   if (message.type === 'RESOLVE_VIMEO_EMBED') {
     const tabId = sender.tab?.id;
@@ -1244,6 +1269,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }).catch(() => {});
 
       await ensureOffscreen();
+      await new Promise(r => setTimeout(r, 500));
       chrome.runtime.sendMessage({
         type: 'START_BACKGROUND_DOWNLOAD',
         itemId, item, downloadType, options
@@ -1293,7 +1319,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       });
     }
     // Forward to popup (if popup is open)
-    chrome.runtime.sendMessage(message).catch(() => {
+    chrome.runtime.sendMessage({...message, _forwarded: true}).catch(() => {
       // Popup closed, ignore error
     });
     // Close offscreen document if no more active downloads
@@ -1302,7 +1328,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         if (activeDownloads.size === 0 && await chrome.offscreen.hasDocument()) {
           chrome.offscreen.closeDocument().catch(() => { });
         }
-      }, 10000);
+      }, 60000);
     }
     return true;
   }
@@ -1377,6 +1403,15 @@ function getStorageKey(tabId) {
   return `tab_media_${tabId}`;
 }
 
+const pendingPersists = new Map();
+function debouncedPersist(tabId) {
+  if (pendingPersists.has(tabId)) clearTimeout(pendingPersists.get(tabId));
+  pendingPersists.set(tabId, setTimeout(() => {
+    pendingPersists.delete(tabId);
+    persistTabMedia(tabId);
+  }, 500));
+}
+
 async function persistTabMedia(tabId) {
   await storageInitPromise;
   const tabMedia = mediaRegistry.get(tabId);
@@ -1432,7 +1467,7 @@ function updateBadge(tabId) {
   chrome.action.setBadgeText({ text: count > 0 ? String(count) : '', tabId });
   chrome.action.setBadgeBackgroundColor({ color: '#6366f1', tabId });
   if (count > 0) {
-    persistTabMedia(tabId);
+    debouncedPersist(tabId);
   } else {
     clearTabMediaStorage(tabId);
   }
@@ -1484,11 +1519,14 @@ async function fetchManifest(url, referer = null) {
 }
 
 // ─── Declarative Net Request Header Rules ───────────────────────────
-const DNR_RULE_IDS = Array.from({ length: 20 }, (_, i) => 1001 + i);
+let dnrTaskCounter = 0;
 
 async function setDownloadHeadersRule(url, referer, extraUrls = []) {
   if (!chrome.declarativeNetRequest || !referer) return;
   try {
+    dnrTaskCounter++;
+    const ruleBase = 1000 + (dnrTaskCounter % 100) * 20;
+    const ruleIds = Array.from({ length: 20 }, (_, i) => ruleBase + i);
     let origin = referer;
     try { origin = new URL(referer).origin; } catch (_) {}
 
@@ -1512,9 +1550,9 @@ async function setDownloadHeadersRule(url, referer, extraUrls = []) {
     }
 
     const rules = [];
-    let ruleId = 1001;
+    let ruleId = ruleBase;
     for (const domain of domains) {
-      if (ruleId > 1020) break;
+      if (ruleId >= ruleBase + 20) break;
       rules.push({
         id: ruleId++,
         priority: 1,
@@ -1533,7 +1571,7 @@ async function setDownloadHeadersRule(url, referer, extraUrls = []) {
     }
 
     await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: DNR_RULE_IDS,
+      removeRuleIds: ruleIds,
       addRules: rules
     });
   } catch (e) {
@@ -1544,8 +1582,9 @@ async function setDownloadHeadersRule(url, referer, extraUrls = []) {
 async function clearDownloadHeadersRule() {
   if (!chrome.declarativeNetRequest) return;
   try {
+    const allIds = Array.from({ length: 2000 }, (_, i) => 1000 + i);
     await chrome.declarativeNetRequest.updateDynamicRules({
-      removeRuleIds: DNR_RULE_IDS
+      removeRuleIds: allIds
     });
   } catch (_) {}
 }
@@ -1807,7 +1846,9 @@ function extractFilename(url, mimeType) {
     let name = parts[parts.length - 1] || 'media';
     name = decodeURIComponent(name.split('?')[0]);
     name = name.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
-    if (name.length > 60) name = name.substring(0, 57) + '...';
+    const ext = name.match(/\.[^.]+$/)?.[0] || '';
+    const stem = name.replace(/\.[^.]+$/, '');
+    if (stem.length > 56) name = stem.substring(0, 56) + '...' + ext;
     return name;
   } catch {
     return 'media';
@@ -1854,8 +1895,13 @@ function sanitizeFilename(name) {
 function getBaseUrl(urlStr) {
   try {
     const u = new URL(urlStr);
-    // Strip query params and hash — just keep scheme + host + path
-    return `${u.origin}${u.pathname}`;
+    const keepParams = ['v', 'id', 'itag', 'mime'];
+    const search = new URLSearchParams();
+    for (const p of keepParams) {
+      if (u.searchParams.has(p)) search.set(p, u.searchParams.get(p));
+    }
+    const query = search.toString();
+    return `${u.origin}${u.pathname}${query ? '?' + query : ''}`;
   } catch {
     return urlStr;
   }

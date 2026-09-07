@@ -38,15 +38,7 @@ function upsertMedia(tabId, mediaRegistry, mediaId, mediaInfo) {
  * @param {Map} mediaRegistry - Global registry reference.
  */
 export function handleUnifiedMessage(msg, tabId, mediaRegistry) {
-  if (!msg || typeof msg !== 'object') return;
-  const { type, mediaId, mediaInfo } = msg;
-  if (!type || !mediaId) return;
-
-  switch (type) {
-    case MSG_TYPE.DETECT:
-      upsertMedia(tabId, mediaRegistry, mediaId, mediaInfo);
-      break;
-    default:
-      console.warn('[MediaSniff] Unhandled unified message type:', type);
-  }
+  // Unified message handling disabled — detection is handled directly
+  // by handleManifestDetected/handleDirectMedia in service-worker.js
+  return;
 }

@@ -19,21 +19,18 @@ export const MSG_TYPE = {
 export function generateMediaId(source, url) {
   try {
     const u = new URL(url);
-    u.search = '';
+    // Preserve essential query params that identify unique media
+    const essentialParams = ['v', 'id', 'list', 'h', 'itag'];
+    const newSearch = new URLSearchParams();
+    for (const param of essentialParams) {
+      if (u.searchParams.has(param)) {
+        newSearch.set(param, u.searchParams.get(param));
+      }
+    }
+    u.search = newSearch.toString();
     u.hash = '';
-    const normalized = u.toString();
-    return `${source}:${normalized}`;
+    return `${source}:${u.toString()}`;
   } catch (_) {
-    // Fallback for malformed URLs
     return `${source}:${url}`;
   }
-}
-
-/** Simple validation of protocol messages */
-export function validateMessage(msg) {
-  if (!msg || typeof msg !== 'object') return false;
-  const { type, mediaId } = msg;
-  if (!type || !mediaId) return false;
-  if (!Object.values(MSG_TYPE).includes(type)) return false;
-  return true;
 }
