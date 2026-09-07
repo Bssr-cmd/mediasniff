@@ -504,11 +504,17 @@ function createMediaCard(item) {
           ${ICONS.mux} Mux
         </button>
       ` : ''}
-      <button class="btn btn-secondary" id="copy-${item.id}" title="Copy URL">
-        ${ICONS.copy}
+      <button class="btn btn-secondary" id="dl-${item.id}" ${progress ? 'disabled' : ''}>
+        Direct Stream
+      </button>
+      <button class="btn btn-secondary" id="streamToDisk-${item.id}" ${progress ? 'disabled' : ''} title="Stream to disk using File System API (Saves Memory)">
+        Stream to Disk
       </button>
       <button class="btn btn-secondary" id="ytdlp-${item.id}" title="Download via yt-dlp native app">
         <span style="font-family:var(--font-mono);font-size:10px;font-weight:600;">yt-dlp</span>
+      </button>
+      <button class="btn btn-secondary" id="copy-${item.id}" title="Copy URL">
+        ${ICONS.copy}
       </button>
     </div>
     <div class="progress-container" id="progress-${item.id}">
@@ -595,6 +601,15 @@ function createMediaCard(item) {
   const muxBtn = card.querySelector(`#mux-${item.id}`);
   if (muxBtn) {
     muxBtn.addEventListener('click', () => handleMuxDownload(item));
+  }
+
+  const streamToDiskBtn = card.querySelector(`#streamToDisk-${item.id}`);
+  if (streamToDiskBtn) {
+    streamToDiskBtn.addEventListener('click', () => {
+      const filename = getSmartName(item);
+      const url = chrome.runtime.getURL(`downloader.html?itemId=${item.id}&filename=${encodeURIComponent(filename)}`);
+      chrome.tabs.create({ url });
+    });
   }
 
   // Copy URL
