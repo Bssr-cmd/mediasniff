@@ -1724,10 +1724,22 @@ async function processVimeoConfig(config, tabId, pageUrl, defaultTitle = '') {
 async function handleManifestDetected({ tabId, url, content, manifestType, pageUrl, title }) {
   if (!tabId || !url) return;
   const tabMedia = getTabMedia(tabId);
-  const baseUrl = getBaseUrl(url);
 
-  // Check if already registered and parsed
-  const existing = Array.from(tabMedia.values()).find(m => m.url === url || (m.parsed && m.variants?.length > 0 && getBaseUrl(m.url) === baseUrl));
+  const isSamePlaylistEarly = (url1, url2) => {
+    if (!url1 || !url2) return false;
+    if (url1 === url2) return true;
+    try {
+      const u1 = new URL(url1);
+      const u2 = new URL(url2);
+      if (u1.pathname === u2.pathname) return true;
+      return url1.includes(url2.split('?')[0]) || url2.includes(url1.split('?')[0]);
+    } catch {
+      return url1.includes(url2) || url2.includes(url1);
+    }
+  };
+
+  // Check if already registered and parsed (even from a different CDN with the same pathname)
+  const existing = Array.from(tabMedia.values()).find(m => isSamePlaylistEarly(m.url, url));
   if (existing && existing.parsed && existing.variants?.length > 0) {
     return;
   }
@@ -1758,6 +1770,24 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
   };
 
   item.referer = pageUrl || item.referer;
+
+  // Check if this new URL is a child of an existing master playlist
+  let earlyIsChild = false;
+  for (const [mId, m] of tabMedia.entries()) {
+    if (m.variants?.length > 0) {
+      const isVariant = m.variants.some(v => isSamePlaylistEarly(v.url, item.url));
+      const isAudio = m.audioRenditions?.some(a => isSamePlaylistEarly(a.url, item.url));
+      const isSub = m.subtitles?.some(s => isSamePlaylistEarly(s.url, item.url));
+      if (isVariant || isAudio || isSub) {
+        earlyIsChild = true;
+        break;
+      }
+    }
+  }
+
+  if (earlyIsChild) {
+    return; // Don't even add it temporarily
+  }
 
   // Register immediately so the item is instantly visible in the popup
   tabMedia.set(id, item);
@@ -1808,24 +1838,11 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
           }
           item.parsed = true;
 
-          const isSamePlaylist = (url1, url2) => {
-            if (!url1 || !url2) return false;
-            if (url1 === url2) return true;
-            try {
-              const u1 = new URL(url1);
-              const u2 = new URL(url2);
-              if (u1.pathname === u2.pathname) return true;
-              return url1.includes(url2.split('?')[0]) || url2.includes(url1.split('?')[0]);
-            } catch {
-              return url1.includes(url2) || url2.includes(url1);
-            }
-          };
-
           if (item.variants?.length > 0) {
             for (const [mId, m] of tabMedia.entries()) {
               if (mId !== item.id && (!m.variants || m.variants.length === 0)) {
                 let isChild = false;
-                const matchVariant = item.variants.find(v => isSamePlaylist(v.url, m.url));
+                const matchVariant = item.variants.find(v => isSamePlaylistEarly(v.url, m.url));
                 if (matchVariant) {
                   isChild = true;
                   if (m.segments?.length > 0 && !matchVariant.segments) {
@@ -1833,7 +1850,7 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
                     matchVariant.initUrl = m.initUrl;
                   }
                 }
-                const matchAudio = item.audioRenditions?.find(a => isSamePlaylist(a.url, m.url));
+                const matchAudio = item.audioRenditions?.find(a => isSamePlaylistEarly(a.url, m.url));
                 if (matchAudio) {
                   isChild = true;
                   if (m.segments?.length > 0 && !matchAudio.segments) {
@@ -1841,7 +1858,7 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
                     matchAudio.initUrl = m.initUrl;
                   }
                 }
-                const matchSub = item.subtitles?.find(s => isSamePlaylist(s.url, m.url));
+                const matchSub = item.subtitles?.find(s => isSamePlaylistEarly(s.url, m.url));
                 if (matchSub) {
                   isChild = true;
                 }
@@ -1854,9 +1871,9 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
             let isChild = false;
             for (const [mId, m] of tabMedia.entries()) {
               if (mId !== item.id && m.variants?.length > 0) {
-                const isVariant = m.variants.some(v => isSamePlaylist(v.url, item.url));
-                const isAudio = m.audioRenditions?.some(a => isSamePlaylist(a.url, item.url));
-                const isSub = m.subtitles?.some(s => isSamePlaylist(s.url, item.url));
+                const isVariant = m.variants.some(v => isSamePlaylistEarly(v.url, item.url));
+                const isAudio = m.audioRenditions?.some(a => isSamePlaylistEarly(a.url, item.url));
+                const isSub = m.subtitles?.some(s => isSamePlaylistEarly(s.url, item.url));
                 if (isVariant || isAudio || isSub) {
                   isChild = true;
                   break;
@@ -1864,7 +1881,10 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
               }
             }
             if (isChild) {
-              return; // do not add this child playlist to tabMedia
+              tabMedia.delete(id);
+              updateBadge(tabId);
+              notifyPopup(tabId);
+              return; // It is a child playlist, remove it from UI
             }
           }
 
