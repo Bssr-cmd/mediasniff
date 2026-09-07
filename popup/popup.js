@@ -869,14 +869,44 @@ async function downloadSubtitles(item, videoFilename) {
 
     const sub = item.subtitles[i];
     try {
-      const response = await fetch(sub.url);
-      if (!response.ok) continue;
-      const blob = await response.blob();
+      let subBlob;
+      let ext = sub.format || 'vtt';
+
+      if (sub.url.includes('.m3u8')) {
+        // Fetch segmented VTT
+        const m3u8Resp = await fetch(sub.url);
+        if (!m3u8Resp.ok) continue;
+        const text = await m3u8Resp.text();
+        const lines = text.split(/\r?\n/);
+        const segmentUrls = [];
+        let baseUrl = sub.url.substring(0, sub.url.lastIndexOf('/') + 1);
+        for (const line of lines) {
+          if (line && !line.startsWith('#')) {
+            segmentUrls.push(line.startsWith('http') ? line : baseUrl + line);
+          }
+        }
+        
+        let fullVtt = 'WEBVTT\n\n';
+        for (const segUrl of segmentUrls) {
+          const segResp = await fetch(segUrl);
+          if (!segResp.ok) continue;
+          let segText = await segResp.text();
+          // Remove WEBVTT header and X-TIMESTAMP-MAP
+          segText = segText.replace(/^WEBVTT.*[\r\n]*/i, '');
+          segText = segText.replace(/^X-TIMESTAMP-MAP.*[\r\n]*/im, '');
+          fullVtt += segText.trim() + '\n\n';
+        }
+        subBlob = new Blob([fullVtt], { type: 'text/vtt' });
+        ext = 'vtt';
+      } else {
+        const response = await fetch(sub.url);
+        if (!response.ok) continue;
+        subBlob = await response.blob();
+      }
 
       const lang = sub.language || `sub${i + 1}`;
-      const ext = sub.format || 'vtt';
       const subFilename = `${baseName}.${lang}.${ext}`;
-      triggerBlobDownload(blob, subFilename);
+      triggerBlobDownload(subBlob, subFilename);
     } catch (e) {
       console.warn(`[MediaSniff] Subtitle download failed:`, e.message);
     }

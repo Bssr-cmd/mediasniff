@@ -1811,14 +1811,42 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
           if (item.variants?.length > 0) {
             for (const [mId, m] of tabMedia.entries()) {
               if (mId !== item.id && (!m.variants || m.variants.length === 0)) {
-                if (m.segments?.length > 0) {
-                  const matchVariant = item.variants.find(v => v.url && m.url && (v.url === m.url || getBaseUrl(v.url) === getBaseUrl(m.url) || m.url.includes(v.url.split('?')[0]) || v.url.includes(m.url.split('?')[0])));
-                  if (matchVariant && !matchVariant.segments) {
+                let isChild = false;
+                const matchVariant = item.variants.find(v => v.url && m.url && (v.url === m.url || getBaseUrl(v.url) === getBaseUrl(m.url) || m.url.includes(v.url.split('?')[0]) || v.url.includes(m.url.split('?')[0])));
+                if (matchVariant) {
+                  isChild = true;
+                  if (m.segments?.length > 0 && !matchVariant.segments) {
                     matchVariant.segments = m.segments;
                     matchVariant.initUrl = m.initUrl;
                   }
                 }
+                const matchAudio = item.audioRenditions?.find(a => a.url && m.url && (a.url === m.url || getBaseUrl(a.url) === getBaseUrl(m.url) || m.url.includes(a.url.split('?')[0]) || a.url.includes(m.url.split('?')[0])));
+                if (matchAudio) {
+                  isChild = true;
+                  if (m.segments?.length > 0 && !matchAudio.segments) {
+                    matchAudio.segments = m.segments;
+                    matchAudio.initUrl = m.initUrl;
+                  }
+                }
+                if (isChild) {
+                  tabMedia.delete(mId);
+                }
               }
+            }
+          } else {
+            let isChild = false;
+            for (const [mId, m] of tabMedia.entries()) {
+              if (mId !== item.id && m.variants?.length > 0) {
+                const isVariant = m.variants.some(v => v.url && item.url && (v.url === item.url || getBaseUrl(v.url) === getBaseUrl(item.url) || item.url.includes(v.url.split('?')[0]) || v.url.includes(item.url.split('?')[0])));
+                const isAudio = m.audioRenditions?.some(a => a.url && item.url && (a.url === item.url || getBaseUrl(a.url) === getBaseUrl(item.url) || item.url.includes(a.url.split('?')[0]) || a.url.includes(item.url.split('?')[0])));
+                if (isVariant || isAudio) {
+                  isChild = true;
+                  break;
+                }
+              }
+            }
+            if (isChild) {
+              return; // do not add this child playlist to tabMedia
             }
           }
 
