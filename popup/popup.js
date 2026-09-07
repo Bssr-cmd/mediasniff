@@ -504,10 +504,7 @@ function createMediaCard(item) {
           ${ICONS.mux} Mux
         </button>
       ` : ''}
-      <button class="btn btn-secondary" id="dl-${item.id}" ${progress ? 'disabled' : ''}>
-        Direct Stream
-      </button>
-      <button class="btn btn-secondary" id="streamToDisk-${item.id}" ${progress ? 'disabled' : ''} title="Stream to disk using File System API (Saves Memory)">
+      <button class="btn btn-secondary" id="streamToDisk-${item.id}" title="Stream to disk using File System API (Saves Memory)">
         Stream to Disk
       </button>
       <button class="btn btn-secondary" id="ytdlp-${item.id}" title="Download via yt-dlp native app">

@@ -6,6 +6,9 @@ import { HLSParser } from '../lib/hls-parser.js';
 import { DASHParser } from '../lib/dash-parser.js';
 import { MSG_TYPE, generateMediaId } from '../shared/protocol.js';
 import { handleUnifiedMessage } from '../shared/unified.js';
+
+
+
 // ─── Per-Tab Media Registry & Storage Sync ───────────────────────────
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
 let idCounter = 0;
