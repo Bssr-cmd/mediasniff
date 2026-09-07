@@ -335,17 +335,19 @@ class DownloadTask {
           const parsed = parseCipher(cipherStr);
           if (!parsed.url) return null;
 
-
-          if (parsed.s && decipher) {
-            try {
-              const signature = decipher(parsed.s);
-              const urlObj = new URL(parsed.url);
-              urlObj.searchParams.set(parsed.sp, signature);
-              urlObj.searchParams.set('ratebypass', 'yes');
-              return urlObj.href;
-            } catch (err) {
-              return parsed.url;
+          if (parsed.s) {
+            if (decipher) {
+              try {
+                const signature = decipher(parsed.s);
+                const urlObj = new URL(parsed.url);
+                urlObj.searchParams.set(parsed.sp, signature);
+                urlObj.searchParams.set('ratebypass', 'yes');
+                return urlObj.href;
+              } catch (err) {
+                return null; // Return null so we fall back to Cobalt
+              }
             }
+            return null; // Return null if decipher is missing so we fall back
           }
           return parsed.url;
         };
@@ -426,9 +428,6 @@ class DownloadTask {
 
     if (this.item.directVideoUrls && this.item.directVideoUrls[this.options.ytQuality]) {
       videoUrl = this.item.directVideoUrls[this.options.ytQuality];
-      // Only override audioUrl if a direct intercepted audio URL actually exists.
-      // Otherwise keep the audioUrl already resolved from rawAdaptiveFormats/getDownloadUrl
-      // — overwriting it with undefined was causing no-audio downloads.
       const directAudio = this.item.directAudioUrls && this.item.directAudioUrls['default'];
       if (directAudio) {
         audioUrl = directAudio;
@@ -437,6 +436,39 @@ class DownloadTask {
       console.log(`[MediaSniff Offscreen] Intercepted stream detected in registry:`, videoUrl);
     }
     
+    // ─── YouTube 'n' parameter Anti-403 Bypass ───
+    // If the requested quality wasn't directly intercepted, our memory-resolved URL has the correct 'sig'
+    // but the OBFUSCATED 'n' parameter, which causes YouTube to return HTTP 403 Forbidden.
+    // Solution: Steal the valid, deobfuscated 'n' parameter from ANY active intercepted player stream
+    // and overwrite the bad 'n' parameter in our target URLs!
+    let validNParam = null;
+    if (this.item.directVideoUrls || this.item.directAudioUrls) {
+      const anyDirect = (this.item.directVideoUrls && Object.values(this.item.directVideoUrls)[0]) 
+                     || (this.item.directAudioUrls && this.item.directAudioUrls['default']);
+      if (anyDirect) {
+        try {
+          validNParam = new URL(anyDirect).searchParams.get('n');
+        } catch(e) {}
+      }
+    }
+    
+    if (validNParam) {
+      const injectN = (uStr) => {
+        if (!uStr) return uStr;
+        try {
+          const u = new URL(uStr);
+          if (u.hostname.includes('googlevideo.com') && u.searchParams.has('n')) {
+            u.searchParams.set('n', validNParam);
+            return u.href;
+          }
+        } catch(e) {}
+        return uStr;
+      };
+      videoUrl = injectN(videoUrl);
+      audioUrl = injectN(audioUrl);
+      console.log(`[MediaSniff Offscreen] Injected valid 'n' parameter to prevent 403 errors.`);
+    }
+
     if (!videoUrl) {
       throw new Error('API_UNAVAILABLE');
     }
