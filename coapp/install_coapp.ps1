@@ -56,9 +56,17 @@ for ($i = 0; $i -lt 32; $i++) {
 Write-Host "  -> Calculated Extension ID: $calculatedId" -ForegroundColor Green
 # 3. Double-check in Chrome User Data Preferences for loaded profiles (if present)
 $chromePrefId = $null
-$chromePrefPath = "$env:LOCALAPPDATA\Google\Chrome\User Data\**\Preferences"
+$chromePrefPath = @(
+    "$env:LOCALAPPDATA\Google\Chrome\User Data",
+    "$env:LOCALAPPDATA\Microsoft\Edge\User Data",
+    "$env:LOCALAPPDATA\BraveSoftware\Brave-Browser\User Data",
+    "$env:LOCALAPPDATA\Chromium\User Data"
+)
 try {
-    $prefFiles = Get-ChildItem -Path "$env:LOCALAPPDATA\Google\Chrome\User Data\" -Filter "Preferences" -Recurse -ErrorAction SilentlyContinue
+    $prefFiles = @()
+    foreach ($path in $chromePrefPath) {
+        $prefFiles += Get-ChildItem -Path $path -Filter "Preferences" -Recurse -ErrorAction SilentlyContinue
+    }
     foreach ($file in $prefFiles) {
         $content = Get-Content -Raw -Path $file.FullName -ErrorAction SilentlyContinue
         if ($content -and $content.Contains("MediaSniff")) {
@@ -104,12 +112,19 @@ $manifestJson = ConvertTo-Json $manifestData -Depth 5
 Write-Host "  -> Manifest written successfully to: $manifestPath" -ForegroundColor Green
 # 5. Create Registry Keys under HKCU
 Write-Host "Writing Windows Registry keys..." -ForegroundColor Yellow
-$registryPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp"
-if (!(Test-Path $registryPath)) {
-    New-Item -Path $registryPath -Force | Out-Null
+$registryPaths = @(
+    "HKCU:\Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\Chromium\NativeMessagingHosts\net.mediasniff.coapp"
+)
+foreach ($regPath in $registryPaths) {
+    if (!(Test-Path $regPath)) {
+        New-Item -Path $regPath -Force | Out-Null
+    }
+    Set-ItemProperty -Path $regPath -Name '(default)' -Value $manifestPath -Force
+    Write-Host "  -> Registry entry created under: $regPath" -ForegroundColor Green
 }
-Set-ItemProperty -Path $registryPath -Name '' -Value $manifestPath -Force
-Write-Host "  -> Registry entry created under HKCU: net.mediasniff.coapp" -ForegroundColor Green
 # 6. Verify FFmpeg
 Write-Host "Checking for FFmpeg dependency..." -ForegroundColor Yellow
 $ffmpegInPath = $false
