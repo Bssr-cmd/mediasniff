@@ -24,7 +24,7 @@ An advanced, high-performance browser extension (Manifest V3) designed to sniff,
   - Standalone quality select badges and custom media card views.
 
 - **🧹 Smart Context Naming**
-  - Automatically sanitizes and generates friendly filenames (e.g. `Creator - Video_Title_(1080p).mp4`) using document metadata and stream resolution details.
+  - Automatically sanitizes and generates friendly filenames (e.g. `Creator - Video Title (1080p).mp4`) using document metadata and stream resolution details.
   - Smart deduplication filters out repetitive caching, CDN variations, and raw chunk listings.
 
 ---

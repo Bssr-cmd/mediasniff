@@ -385,10 +385,12 @@ class DownloadTask {
             || audioStreams[0];
 
           audioUrl = matchedAudio?.resolvedUrl || null;
-          isCombined = false;
-          
           const title = this.item.title || 'Video';
-          resultFilename = `${title}${isWebmVideo ? '.webm' : '.mp4'}`;
+          const defaultName = `${title}${isWebmVideo ? '.webm' : '.mp4'}`;
+          resultFilename = this.options.filename || defaultName;
+          if (isWebmVideo && !resultFilename.endsWith('.webm')) {
+            resultFilename = resultFilename.replace(/\.[^.]+$/, '') + '.webm';
+          }
           
           console.log(`[MediaSniff YouTube] Selected video: ${bestVideo.height}p ${bestVideo.mimeType}, audio: ${matchedAudio ? matchedAudio.mimeType : 'NONE'}, file: ${resultFilename}`);
         } else {
@@ -570,9 +572,11 @@ class DownloadTask {
   async triggerSave(blob, filename) {
     const url = URL.createObjectURL(blob);
     const sanitized = filename
+      .replace(/_/g, ' ')
       .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-      .replace(/\.\./g, '_')
+      .replace(/\.\./g, ' ')
       .replace(/^\.+/, '')
+      .replace(/\s+/g, ' ')
       .trim()
       .substring(0, 200) || 'download.mp4';
 

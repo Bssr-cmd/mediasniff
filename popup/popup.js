@@ -526,15 +526,26 @@ function getSmartName(item) {
     }
   }
 
-  // Clean name
-  name = name
-    .replace(/&/g, 'and')
-    .replace(/\s+/g, '_')
-    .replace(/_{2,}/g, '_')
-    .replace(/[^\w\s_.()-]/g, '');
-  if (name.length > 80) name = name.substring(0, 80);
+  // Strip existing extension if any to avoid duplicate extensions
+  name = name.replace(/\.(mp4|webm|mkv|ts|m4s|m4a|mp3|vtt|srt)$/i, '');
 
-  return quality ? `${name}_(${quality})${ext}` : `${name}${ext}`;
+  // Strip duplicate trailing resolution/quality tag if already present in title
+  if (quality) {
+    const qualEscaped = quality.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    name = name.replace(new RegExp(`\\s*[(_-]*${qualEscaped}[)]*\\s*$`, 'i'), '');
+  }
+
+  // Clean name: replace underscores with spaces, remove illegal filesystem chars, collapse whitespace
+  name = name
+    .replace(/_/g, ' ')
+    .replace(/&/g, 'and')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (name.length > 80) name = name.substring(0, 80).trim();
+
+  return quality ? `${name} (${quality})${ext}` : `${name}${ext}`;
 }
 
 // ─── Download Handlers ──────────────────────────────────────────────
@@ -744,10 +755,12 @@ function triggerBlobDownload(blob, filename) {
 function sanitizeFilename(name) {
   if (!name) return 'download.mp4';
   return name
+    .replace(/_/g, ' ')
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-    .replace(/\.\./g, '_')
+    .replace(/\.\./g, ' ')
     .replace(/^\.+/, '')
     .replace(/&/g, 'and')
+    .replace(/\s+/g, ' ')
     .trim()
     .substring(0, 200) || 'download.mp4';
 }

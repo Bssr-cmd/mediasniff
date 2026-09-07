@@ -1787,6 +1787,7 @@ function extractFilename(url, mimeType) {
     const parts = pathname.split('/');
     let name = parts[parts.length - 1] || 'media';
     name = decodeURIComponent(name.split('?')[0]);
+    name = name.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
     if (name.length > 60) name = name.substring(0, 57) + '...';
     return name;
   } catch {
@@ -1820,11 +1821,14 @@ function extractSubLanguage(url) {
 }
 function sanitizeFilename(name) {
   if (!name) return null;
-  // Remove path separators and illegal filesystem characters
+  // Remove path separators, illegal filesystem characters, and replace underscores with spaces
   return name
+    .replace(/_/g, ' ')
     .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-    .replace(/\.\./g, '_')
+    .replace(/\.\./g, ' ')
     .replace(/^\.+/, '')
+    .replace(/&/g, 'and')
+    .replace(/\s+/g, ' ')
     .trim()
     .substring(0, 200);
 }
