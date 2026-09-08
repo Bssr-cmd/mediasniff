@@ -217,12 +217,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     let nativeHostAvailable = false;
     if (permGranted) {
       try {
-        const port = chrome.runtime.connectNative('net.mediasniff.coapp');
-        port.onDisconnect.addListener(() => {
-          // native host not available
-        });
-        nativeHostAvailable = true;
-        port.disconnect();
+        // Query native app status through the service worker (the sole native messaging owner)
+        const resp = await chrome.runtime.sendMessage({ type: 'NATIVE_PING' });
+        nativeHostAvailable = resp?.available === true;
       } catch (e) {
         nativeHostAvailable = false;
       }
@@ -604,7 +601,7 @@ function createMediaCard(item) {
   if (streamToDiskBtn) {
     streamToDiskBtn.addEventListener('click', () => {
       const filename = getSmartName(item);
-      const url = chrome.runtime.getURL(`downloader.html?itemId=${item.id}&filename=${encodeURIComponent(filename)}`);
+      const url = chrome.runtime.getURL(`downloader.html?itemId=${item.id}&tabId=${currentTabId}&filename=${encodeURIComponent(filename)}`);
       chrome.tabs.create({ url });
     });
   }

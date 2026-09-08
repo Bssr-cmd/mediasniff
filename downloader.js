@@ -1,5 +1,6 @@
 const urlParams = new URLSearchParams(window.location.search);
 const itemId = urlParams.get("itemId");
+const tabId = parseInt(urlParams.get("tabId"));
 const filename = urlParams.get("filename") || "download.mp4";
 
 async function startDownload() {
@@ -12,18 +13,44 @@ async function startDownload() {
     const writable = await handle.createWritable();
     
     // Request item data from background
-    const response = await new Promise(r => chrome.runtime.sendMessage({ type: "GET_MEDIA" }, r));
-    const item = response.media.find(m => m.id === itemId);
+    const msg = { type: "GET_MEDIA" };
+    if (tabId && !isNaN(tabId)) msg.tabId = tabId;
+    const response = await new Promise(r => chrome.runtime.sendMessage(msg, r));
+    const allMedia = response?.media || [];
+    const item = allMedia.find(m => m.id === itemId);
     if (!item) throw new Error("Media item not found");
     
-    let segments = item.variants && item.variants[0] ? item.variants[0].segments : [];
+    // Resolve segments: check variant segments, then item-level segments
+    let segments = null;
+    let initUrl = null;
+    if (item.variants && item.variants.length > 0 && item.variants[0].segments && item.variants[0].segments.length > 0) {
+      segments = item.variants[0].segments;
+      initUrl = item.variants[0].initUrl || null;
+    } else if (item.segments && item.segments.length > 0) {
+      segments = item.segments;
+      initUrl = item.initUrl || null;
+    }
     if (!segments || segments.length === 0) throw new Error("No segments found for streaming.");
     
     statusEl.textContent = "Downloading...";
     
+    // Fetch and write initialization segment first (required for fMP4)
+    if (initUrl) {
+      statusEl.textContent = "Downloading init segment...";
+      const initRes = await fetch(initUrl);
+      if (initRes.ok) {
+        const initBuffer = await initRes.arrayBuffer();
+        await writable.write(initBuffer);
+      }
+    }
+    
+    // Download and write each media segment
     for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i];
-      const res = await fetch(seg.url);
+      // Segments can be plain URL strings or objects with a .url property
+      const segUrl = typeof segments[i] === 'string' ? segments[i] : segments[i].url;
+      if (!segUrl) throw new Error("Segment " + i + " has no URL");
+      
+      const res = await fetch(segUrl);
       if (!res.ok) throw new Error("Failed to fetch chunk " + i);
       
       const buffer = await res.arrayBuffer();
@@ -56,4 +83,3 @@ document.addEventListener("DOMContentLoaded", () => {
   };
   document.querySelector(".card").appendChild(btn);
 });
-

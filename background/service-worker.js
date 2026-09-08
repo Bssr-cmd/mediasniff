@@ -5,9 +5,243 @@
 import { HLSParser } from '../lib/hls-parser.js';
 import { DASHParser } from '../lib/dash-parser.js';
 import { MSG_TYPE, generateMediaId } from '../shared/protocol.js';
-import { handleUnifiedMessage } from '../shared/unified.js';
 
+// ─── Native Messaging Bridge ─────────────────────────────────────────
+// Single managed connection to the native companion app (coapp.py).
+// The service worker is the ONLY context allowed to call connectNative in MV3.
+// All other contexts (offscreen, popup) communicate via chrome.runtime messages.
+const NATIVE_HOST = 'net.mediasniff.coapp';
 
+class NativeMessagingBridge {
+  constructor() {
+    this._port = null;
+    this._connected = false;
+    this._listeners = new Map();    // itemId -> { onMessage, onDone }
+    this._pendingPing = null;       // resolve/reject for ping
+    this._reconnectTimer = null;
+  }
+
+  /** Check if native host permission is available */
+  async _hasPermission() {
+    try {
+      return await chrome.permissions.contains({ permissions: ['nativeMessaging'] });
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /** Open a persistent port to the native host. Returns true if connected. */
+  async connect() {
+    if (this._connected && this._port) return true;
+    if (!(await this._hasPermission())) return false;
+
+    try {
+      this._port = chrome.runtime.connectNative(NATIVE_HOST);
+      this._connected = true;
+
+      this._port.onMessage.addListener((msg) => this._handleMessage(msg));
+      this._port.onDisconnect.addListener(() => this._handleDisconnect());
+
+      console.log('[MediaSniff NativeBridge] Connected to', NATIVE_HOST);
+      return true;
+    } catch (e) {
+      console.warn('[MediaSniff NativeBridge] Failed to connect:', e.message);
+      this._connected = false;
+      this._port = null;
+      return false;
+    }
+  }
+
+  /** Send a ping and wait for pong. Resolves true/false. Timeout 3s. */
+  async ping() {
+    const connected = await this.connect();
+    if (!connected) return false;
+
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        this._pendingPing = null;
+        resolve(false);
+      }, 3000);
+
+      this._pendingPing = (msg) => {
+        clearTimeout(timeout);
+        this._pendingPing = null;
+        resolve(msg && msg.status === 'pong');
+      };
+
+      try {
+        this._port.postMessage({ action: 'ping' });
+      } catch (e) {
+        clearTimeout(timeout);
+        this._pendingPing = null;
+        resolve(false);
+      }
+    });
+  }
+
+  /** Send a download command to the native app. Returns immediately.
+   *  Progress and completion are routed via the listener callbacks. */
+  sendDownload(itemId, payload, { onProgress, onComplete, onFailed }) {
+    if (!this._connected || !this._port) {
+      if (onFailed) onFailed('Native host not connected');
+      return false;
+    }
+
+    payload.jobId = itemId;
+    this._listeners.set(itemId, {
+      onMessage: (msg) => {
+        if (msg.status === 'progress' && onProgress) {
+          onProgress(msg);
+        } else if (msg.status === 'complete') {
+          this._listeners.delete(itemId);
+          if (onComplete) onComplete(msg);
+        } else if (msg.status === 'failed') {
+          this._listeners.delete(itemId);
+          if (onFailed) onFailed(msg.statusLabel || msg.error || 'Native download failed');
+        }
+      }
+    });
+
+    try {
+      this._port.postMessage(payload);
+      return true;
+    } catch (e) {
+      this._listeners.delete(itemId);
+      if (onFailed) onFailed(e.message);
+      return false;
+    }
+  }
+
+  /** Whether the bridge is currently connected */
+  get isConnected() {
+    return this._connected;
+  }
+
+  /** Internal: route incoming messages to the right listener with correlation safety */
+  _handleMessage(msg) {
+    // Ping response
+    if (msg.status === 'pong' && this._pendingPing) {
+      this._pendingPing(msg);
+      return;
+    }
+
+    // Correlation-safe routing by jobId or itemId
+    const targetId = msg.jobId || msg.itemId;
+    if (targetId && this._listeners.has(targetId)) {
+      const listener = this._listeners.get(targetId);
+      if (listener.onMessage) {
+        listener.onMessage(msg);
+        return;
+      }
+    }
+
+    // Fallback: route to first listener if no targetId specified
+    for (const [, listener] of this._listeners) {
+      if (listener.onMessage) {
+        listener.onMessage(msg);
+        return;
+      }
+    }
+
+    console.log('[MediaSniff NativeBridge] Unrouted message:', msg);
+  }
+
+  /** Internal: handle port disconnect */
+  _handleDisconnect() {
+    const err = chrome.runtime.lastError;
+    console.warn('[MediaSniff NativeBridge] Disconnected:', err?.message || 'unknown');
+    this._connected = false;
+    this._port = null;
+
+    // Fail all pending listeners with correlation
+    for (const [itemId, listener] of this._listeners) {
+      if (listener.onMessage) {
+        listener.onMessage({ status: 'failed', statusLabel: 'Host disconnected: ' + (err?.message || 'unknown'), jobId: itemId });
+      }
+    }
+    this._listeners.clear();
+
+    // Reject pending ping
+    if (this._pendingPing) {
+      this._pendingPing({ status: 'pong_failed' });
+      this._pendingPing = null;
+    }
+  }
+
+  /** Disconnect and clean up */
+  disconnect() {
+    if (this._port) {
+      try { this._port.disconnect(); } catch (_) {}
+    }
+    this._port = null;
+    this._connected = false;
+    this._listeners.clear();
+    this._pendingPing = null;
+  }
+}
+
+const nativeBridge = new NativeMessagingBridge();
+
+/**
+ * Extract cookies for a URL and format them into Netscape HTTP Cookie File format
+ * suitable for yt-dlp.
+ * SECURITY: Cookie values are never logged or exposed to popup/UI.
+ */
+async function extractNetscapeCookies(targetUrl) {
+  if (!chrome.cookies) return null;
+  try {
+    const urlObj = new URL(targetUrl);
+    const domain = urlObj.hostname;
+
+    // Get cookies for the exact URL
+    const urlCookies = await chrome.cookies.getAll({ url: targetUrl });
+    
+    // Also get domain-level cookies (e.g. for .youtube.com or root domain)
+    let domainCookies = [];
+    const domainParts = domain.split('.');
+    if (domainParts.length >= 2) {
+      const rootDomain = domainParts.slice(-2).join('.');
+      domainCookies = await chrome.cookies.getAll({ domain: rootDomain });
+    }
+
+    // Deduplicate by domain + path + name
+    const cookieMap = new Map();
+    for (const c of [...domainCookies, ...urlCookies]) {
+      const key = `${c.domain}#${c.path}#${c.name}`;
+      cookieMap.set(key, c);
+    }
+
+    if (cookieMap.size === 0) return null;
+
+    const lines = [
+      '# Netscape HTTP Cookie File',
+      '# http://curl.haxx.se/rfc/cookie_spec.html',
+      '# This is a generated file! Do not edit.'
+    ];
+
+    for (const c of cookieMap.values()) {
+      let cookieDomain = c.domain || domain;
+      const isSubdomain = cookieDomain.startsWith('.') || (domainParts.length > 2 && !cookieDomain.startsWith('.'));
+      if (isSubdomain && !cookieDomain.startsWith('.')) {
+        cookieDomain = '.' + cookieDomain;
+      }
+      const includeSubdomains = cookieDomain.startsWith('.') ? 'TRUE' : 'FALSE';
+      const path = c.path || '/';
+      const isSecure = c.secure ? 'TRUE' : 'FALSE';
+      const expiry = c.expirationDate ? Math.round(c.expirationDate) : Math.round(Date.now() / 1000 + 86400);
+      const name = c.name;
+      const value = c.value;
+
+      lines.push(`${cookieDomain}\t${includeSubdomains}\t${path}\t${isSecure}\t${expiry}\t${name}\t${value}`);
+    }
+
+    console.log(`[MediaSniff] Prepared cookie delegation (${cookieMap.size} cookies) for ${domain}`);
+    return lines.join('\n') + '\n';
+  } catch (err) {
+    console.warn('[MediaSniff] Cookie extraction failed:', err.message);
+    return null;
+  }
+}
 
 // ─── Per-Tab Media Registry & Storage Sync ───────────────────────────
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
@@ -697,11 +931,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     const tabId = message.tabId;
     (async () => {
       try {
-        let tabMedia = mediaRegistry.get(tabId);
-        if (!tabMedia || tabMedia.size === 0) {
-          tabMedia = await restoreTabMedia(tabId);
+        if (tabId != null && !isNaN(tabId)) {
+          let tabMedia = mediaRegistry.get(tabId);
+          if (!tabMedia || tabMedia.size === 0) {
+            tabMedia = await restoreTabMedia(tabId);
+          }
+          sendResponse({ media: tabMedia ? Array.from(tabMedia.values()) : [] });
+        } else {
+          // If no tabId specified, return all items from all active tab registries
+          const allItems = [];
+          for (const map of mediaRegistry.values()) {
+            allItems.push(...map.values());
+          }
+          sendResponse({ media: allItems });
         }
-        sendResponse({ media: tabMedia ? Array.from(tabMedia.values()) : [] });
       } catch (err) {
         console.warn('[MediaSniff] Error handling GET_MEDIA:', err);
         sendResponse({ media: [] });
@@ -1271,45 +1514,63 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         speedLabel: ''
       }).catch(() => {});
 
-      if (downloadType === 'ytdlp') {
-        const port = chrome.runtime.connectNative("net.mediasniff.coapp");
-        let hasResolved = false;
+      const broadcastProgress = (status, percent, statusLabel) => {
+        if (status === 'complete' || status === 'failed') activeDownloads.delete(itemId);
+        chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status, percent, statusLabel, speedLabel: '' }).catch(() => {});
+      };
 
-        port.onMessage.addListener((msg) => {
-          if (hasResolved) return;
-          if (msg.status === "progress") {
-            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'downloading', percent: msg.percent || 0, statusLabel: msg.statusLabel || "Downloading...", speedLabel: '' }).catch(() => {});
-          } else if (msg.status === "complete") {
-            hasResolved = true;
-            activeDownloads.delete(itemId);
-            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'complete', percent: 100, statusLabel: msg.statusLabel || "Completed by yt-dlp!", speedLabel: '' }).catch(() => {});
-          } else if (msg.status === "failed") {
-            hasResolved = true;
-            activeDownloads.delete(itemId);
-            chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'failed', percent: 0, statusLabel: msg.statusLabel || "Failed", speedLabel: '' }).catch(() => {});
-          }
-        });
+      // Source-aware routing (Phase B):
+      // YouTube / yt-dlp -> native when available; fallback to in-browser pipeline
+      const isYouTube = downloadType === 'youtube' || downloadType === 'ytdlp' || item.source === 'youtube' || (item.url && item.url.includes('youtube.com'));
 
-        port.onDisconnect.addListener(() => {
-          const err = chrome.runtime.lastError;
-          if (!hasResolved) {
-            hasResolved = true;
-            activeDownloads.delete(itemId);
-            if (err) {
-              chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'failed', percent: 0, statusLabel: "Host disconnected: " + err.message, speedLabel: '' }).catch(() => {});
-            } else {
-              chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'complete', percent: 100, statusLabel: "Completed!", speedLabel: '' }).catch(() => {});
+      if (isYouTube) {
+        const isNativeAvailable = await nativeBridge.connect();
+
+        if (isNativeAvailable) {
+          const targetUrl = item.streamType === 'direct' ? item.url : (item.masterUrl || item.pageUrl || item.url);
+          
+          // Secure cookie delegation (never logged, never sent to UI)
+          const cookies = await extractNetscapeCookies(targetUrl);
+          
+          const payload = {
+            action: 'ytdlp_download',
+            jobId: itemId,
+            url: targetUrl,
+            filename: options.filename || 'download.mp4',
+            headers: {
+              'User-Agent': navigator.userAgent,
+              'Referer': item.pageUrl || 'https://www.youtube.com/'
             }
+          };
+          if (cookies) {
+            payload.cookies = cookies;
           }
-        });
 
-        const url = item.streamType === 'direct' ? item.url : (item.masterUrl || item.url);
-        port.postMessage({
-          action: "ytdlp_download",
-          url: url,
-          filename: options.filename || 'download.mp4'
-        });
-        return; // Don't forward to offscreen
+          console.log('[MediaSniff] Routing YouTube download to native yt-dlp:', itemId);
+          nativeBridge.sendDownload(itemId, payload, {
+            onProgress: (msg) => broadcastProgress('downloading', msg.percent || 0, msg.statusLabel || 'Downloading...'),
+            onComplete: (msg) => broadcastProgress('complete', 100, msg.statusLabel || 'Completed by yt-dlp!'),
+            onFailed: async (errorMsg) => {
+              console.warn('[MediaSniff] Native yt-dlp failed, falling back to browser offscreen pipeline:', errorMsg);
+              try {
+                await ensureOffscreen();
+                await new Promise(r => setTimeout(r, 200));
+                chrome.runtime.sendMessage({
+                  type: 'START_BACKGROUND_DOWNLOAD',
+                  itemId, item, downloadType: 'youtube', options
+                });
+              } catch (fallbackErr) {
+                broadcastProgress('failed', 0, 'Native & fallback failed: ' + (typeof errorMsg === 'string' ? errorMsg : fallbackErr.message));
+              }
+            }
+          });
+          return;
+        } else if (downloadType === 'ytdlp') {
+          // If the user explicitly clicked "yt-dlp" but companion host is missing
+          broadcastProgress('failed', 0, 'Native companion app not installed or not connected.');
+          return;
+        }
+        console.log('[MediaSniff] Native app not available; falling back to in-browser YouTube pipeline.');
       }
 
       await ensureOffscreen();
@@ -1336,42 +1597,39 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   
   if (message.type === 'TRIGGER_NATIVE_MUX') {
     const { itemId, videoUrl, audioUrl, filename } = message;
-    try {
-      const port = chrome.runtime.connectNative("net.mediasniff.coapp");
-      
-      port.onMessage.addListener((msg) => {
-        if (msg.status === "progress") {
-          // Offscreen document is listening for BACKGROUND_DOWNLOAD_PROGRESS to bubble it up
-          // But it's easier if we just let the offscreen document handle progress itself, OR we just bubble it globally
-          chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'downloading', percent: msg.percent || 0, statusLabel: msg.statusLabel || "Muxing natively...", speedLabel: '' }).catch(() => {});
-        } else if (msg.status === "complete") {
-          sendResponse({ success: true, statusLabel: msg.statusLabel || "Completed by Companion App" });
-          port.disconnect();
-        } else if (msg.status === "failed") {
-          sendResponse({ success: false, error: msg.statusLabel || "Host error" });
-          port.disconnect();
+    (async () => {
+      try {
+        const connected = await nativeBridge.connect();
+        if (!connected) {
+          sendResponse({ success: false, error: 'Native companion app not installed or not connected.' });
+          return;
         }
-      });
-      
-      port.onDisconnect.addListener(() => {
-        const err = chrome.runtime.lastError;
-        if (err) {
-          sendResponse({ success: false, error: "Host disconnected: " + err.message });
-        } else {
-          sendResponse({ success: true, statusLabel: "Completed by Companion App" });
-        }
-      });
-      
-      port.postMessage({
-        action: "download_and_mux",
-        videoUrl,
-        audioUrl,
-        filename
-      });
-    } catch (err) {
-      sendResponse({ success: false, error: err.message });
-    }
-    return true; // keep alive for async response
+
+        // Use a Promise wrapper so sendResponse is called while still valid
+        const result = await new Promise((resolve) => {
+          nativeBridge.sendDownload(itemId, {
+            action: 'download_and_mux',
+            jobId: itemId,
+            videoUrl,
+            audioUrl,
+            filename,
+            headers: {
+              'User-Agent': navigator.userAgent
+            }
+          }, {
+            onProgress: (msg) => {
+              chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status: 'downloading', percent: msg.percent || 0, statusLabel: msg.statusLabel || 'Muxing natively...', speedLabel: '' }).catch(() => {});
+            },
+            onComplete: (msg) => resolve({ success: true, statusLabel: msg.statusLabel || 'Completed by Companion App' }),
+            onFailed: (errorMsg) => resolve({ success: false, error: typeof errorMsg === 'string' ? errorMsg : 'Native muxing failed' })
+          });
+        });
+        sendResponse(result);
+      } catch (err) {
+        sendResponse({ success: false, error: err.message });
+      }
+    })();
+    return true; // keep alive for async sendResponse
   }
 
   // Cancel background download
@@ -1389,6 +1647,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Get list of active background downloads
   if (message.type === 'GET_ACTIVE_DOWNLOADS') {
     sendResponse({ downloads: Array.from(activeDownloads.values()) });
+    return true;
+  }
+  // Native companion app status check — popup queries this instead of calling connectNative directly
+  if (message.type === 'NATIVE_PING') {
+    (async () => {
+      try {
+        const pong = await nativeBridge.ping();
+        sendResponse({ available: pong });
+      } catch (e) {
+        sendResponse({ available: false });
+      }
+    })();
     return true;
   }
   // Process progress updates sent from the offscreen document

@@ -10,7 +10,8 @@
     "storage",
     "scripting",
     "offscreen",
-    "declarativeNetRequest"
+    "declarativeNetRequest",
+    "cookies"
   ],
   "optional_permissions": [
     "tabs",

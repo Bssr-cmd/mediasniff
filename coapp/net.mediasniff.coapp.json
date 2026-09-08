@@ -1,12 +1,13 @@
 {
-  "name": "net.mediasniff.coapp",
-  "description": "MediaSniff Companion App for native video downloading and remuxing",
-  "path": "C:\\Users\\think\\.gemini\\antigravity\\scratch\\mediasniff\\coapp\\coapp.bat",
-  "type": "stdio",
-  "allowed_origins": [
-    "chrome-extension://fjnjkfhpabkdigkilgbfgkbbebkbeojn/",
-    "chrome-extension://ijdmgejobfngcmnkckepcnoghjideefc/",
-    "chrome-extension://njflocbkdhocjoabjafodemcphglfmog/",
-    "chrome-extension://njlnlhkhdkmihkabkpigdephfclidljd/"
-  ]
+    "name":  "net.mediasniff.coapp",
+    "description":  "MediaSniff Companion App for native video downloading and remuxing",
+    "path":  "C:\\Users\\think\\.gemini\\antigravity\\scratch\\mediasniff\\coapp\\coapp.bat",
+    "type":  "stdio",
+    "allowed_origins": [
+        "chrome-extension://fjnjkfhpabkdigkilgbfgkbbebkbeojn/",
+        "chrome-extension://jpjpgkedgcgbfghcbladidalmmchlgek/",
+        "chrome-extension://ijdmgejobfngcmnkckepcnoghjideefc/",
+        "chrome-extension://njflocbkdhocjoabjafodemcphglfmog/",
+        "chrome-extension://njlnlhkhdkmihkabkpigdephfclidljd/"
+    ]
 }

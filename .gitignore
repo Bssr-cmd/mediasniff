@@ -1,3 +1,9 @@
 .agents/
 scratch/
 ORIGINAL_REQUEST.md
+*.log
+__pycache__/
+*.pyc
+coapp/*.exe
+coapp/*.gz
+coapp/coapp.log
