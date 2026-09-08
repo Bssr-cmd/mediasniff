@@ -4,7 +4,7 @@
  */
 import { HLSParser } from '../lib/hls-parser.js';
 import { DASHParser } from '../lib/dash-parser.js';
-import { MSG_TYPE, generateMediaId } from '../shared/protocol.js';
+import { MSG_TYPE, generateMediaId, ERROR_TYPE, classifyError } from '../shared/protocol.js';
 
 // ─── Native Messaging Bridge ─────────────────────────────────────────
 // Single managed connection to the native companion app (coapp.py).
@@ -19,6 +19,16 @@ class NativeMessagingBridge {
     this._listeners = new Map();    // itemId -> { onMessage, onDone }
     this._pendingPing = null;       // resolve/reject for ping
     this._reconnectTimer = null;
+  }
+
+  /** Cancel an ongoing download on the native host */
+  cancelDownload(itemId) {
+    this._listeners.delete(itemId);
+    if (this._connected && this._port) {
+      try {
+        this._port.postMessage({ action: 'cancel', jobId: itemId });
+      } catch (_) {}
+    }
   }
 
   /** Check if native host permission is available */
@@ -1514,16 +1524,74 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         speedLabel: ''
       }).catch(() => {});
 
-      const broadcastProgress = (status, percent, statusLabel) => {
-        if (status === 'complete' || status === 'failed') activeDownloads.delete(itemId);
-        chrome.runtime.sendMessage({ type: 'BACKGROUND_DOWNLOAD_PROGRESS', itemId, status, percent, statusLabel, speedLabel: '' }).catch(() => {});
+      // Tracking set for fallbacks to avoid duplicate triggers across async events
+      if (!globalThis._fallbackTracker) {
+        globalThis._fallbackTracker = new Set();
+      }
+      const fallbackTracker = globalThis._fallbackTracker;
+
+      const broadcastProgress = (status, percent, statusLabel, rawError = null) => {
+        let errorType = null;
+        if (status === 'complete' || status === 'failed' || status === 'cancelled') {
+          activeDownloads.delete(itemId);
+          fallbackTracker.delete(itemId);
+        }
+        if (status === 'failed') {
+          const classified = classifyError(statusLabel, rawError);
+          statusLabel = classified.message;
+          errorType = classified.type;
+        }
+        chrome.runtime.sendMessage({
+          type: 'BACKGROUND_DOWNLOAD_PROGRESS',
+          itemId,
+          status,
+          percent,
+          statusLabel,
+          speedLabel: '',
+          errorType
+        }).catch(() => {});
       };
 
-      // Source-aware routing (Phase B):
-      // YouTube / yt-dlp -> native when available; fallback to in-browser pipeline
+      const triggerBrowserFallback = async (reason, fallbackType = 'youtube') => {
+        if (fallbackTracker.has(itemId)) {
+          console.log('[MediaSniff] Fallback already active for item:', itemId);
+          return;
+        }
+        fallbackTracker.add(itemId);
+        console.warn(`[MediaSniff] Triggering in-browser fallback (${fallbackType}) for ${itemId}: ${reason}`);
+        try {
+          await ensureOffscreen();
+          await new Promise(r => setTimeout(r, 200));
+          chrome.runtime.sendMessage({
+            type: 'START_BACKGROUND_DOWNLOAD',
+            itemId,
+            item,
+            downloadType: fallbackType,
+            options
+          });
+        } catch (fallbackErr) {
+          fallbackTracker.delete(itemId);
+          broadcastProgress('failed', 0, 'In-browser fallback failed: ' + fallbackErr.message, fallbackErr);
+        }
+      };
+
+      // Source-aware routing (Phase C):
+      // 1. YouTube / yt-dlp:
+      //    ├─ Native available → native yt-dlp
+      //    └─ Native unavailable → existing browser YouTube pipeline
       const isYouTube = downloadType === 'youtube' || downloadType === 'ytdlp' || item.source === 'youtube' || (item.url && item.url.includes('youtube.com'));
 
-      if (isYouTube) {
+      // 2. Authenticated / Native-Required HLS / DASH:
+      //    ├─ Native available → native yt-dlp (streams HLS/DASH manifest with cookies/headers)
+      //    └─ Native unavailable → existing browser path (stream/mux)
+      const isAuthStream = Boolean(
+        downloadType === 'native_stream' ||
+        options?.useNative ||
+        item.needsAuth ||
+        item.requiresNative
+      );
+
+      if (isYouTube || isAuthStream) {
         const isNativeAvailable = await nativeBridge.connect();
 
         if (isNativeAvailable) {
@@ -1539,40 +1607,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             filename: options.filename || 'download.mp4',
             headers: {
               'User-Agent': navigator.userAgent,
-              'Referer': item.pageUrl || 'https://www.youtube.com/'
+              'Referer': item.pageUrl || item.url || 'https://www.youtube.com/'
             }
           };
           if (cookies) {
             payload.cookies = cookies;
           }
 
-          console.log('[MediaSniff] Routing YouTube download to native yt-dlp:', itemId);
+          console.log(`[MediaSniff] Routing ${isYouTube ? 'YouTube' : 'authenticated stream'} to native yt-dlp:`, itemId);
           nativeBridge.sendDownload(itemId, payload, {
             onProgress: (msg) => broadcastProgress('downloading', msg.percent || 0, msg.statusLabel || 'Downloading...'),
             onComplete: (msg) => broadcastProgress('complete', 100, msg.statusLabel || 'Completed by yt-dlp!'),
             onFailed: async (errorMsg) => {
               console.warn('[MediaSniff] Native yt-dlp failed, falling back to browser offscreen pipeline:', errorMsg);
-              try {
-                await ensureOffscreen();
-                await new Promise(r => setTimeout(r, 200));
-                chrome.runtime.sendMessage({
-                  type: 'START_BACKGROUND_DOWNLOAD',
-                  itemId, item, downloadType: 'youtube', options
-                });
-              } catch (fallbackErr) {
-                broadcastProgress('failed', 0, 'Native & fallback failed: ' + (typeof errorMsg === 'string' ? errorMsg : fallbackErr.message));
-              }
+              const fallbackType = isYouTube ? 'youtube' : (downloadType === 'mux' || selectedAudio ? 'mux' : 'stream');
+              triggerBrowserFallback(errorMsg, fallbackType);
             }
           });
           return;
-        } else if (downloadType === 'ytdlp') {
-          // If the user explicitly clicked "yt-dlp" but companion host is missing
-          broadcastProgress('failed', 0, 'Native companion app not installed or not connected.');
+        } else if (downloadType === 'ytdlp' || downloadType === 'native_stream') {
+          // If the user explicitly clicked an advanced native-only button but companion host is missing
+          broadcastProgress('failed', 0, 'Native companion app not installed or not running.', 'NATIVE_UNAVAILABLE');
           return;
         }
-        console.log('[MediaSniff] Native app not available; falling back to in-browser YouTube pipeline.');
+        console.log(`[MediaSniff] Native host unavailable; routing ${isYouTube ? 'YouTube' : 'HLS/DASH'} to in-browser pipeline.`);
       }
 
+      // 3. Public / Simple HLS/DASH or Native Fallback:
+      //    → existing browser/WASM path
       await ensureOffscreen();
       await new Promise(r => setTimeout(r, 500));
       chrome.runtime.sendMessage({
@@ -1582,13 +1644,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     })().catch(err => {
       console.error('[MediaSniff] Failed to start background download:', err);
       activeDownloads.delete(itemId);
+      const classified = classifyError(err.message, err);
       chrome.runtime.sendMessage({
         type: 'BACKGROUND_DOWNLOAD_PROGRESS',
         itemId,
         status: 'failed',
         percent: 0,
-        statusLabel: 'Error: ' + err.message,
-        speedLabel: ''
+        statusLabel: classified.message,
+        speedLabel: '',
+        errorType: classified.type
       }).catch(() => {});
     });
     sendResponse({ success: true });
@@ -1641,6 +1705,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       itemId
     });
     activeDownloads.delete(itemId);
+    if (globalThis._fallbackTracker) {
+      globalThis._fallbackTracker.delete(itemId);
+    }
+    if (nativeBridge.isConnected) {
+      nativeBridge.cancelDownload(itemId);
+    }
+    chrome.runtime.sendMessage({
+      type: 'BACKGROUND_DOWNLOAD_PROGRESS',
+      itemId,
+      status: 'cancelled',
+      percent: 0,
+      statusLabel: 'Download cancelled',
+      speedLabel: '',
+      errorType: 'CANCELLED'
+    }).catch(() => {});
     sendResponse({ success: true });
     return true;
   }

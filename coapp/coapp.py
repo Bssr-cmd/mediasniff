@@ -207,6 +207,8 @@ def handle_ytdlp_download(msg):
     cmd = [
         ytdlp_bin,
         "--no-playlist",
+        "--socket-timeout", "15",
+        "--retries", "2",
         "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
         "--merge-output-format", "mp4",
         "-o", output_path,
@@ -234,10 +236,17 @@ def handle_ytdlp_download(msg):
         except Exception as ce:
             log(f"Failed to create temporary cookie file: {ce}")
 
+    active_processes = getattr(handle_ytdlp_download, "active_processes", None)
+    if active_processes is None:
+        active_processes = {}
+        handle_ytdlp_download.active_processes = active_processes
+
     log(f"Executing: {' '.join(cmd)}")
     try:
         # Run yt-dlp and capture output for progress
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
+        if job_id:
+            active_processes[job_id] = process
         import re
         progress_pattern = re.compile(r'\[download\]\s+([0-9.]+)%')
         
@@ -263,6 +272,8 @@ def handle_ytdlp_download(msg):
         log(f"yt-dlp task error: {e} (jobId: {job_id})")
         report("failed", status_label=f"yt-dlp Error: {str(e)}")
     finally:
+        if job_id and hasattr(handle_ytdlp_download, "active_processes"):
+            handle_ytdlp_download.active_processes.pop(job_id, None)
         # Secure cleanup: delete temporary cookie file immediately upon completion/failure
         if cookie_file and os.path.exists(cookie_file):
             try:
@@ -394,6 +405,19 @@ def main():
                 handle_ytdlp_download(msg)
             elif action == "download_and_mux":
                 handle_download_and_mux(msg)
+            elif action == "cancel":
+                target_job = msg.get("jobId") or msg.get("itemId")
+                procs = getattr(handle_ytdlp_download, "active_processes", {})
+                if target_job and target_job in procs:
+                    try:
+                        procs[target_job].terminate()
+                        log(f"Terminated process for cancelled job: {target_job}")
+                    except Exception as te:
+                        log(f"Error terminating job {target_job}: {te}")
+                resp = {"status": "cancelled", "statusLabel": "Job cancelled"}
+                if target_job:
+                    resp["jobId"] = target_job
+                send_message(resp)
             else:
                 resp = {"status": "failed", "statusLabel": "Unknown action: " + str(action)}
                 if job_id:

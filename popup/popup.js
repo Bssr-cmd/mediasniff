@@ -105,24 +105,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (status === 'complete') {
           showToast(statusLabel);
         } else if (status === 'failed') {
-          if (statusLabel === 'Error: API_UNAVAILABLE') {
-            const item = mediaItems.find(m => m.id === itemId);
-            if (item) {
-              showToast('YouTube API failed. Falling back to native yt-dlp...');
-              setCardDownloadStarting(item.id, 'Connecting to yt-dlp...');
-              chrome.runtime.sendMessage({
-                type: 'START_DOWNLOAD',
-                itemId: item.id,
-                item,
-                downloadType: 'ytdlp',
-                options: { filename: getSmartName(item) }
-              });
-            }
-          } else {
-            showToast(statusLabel);
-          }
+          showToast(statusLabel || 'Download failed');
         } else if (status === 'cancelled') {
-          showToast('Download cancelled');
+          showToast(statusLabel || 'Download cancelled');
         }
       } else {
         if (progressEl) progressEl.classList.add('active');

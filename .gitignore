@@ -7,3 +7,4 @@ __pycache__/
 coapp/*.exe
 coapp/*.gz
 coapp/coapp.log
+dist/
