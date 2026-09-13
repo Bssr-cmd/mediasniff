@@ -406,7 +406,7 @@ function createMediaCard(item) {
     <div class="card-badges">
       ${item.source === 'youtube' ? '<span class="badge youtube">YOUTUBE</span>' : `<span class="badge ${item.streamType}">${item.streamType.toUpperCase()}</span>`}
       <span class="badge ${item.type}">${item.type.toUpperCase()}</span>
-      ${item.sizeLabel && item.sizeLabel !== 'Unknown' ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
+      ${item.sizeLabel && item.sizeLabel !== 'Unknown' && item.sizeLabel.toUpperCase() !== item.streamType?.toUpperCase() && item.sizeLabel.toUpperCase() !== item.type?.toUpperCase() ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
       ${item.totalDuration ? `<span class="badge duration">${formatDuration(item.totalDuration)}</span>` : ''}
       ${item.segmentCount > 0 ? `<span class="badge segments">${item.segmentCount} segs</span>` : ''}
       ${isDrm ? `<span class="badge drm">${lockIcon}DRM</span>` : ''}
@@ -651,18 +651,35 @@ function createMediaCard(item) {
 function getSmartName(item) {
   let name = '';
 
-  // 1. If item has its own sniffed filename, prioritize that
-  if (item.filename && item.filename !== 'Live Video Stream' && item.filename !== 'HLS Video' && item.filename !== 'DASH Video') {
-    name = item.filename;
-  } else if (item.title && item.title !== 'Live Video Stream' && item.title !== 'HLS Video' && item.title !== 'DASH Video') {
-    name = item.title;
-  } else if (pageTitle) {
-    // Clean up common page title suffixes
-    name = pageTitle
+  const isGeneric = (str) => {
+    if (!str) return true;
+    const s = str.toLowerCase().trim();
+    return s === 'live video stream' || s === 'hls video' || s === 'dash video' ||
+           s === 'media' || s === 'download' || s === 'video' || s === 'audio' ||
+           /^(?:master|index|playlist|chunklist|video|audio|media|\d+p|\d+k)(?:\.(?:m3u8|mpd|ts|mp4|webm|m4s|m4a))?$/i.test(s);
+  };
+
+  // Clean page title if available
+  let cleanPageTitle = '';
+  if (pageTitle) {
+    cleanPageTitle = pageTitle
       .replace(/\s*[-–—|]\s*(YouTube|Vimeo|Dailymotion|Twitch|Facebook|Twitter|X).*$/i, '')
       .replace(/\s*[-–—|]\s*Watch.*$/i, '')
-      .replace(/[<>:"/\\|?*]/g, '')
+      // Strip domain prefix like "web.classplusapp.com/" or "https://domain.com/"
+      .replace(/^(?:https?:\/\/)?(?:[a-z0-9-]+\.)+[a-z]{2,6}(?:\/|\s+|$)/i, '')
+      .replace(/[/\\_]+/g, ' ')
+      .replace(/[<>:"|?*\x00-\x1f]/g, '')
+      .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  // 1. If item has its own non-generic sniffed filename, prioritize that
+  if (item.filename && !isGeneric(item.filename)) {
+    name = item.filename;
+  } else if (item.title && !isGeneric(item.title)) {
+    name = item.title;
+  } else if (cleanPageTitle && !isGeneric(cleanPageTitle)) {
+    name = cleanPageTitle;
   }
 
   // Fallback to URL-based name
@@ -707,8 +724,8 @@ function getSmartName(item) {
     }
   }
 
-  // Strip existing extension if any to avoid duplicate extensions
-  name = name.replace(/\.(mp4|webm|mkv|ts|m4s|m4a|mp3|vtt|srt)$/i, '');
+  // Strip existing extension if any to avoid duplicate extensions (including .m3u8, .mpd)
+  name = name.replace(/\.(mp4|webm|mkv|ts|m4s|m4a|mp3|vtt|srt|m3u8|mpd)$/i, '');
 
   // Strip duplicate trailing resolution/quality tag if already present in title
   if (quality) {
@@ -716,11 +733,11 @@ function getSmartName(item) {
     name = name.replace(new RegExp(`\\s*[(_-]*${qualEscaped}[)]*\\s*$`, 'i'), '');
   }
 
-  // Clean name: replace underscores with spaces, remove illegal filesystem chars, collapse whitespace
+  // Clean name: replace slashes/underscores with spaces, remove illegal filesystem chars, collapse whitespace
   name = name
-    .replace(/_/g, ' ')
+    .replace(/[/\\_]+/g, ' ')
     .replace(/&/g, 'and')
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/[<>:"|?*\x00-\x1f]/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 

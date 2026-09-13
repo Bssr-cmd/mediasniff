@@ -466,6 +466,8 @@ async function handleRequest(details) {
     if (m.url === url) return true;
     // Same base URL (ignore query params / CDN cache-busting)
     if (getBaseUrl(m.url) === baseUrl) return true;
+    // Check if this URL is already a variant of an existing master playlist
+    if (m.variants && m.variants.some(v => v.url === url || getBaseUrl(v.url) === baseUrl)) return true;
     return false;
   });
   if (isDuplicate) return;
@@ -509,12 +511,14 @@ async function handleRequest(details) {
         const manifestContent = await fetchManifest(url, item.referer);
         if (manifestContent) {
           if (streamType === 'hls') {
-            await parseHLSManifest(item, manifestContent, url);
+            await parseHLSManifest(item, manifestContent, url, details.tabId);
           } else {
             parseDASHManifest(item, manifestContent, url);
           }
           item.parsed = true;
-          tabMedia.set(id, item);
+          if (tabMedia.has(id)) {
+            tabMedia.set(id, item);
+          }
           updateBadge(details.tabId);
           notifyPopup(details.tabId);
         }
@@ -678,7 +682,7 @@ async function tryUpgradeSegmentToPlaylist(item, segUrl, tabId) {
     try {
       const content = await fetchManifest(cand, item.referer);
       if (content && (content.includes('#EXT-X-STREAM-INF') || content.includes('#EXTM3U') || content.trim().startsWith('{'))) {
-        await parseHLSManifest(item, content, cand);
+        await parseHLSManifest(item, content, cand, tabId);
         item.url = cand;
         item.parsed = true;
         if (item.variants?.length > 0) {
@@ -686,7 +690,9 @@ async function tryUpgradeSegmentToPlaylist(item, segUrl, tabId) {
           item.isLive = false;
         }
         const tabMedia = getTabMedia(tabId);
-        tabMedia.set(item.id, item);
+        if (tabMedia.has(item.id)) {
+          tabMedia.set(item.id, item);
+        }
         updateBadge(tabId);
         notifyPopup(tabId);
         break;
@@ -695,7 +701,7 @@ async function tryUpgradeSegmentToPlaylist(item, segUrl, tabId) {
   }
 }
 // ─── HLS Manifest Parsing ───────────────────────────────────────────
-async function parseHLSManifest(item, content, url) {
+async function parseHLSManifest(item, content, url, tabId = null) {
   if (!content) return;
   const trimmed = content.trim();
 
@@ -766,6 +772,19 @@ async function parseHLSManifest(item, content, url) {
     item.quality = item.variants.length > 0 ? item.variants[0].label : null;
     item.isLive = false;
     item.parsed = true;
+
+    // Deduplicate: If any standalone media cards already exist in this tab that are child variants of this master playlist, remove them!
+    if (tabId) {
+      const tabMedia = getTabMedia(tabId);
+      for (const [existingId, existingItem] of tabMedia.entries()) {
+        if (existingId !== item.id) {
+          const isChildVariant = item.variants.some(v => v.url === existingItem.url || getBaseUrl(v.url) === getBaseUrl(existingItem.url));
+          if (isChildVariant) {
+            tabMedia.delete(existingId);
+          }
+        }
+      }
+    }
   } else {
     // Media playlist
     item.segmentCount = parsed.segmentCount;
@@ -777,12 +796,29 @@ async function parseHLSManifest(item, content, url) {
     item.initUrl = parsed.initSegment || null;
     item.parsed = true;
 
+    // Deduplicate token refreshes: if another media item in this tab already has the identical segment count & duration
+    if (tabId && item.totalDuration > 0 && item.segmentCount > 0) {
+      const tabMedia = getTabMedia(tabId);
+      const existingMatch = Array.from(tabMedia.values()).find(m => 
+        m.id !== item.id && 
+        m.segmentCount === item.segmentCount && 
+        Math.abs(m.totalDuration - item.totalDuration) < 1.0
+      );
+      if (existingMatch) {
+        existingMatch.url = item.url;
+        existingMatch.segments = item.segments;
+        existingMatch.timestamp = Date.now();
+        tabMedia.delete(item.id);
+        return;
+      }
+    }
+
     // Check if we can probe and auto-upgrade to master playlist asynchronously
-    tryUpgradeToMasterPlaylist(item, url).catch(() => {});
+    tryUpgradeToMasterPlaylist(item, url, tabId).catch(() => {});
   }
 }
 
-async function tryUpgradeToMasterPlaylist(item, url) {
+async function tryUpgradeToMasterPlaylist(item, url, tabId = null) {
   let u;
   try { u = new URL(url); } catch (_) { return; }
   const query = u.search || '';
@@ -838,7 +874,7 @@ async function tryUpgradeToMasterPlaylist(item, url) {
     try {
       const candContent = await fetchManifest(cand, item.referer);
       if (candContent && (candContent.includes('#EXT-X-STREAM-INF') || candContent.includes('#EXTM3U') || candContent.trim().startsWith('{'))) {
-        await parseHLSManifest(item, candContent, cand);
+        await parseHLSManifest(item, candContent, cand, tabId);
         if (item.variants?.length > 0) {
           item.url = cand;
           item.parsed = true;
