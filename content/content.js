@@ -337,6 +337,9 @@
     if (event.data && event.data.type === 'MS_VIMEO_RESPONSE') {
       processVimeoPlayerResponse(event.data.data);
     }
+    if (event.data && event.data.type === 'MS_INSTAGRAM_RESPONSE') {
+      processInstagramResponse(event.data.data);
+    }
   });
 
   function injectPlayerResponseScraper() {
@@ -577,6 +580,76 @@
     } catch (e) { /* ignore */ }
   }
 
+  // ─── Instagram Detection ────────────────────────────────────────────
+  const reportedInstagramCodes = new Set();
+
+  function processInstagramResponse(items) {
+    if (!items || !Array.isArray(items) || items.length === 0) return;
+    const newItems = items.filter(item => {
+      const key = item.shortcode || item.id;
+      if (!key) return true;
+      if (reportedInstagramCodes.has(key)) return false;
+      reportedInstagramCodes.add(key);
+      return true;
+    });
+
+    if (newItems.length > 0) {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'INSTAGRAM_DATA',
+          items: newItems,
+          pageUrl: location.href,
+          pageTitle: document.title || ''
+        }).catch(() => {});
+      } catch (e) { /* Extension context invalidated */ }
+    }
+  }
+
+  function extractInstagramData() {
+    if (!location.hostname.includes('instagram.com')) return;
+
+    // 1. Check current URL for reel or post shortcode
+    const match = location.pathname.match(/\/(?:reel|reels|p)\/([a-zA-Z0-9_-]+)/);
+    const shortcode = match ? match[1] : null;
+
+    // Trigger inject.js scan
+    try {
+      window.postMessage({ type: 'MS_TRIGGER_INJECT_SCAN' }, '*');
+    } catch (_) {}
+
+    // 2. Scan direct video tags on Instagram page
+    try {
+      const videoElements = document.querySelectorAll('video');
+      const items = [];
+      for (const v of videoElements) {
+        let src = v.src || v.currentSrc;
+        if (src && !src.startsWith('blob:') && !src.startsWith('data:')) {
+          // Clean bytestart & byteend
+          src = src.replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, '').replace(/\?&/, '?').replace(/[?&]$/, '');
+          items.push({
+            id: shortcode || String(Date.now()),
+            shortcode,
+            username: '',
+            caption: document.title || '',
+            duration: v.duration || 0,
+            thumbnail: v.poster || null,
+            videoVersions: [{
+              url: src,
+              width: v.videoWidth || 0,
+              height: v.videoHeight || 0,
+              label: v.videoHeight ? `${v.videoHeight}p` : 'MP4 Video'
+            }],
+            dashManifest: null,
+            pageUrl: shortcode ? `https://www.instagram.com/reel/${shortcode}/` : location.href
+          });
+        }
+      }
+      if (items.length > 0) {
+        processInstagramResponse(items);
+      }
+    } catch (_) {}
+  }
+
   // ─── Thumbnail Extraction ───────────────────────────────────────────
   function extractThumbnail() {
     // 1. og:image meta tag (most sites including YouTube)
@@ -624,6 +697,7 @@
   function fullRescan() {
     reportedUrls.clear();
     reportedEmbedIds.clear();
+    reportedInstagramCodes.clear();
     ytDataReported = false;
     reportedVimeoIds.clear();
     lastReportedVideoId = null;
@@ -635,6 +709,7 @@
     reportMedia();
     extractYouTubeData();
     extractVimeoData();
+    extractInstagramData();
   }
 
   // Expose for re-injection
@@ -643,11 +718,13 @@
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       setTimeout(reportMedia, 500);
+      setTimeout(extractInstagramData, 1000);
       setTimeout(extractYouTubeData, 1500);
       setTimeout(extractVimeoData, 1500);
     });
   } else {
     setTimeout(reportMedia, 500);
+    setTimeout(extractInstagramData, 1000);
     setTimeout(extractYouTubeData, 1500);
     setTimeout(extractVimeoData, 1500);
   }
@@ -682,9 +759,11 @@
       lastUrl = location.href;
       ytDataReported = false;
       reportedVimeoIds.clear();
-    lastReportedVideoId = null;
-    lastReportedJsUrl = null;
-    lastReportedFormatCount = 0;
+      reportedInstagramCodes.clear();
+      lastReportedVideoId = null;
+      lastReportedJsUrl = null;
+      lastReportedFormatCount = 0;
+      setTimeout(extractInstagramData, 1200);
       setTimeout(extractYouTubeData, 2000);
       setTimeout(extractVimeoData, 2000);
     }

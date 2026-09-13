@@ -404,7 +404,7 @@ function createMediaCard(item) {
       </div>
     </div>
     <div class="card-badges">
-      ${item.source === 'youtube' ? '<span class="badge youtube">YOUTUBE</span>' : `<span class="badge ${item.streamType}">${item.streamType.toUpperCase()}</span>`}
+      ${item.source === 'youtube' ? '<span class="badge youtube">YOUTUBE</span>' : item.source === 'instagram' ? '<span class="badge instagram">INSTAGRAM</span>' : `<span class="badge ${item.streamType}">${item.streamType.toUpperCase()}</span>`}
       <span class="badge ${item.type}">${item.type.toUpperCase()}</span>
       ${item.sizeLabel && item.sizeLabel !== 'Unknown' && item.sizeLabel.toUpperCase() !== item.streamType?.toUpperCase() && item.sizeLabel.toUpperCase() !== item.type?.toUpperCase() ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
       ${item.totalDuration ? `<span class="badge duration">${formatDuration(item.totalDuration)}</span>` : ''}
@@ -414,13 +414,21 @@ function createMediaCard(item) {
       ${item.isLive ? `<span class="badge live">● LIVE</span>` : ''}
     </div>`;
 
-  // Quality selector for variants (HLS/DASH)
+  // Quality selector for variants (HLS/DASH/Instagram)
   if (item.variants && item.variants.length >= 1) {
     html += `
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
       <select class="quality-select" id="quality-${item.id}">
         ${item.variants.map((v, i) => `<option value="${i}">${v.label}${v.resolution ? ' (' + v.resolution + ')' : ''}${v.codecs ? ' [' + v.codecs + ']' : ''}</option>`).join('')}
+      </select>
+    </div>`;
+  } else if (item.source === 'instagram' && item.availableQualities?.length > 1) {
+    html += `
+    <div class="quality-section">
+      <div class="quality-label">Video Quality</div>
+      <select class="quality-select" id="quality-${item.id}">
+        ${item.availableQualities.map((q, i) => `<option value="${q.height || i}">${q.label || (q.height + 'p')}${q.width ? ' (' + q.width + 'x' + q.height + ')' : ''}</option>`).join('')}
       </select>
     </div>`;
   }
@@ -795,6 +803,15 @@ async function handleDownload(item) {
     return;
   }
 
+  // Instagram reels & videos — download selected progressive MP4 directly
+  if (item.source === 'instagram') {
+    const filename = getSmartName(item);
+    const downloadUrl = getSelectedUrl(item);
+    chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: downloadUrl, filename });
+    showToast('Downloading Instagram Reel...');
+    return;
+  }
+
   if (item.streamType === 'direct') {
     // Direct download
     const filename = getSmartName(item);
@@ -939,8 +956,16 @@ async function downloadSubtitles(item, videoFilename) {
 // ─── Helpers ────────────────────────────────────────────────────────
 function getSelectedUrl(item) {
   const qualitySelect = document.getElementById(`quality-${item.id}`);
-  if (qualitySelect && item.variants?.length > 0) {
-    return item.variants[parseInt(qualitySelect.value)].url;
+  if (qualitySelect) {
+    const val = qualitySelect.value;
+    if (item.directMp4Urls && item.directMp4Urls[val]) {
+      return item.directMp4Urls[val];
+    }
+    const idx = parseInt(val);
+    if (!isNaN(idx)) {
+      if (item.variants && item.variants[idx]?.url) return item.variants[idx].url;
+      if (item.availableQualities && item.availableQualities[idx]?.url) return item.availableQualities[idx].url;
+    }
   }
   return item.url;
 }

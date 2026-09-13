@@ -319,6 +319,8 @@ const SEGMENT_URL_PATTERNS = [
   /\/range\/\d+/i,       // range/0, range/1...
   /[?&]sq=\d+/i,         // YouTube sq= sequence
   /[?&]range=/i,          // range= param
+  /[?&]bytestart=\d+/i,  // Instagram/Facebook bytestart param
+  /[?&]byteend=\d+/i,    // Instagram/Facebook byteend param
   /\.ts\?/i,              // .ts with query params (segment)
 ];
 const MEDIA_MIME_TYPES = [
@@ -328,6 +330,7 @@ const MEDIA_MIME_TYPES = [
   'application/octet-stream'
 ];
 const YOUTUBE_VIDEO_PATTERN = /\.googlevideo\.com\/videoplayback/i;
+const INSTAGRAM_CDN_PATTERN = /(?:cdninstagram\.com|fbcdn\.net)/i;
 const IGNORE_PATTERNS = [
   /^chrome-extension:\/\//,
   /^moz-extension:\/\//,
@@ -415,6 +418,11 @@ async function handleRequest(details) {
     }
     return;
   }
+  // 0c. Check for Instagram / Facebook CDN streams
+  else if (INSTAGRAM_CDN_PATTERN.test(url)) {
+    handleInstagramCdnRequest(details, url, headers, contentType, contentLength);
+    return;
+  }
   // 1. Check for HLS manifest
   else if (
     HLS_EXTENSIONS.test(url) ||
@@ -435,13 +443,23 @@ async function handleRequest(details) {
   }
   // 3. Check for direct video files
   else if (MEDIA_EXTENSIONS.test(url) || contentType.startsWith('video/')) {
-    if (contentLength > MIN_CONTENT_LENGTH || contentType.startsWith('video/')) {
+    const isPartialChunk = (contentLength > 0 && contentLength < MIN_CONTENT_LENGTH) && (
+      headers['content-range'] ||
+      details.statusCode === 206 ||
+      /[?&](?:bytestart|byteend|range|sq)=/i.test(url)
+    );
+    if (!isPartialChunk && (contentLength > MIN_CONTENT_LENGTH || (contentLength === 0 && contentType.startsWith('video/')))) {
       mediaType = 'video';
     }
   }
   // 4. Check for audio files
   else if (AUDIO_EXTENSIONS.test(url) || contentType.startsWith('audio/')) {
-    if (contentLength > MIN_CONTENT_LENGTH || contentType.startsWith('audio/')) {
+    const isPartialChunk = (contentLength > 0 && contentLength < MIN_CONTENT_LENGTH) && (
+      headers['content-range'] ||
+      details.statusCode === 206 ||
+      /[?&](?:bytestart|byteend|range|sq)=/i.test(url)
+    );
+    if (!isPartialChunk && (contentLength > MIN_CONTENT_LENGTH || (contentLength === 0 && contentType.startsWith('audio/')))) {
       mediaType = 'audio';
     }
   }
@@ -526,6 +544,76 @@ async function handleRequest(details) {
         console.warn(`[MediaSniff] Background parse for ${streamType} manifest completed with note:`, err.message);
       }
     })();
+  }
+}
+
+function handleInstagramCdnRequest(details, url, headers, contentType, contentLength) {
+  if (details.tabId < 0) return;
+  try {
+    const cleanUrl = url
+      .replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
+      .replace(/\?&/, '?').replace(/\?(?=#|$)/, '');
+
+    const tabMedia = getTabMedia(details.tabId);
+    let igItem = Array.from(tabMedia.values()).find(m => m.source === 'instagram');
+
+    const isVideo = contentType.startsWith('video/') || url.includes('.mp4') || /[?&]mime=video/i.test(url);
+    const isAudio = contentType.startsWith('audio/') || /[?&]mime=audio/i.test(url);
+
+    if (igItem) {
+      if (!igItem.directVideoUrls) igItem.directVideoUrls = {};
+      if (!igItem.directAudioUrls) igItem.directAudioUrls = {};
+
+      if (isVideo) {
+        if (!igItem.url || igItem.url.includes('/reel/')) {
+          igItem.url = cleanUrl;
+        }
+        igItem.directVideoUrls['default'] = cleanUrl;
+      } else if (isAudio) {
+        igItem.directAudioUrls['default'] = cleanUrl;
+      }
+      notifyPopup(details.tabId);
+      return;
+    }
+
+    const isChunk = (contentLength > 0 && contentLength < MIN_CONTENT_LENGTH) ||
+                    /[?&](?:bytestart|byteend)=/i.test(url) ||
+                    headers['content-range'] ||
+                    details.statusCode === 206;
+
+    // Deduplicate against existing cards on this tab
+    const existingClean = Array.from(tabMedia.values()).find(m => getBaseUrl(m.url) === getBaseUrl(cleanUrl));
+    if (!existingClean && isVideo) {
+      const id = `media_${++idCounter}`;
+      tabMedia.set(id, {
+        id,
+        url: cleanUrl,
+        type: 'video',
+        streamType: 'direct',
+        mimeType: 'video/mp4',
+        contentLength: isChunk ? 0 : contentLength,
+        sizeLabel: 'Instagram',
+        filename: 'Instagram Reel',
+        quality: 'HD',
+        variants: [],
+        audioRenditions: [],
+        subtitles: [],
+        isEncrypted: false,
+        isLive: false,
+        totalDuration: 0,
+        segmentCount: 0,
+        parsed: true,
+        source: 'instagram',
+        directVideoUrls: { default: cleanUrl },
+        directAudioUrls: {},
+        referer: details.initiator || details.documentUrl || null,
+        timestamp: Date.now()
+      });
+      updateBadge(details.tabId);
+      notifyPopup(details.tabId);
+    }
+  } catch (e) {
+    console.warn('[MediaSniff] Error handling Instagram CDN request:', e.message);
   }
 }
 
@@ -1332,6 +1420,125 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     return;
   }
+  // Instagram reels/posts from content script
+  if (message.type === 'INSTAGRAM_DATA') {
+    if (sender.tab) {
+      const tabId = sender.tab.id;
+      const tabMedia = getTabMedia(tabId);
+      const items = message.items || [];
+      for (const item of items) {
+        const shortcode = item.shortcode || item.id;
+        const existing = Array.from(tabMedia.values()).find(m => m.source === 'instagram' && (m.shortcode === shortcode || m.id === item.id));
+
+        // Clean up individual chunk cards or raw CDN stubs on this tab
+        for (const [mId, m] of tabMedia.entries()) {
+          if (m.source !== 'instagram' && m.url && (m.url.includes('cdninstagram.com') || m.url.includes('fbcdn.net'))) {
+            tabMedia.delete(mId);
+          }
+        }
+
+        // Format clean title
+        let captionSnippet = (item.caption || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
+        if (captionSnippet.length > 60) captionSnippet = captionSnippet.substring(0, 57) + '...';
+        let smartTitle = 'Instagram Reel';
+        if (item.username && captionSnippet) {
+          smartTitle = `@${item.username} - ${captionSnippet}`;
+        } else if (item.username) {
+          smartTitle = `Instagram Reel by @${item.username}`;
+        } else if (captionSnippet) {
+          smartTitle = `Instagram Reel - ${captionSnippet}`;
+        }
+
+        const videoVersions = item.videoVersions || [];
+        const bestVideo = [...videoVersions].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+        const progressiveUrl = bestVideo?.url || item.url || '';
+
+        // If DASH manifest is available, parse it
+        let variants = [];
+        let audioRenditions = [];
+        if (item.dashManifest) {
+          try {
+            const parsedDash = DASHParser.parse(item.dashManifest, item.pageUrl || sender.tab.url);
+            if (parsedDash.variants?.length > 0) variants = parsedDash.variants;
+            if (parsedDash.audioRenditions?.length > 0) audioRenditions = parsedDash.audioRenditions;
+          } catch (e) {
+            console.warn('[MediaSniff] Failed to parse Instagram DASH manifest:', e.message);
+          }
+        }
+
+        // If DASH variants are empty, use progressive MP4 versions
+        if (variants.length === 0 && videoVersions.length > 0) {
+          variants = videoVersions.map(v => ({
+            url: v.url,
+            resolution: `${v.width}x${v.height}`,
+            width: v.width,
+            height: v.height,
+            label: v.label || `${v.height}p`,
+            isDirect: true
+          }));
+        }
+
+        const availableQualities = videoVersions.map(v => ({
+          label: v.label || `${v.height}p`,
+          height: v.height,
+          width: v.width,
+          url: v.url
+        }));
+
+        const directMp4Urls = {};
+        for (const v of videoVersions) {
+          if (v.height && v.url) {
+            directMp4Urls[String(v.height)] = v.url;
+            directMp4Urls[`${v.height}p`] = v.url;
+          }
+        }
+
+        if (existing) {
+          if (progressiveUrl && (!existing.url || existing.url.length < 10 || existing.url.includes('/reel/'))) {
+            existing.url = progressiveUrl;
+          }
+          if (item.thumbnail && !existing.thumbnail) existing.thumbnail = item.thumbnail;
+          if (availableQualities.length > 0) existing.availableQualities = availableQualities;
+          if (Object.keys(directMp4Urls).length > 0) existing.directMp4Urls = { ...existing.directMp4Urls, ...directMp4Urls };
+          if (variants.length > 0) existing.variants = variants;
+          if (audioRenditions.length > 0) existing.audioRenditions = audioRenditions;
+          continue;
+        }
+
+        const id = `media_${++idCounter}`;
+        const reelUrl = item.pageUrl || (shortcode ? `https://www.instagram.com/reel/${shortcode}/` : sender.tab.url);
+        tabMedia.set(id, {
+          id,
+          url: progressiveUrl || reelUrl,
+          type: 'video',
+          streamType: 'direct',
+          mimeType: 'video/mp4',
+          contentLength: 0,
+          sizeLabel: 'Instagram',
+          filename: smartTitle,
+          quality: bestVideo?.height ? `${bestVideo.height}p` : 'HD',
+          variants,
+          audioRenditions,
+          subtitles: [],
+          isEncrypted: false,
+          isLive: false,
+          totalDuration: item.duration || 0,
+          segmentCount: 0,
+          parsed: true,
+          source: 'instagram',
+          shortcode: shortcode,
+          pageUrl: reelUrl,
+          thumbnail: item.thumbnail,
+          availableQualities,
+          directMp4Urls,
+          timestamp: Date.now()
+        });
+      }
+      updateBadge(tabId);
+      notifyPopup(tabId);
+    }
+    return true;
+  }
   if (message.type === 'RESOLVE_VIMEO_EMBED') {
     const tabId = sender.tab?.id;
     if (tabId) {
@@ -1620,10 +1827,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       };
 
       // Source-aware routing (Phase C):
-      // 1. YouTube / yt-dlp:
+      // 1. YouTube / yt-dlp / Instagram:
       //    ├─ Native available → native yt-dlp
-      //    └─ Native unavailable → existing browser YouTube pipeline
-      const isYouTube = downloadType === 'youtube' || downloadType === 'ytdlp' || item.source === 'youtube' || (item.url && item.url.includes('youtube.com'));
+      //    └─ Native unavailable → existing browser pipeline
+      const isInstagram = item.source === 'instagram' || (item.url && (item.url.includes('instagram.com') || item.url.includes('cdninstagram.com')));
+      const isYouTube = downloadType === 'youtube' || (downloadType === 'ytdlp' && !isInstagram) || item.source === 'youtube' || (item.url && item.url.includes('youtube.com'));
+      const isYtDlp = downloadType === 'ytdlp';
 
       // 2. Authenticated / Native-Required HLS / DASH:
       //    ├─ Native available → native yt-dlp (streams HLS/DASH manifest with cookies/headers)
@@ -1635,14 +1844,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         item.requiresNative
       );
 
-      if (isYouTube || isAuthStream) {
+      if (isYouTube || isAuthStream || (isInstagram && isYtDlp)) {
         const isNativeAvailable = await nativeBridge.connect();
 
         if (isNativeAvailable) {
-          const targetUrl = item.streamType === 'direct' ? item.url : (item.masterUrl || item.pageUrl || item.url);
+          let targetUrl = item.streamType === 'direct' ? item.url : (item.masterUrl || item.pageUrl || item.url);
+          if (isInstagram) {
+            targetUrl = item.pageUrl || (item.shortcode ? `https://www.instagram.com/reel/${item.shortcode}/` : item.url);
+          }
           
           // Secure cookie delegation (never logged, never sent to UI)
-          const cookies = await extractNetscapeCookies(targetUrl);
+          const cookies = await extractNetscapeCookies(isInstagram ? 'https://www.instagram.com' : targetUrl);
           
           const payload = {
             action: 'ytdlp_download',
@@ -1651,30 +1863,57 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             filename: options.filename || 'download.mp4',
             headers: {
               'User-Agent': navigator.userAgent,
-              'Referer': item.pageUrl || item.url || 'https://www.youtube.com/'
+              'Referer': isInstagram ? 'https://www.instagram.com/' : (item.pageUrl || item.url || 'https://www.youtube.com/')
             }
           };
           if (cookies) {
             payload.cookies = cookies;
           }
 
-          console.log(`[MediaSniff] Routing ${isYouTube ? 'YouTube' : 'authenticated stream'} to native yt-dlp:`, itemId);
+          console.log(`[MediaSniff] Routing ${isInstagram ? 'Instagram' : isYouTube ? 'YouTube' : 'authenticated stream'} to native yt-dlp:`, itemId);
           nativeBridge.sendDownload(itemId, payload, {
             onProgress: (msg) => broadcastProgress('downloading', msg.percent || 0, msg.statusLabel || 'Downloading...'),
             onComplete: (msg) => broadcastProgress('complete', 100, msg.statusLabel || 'Completed by yt-dlp!'),
             onFailed: async (errorMsg) => {
               console.warn('[MediaSniff] Native yt-dlp failed, falling back to browser offscreen pipeline:', errorMsg);
+              if (isInstagram && (item.url || item.directMp4Urls)) {
+                let dlUrl = item.url;
+                if (item.availableQualities?.length > 0) {
+                  dlUrl = item.availableQualities[0].url;
+                }
+                chrome.downloads.download({
+                  url: dlUrl,
+                  filename: sanitizeFilename(options.filename || item.filename) || 'download.mp4',
+                  saveAs: true
+                });
+                broadcastProgress('complete', 100, 'Downloaded via direct MP4 fallback');
+                return;
+              }
               const fallbackType = isYouTube ? 'youtube' : (downloadType === 'mux' || selectedAudio ? 'mux' : 'stream');
               triggerBrowserFallback(errorMsg, fallbackType);
             }
           });
           return;
         } else if (downloadType === 'ytdlp' || downloadType === 'native_stream') {
+          // If native companion app is unavailable, for Instagram fallback directly to progressive MP4
+          if (isInstagram && (item.url || item.directMp4Urls)) {
+            let dlUrl = item.url;
+            if (item.availableQualities?.length > 0) {
+              dlUrl = item.availableQualities[0].url;
+            }
+            chrome.downloads.download({
+              url: dlUrl,
+              filename: sanitizeFilename(options.filename || item.filename) || 'download.mp4',
+              saveAs: true
+            });
+            broadcastProgress('complete', 100, 'Downloaded via direct MP4');
+            return;
+          }
           // If the user explicitly clicked an advanced native-only button but companion host is missing
           broadcastProgress('failed', 0, 'Native companion app not installed or not running.', 'NATIVE_UNAVAILABLE');
           return;
         }
-        console.log(`[MediaSniff] Native host unavailable; routing ${isYouTube ? 'YouTube' : 'HLS/DASH'} to in-browser pipeline.`);
+        console.log(`[MediaSniff] Native host unavailable; routing ${isInstagram ? 'Instagram' : isYouTube ? 'YouTube' : 'HLS/DASH'} to in-browser pipeline.`);
       }
 
       // 3. Public / Simple HLS/DASH or Native Fallback:

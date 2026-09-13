@@ -151,6 +151,128 @@
     } catch (e) { /* ignore */ }
   }
 
+  // ─── Instagram Detection ────────────────────────────────────────────
+  const reportedIgMediaIds = new Set();
+
+  function findInstagramMediaNodes(root, results = [], seenIds = new Set()) {
+    if (!root || typeof root !== 'object') return results;
+
+    const hasVideoVersions = Array.isArray(root.video_versions) && root.video_versions.length > 0;
+    const hasDashManifest = typeof root.video_dash_manifest === 'string' && root.video_dash_manifest.includes('<MPD');
+    const hasVideoUrl = typeof root.video_url === 'string' && (root.is_video === true || root.__typename === 'GraphVideo');
+
+    if (hasVideoVersions || hasDashManifest || hasVideoUrl) {
+      const id = root.code || root.shortcode || root.id || root.pk || (hasVideoVersions ? root.video_versions[0].url : root.video_url);
+      const strId = String(id || '');
+      if (!strId || !seenIds.has(strId)) {
+        if (strId) seenIds.add(strId);
+        results.push(root);
+      }
+    }
+
+    if (Array.isArray(root)) {
+      for (const item of root) {
+        findInstagramMediaNodes(item, results, seenIds);
+      }
+    } else {
+      for (const key of Object.keys(root)) {
+        if (typeof root[key] === 'object' && root[key] !== null) {
+          findInstagramMediaNodes(root[key], results, seenIds);
+        }
+      }
+    }
+    return results;
+  }
+
+  function formatInstagramItem(node) {
+    const shortcode = node.code || node.shortcode || (node.pk ? String(node.pk) : null);
+    const user = node.user || node.owner || {};
+    const username = user.username || '';
+    const fullName = user.full_name || '';
+    const caption = node.caption?.text || node.edge_media_to_caption?.edges?.[0]?.node?.text || node.title || '';
+    const duration = node.video_duration || 0;
+
+    const thumbCandidates = node.image_versions2?.candidates || [];
+    const thumbnail = thumbCandidates[0]?.url || node.display_url || node.thumbnail_src || user.profile_pic_url || null;
+
+    let videoVersions = [];
+    if (Array.isArray(node.video_versions)) {
+      videoVersions = node.video_versions.map(v => ({
+        url: v.url,
+        width: v.width || 0,
+        height: v.height || 0,
+        label: v.height ? `${v.height}p` : 'MP4 Video'
+      })).filter(v => v.url);
+    } else if (node.video_url) {
+      videoVersions = [{
+        url: node.video_url,
+        width: node.dimensions?.width || 0,
+        height: node.dimensions?.height || 0,
+        label: node.dimensions?.height ? `${node.dimensions.height}p` : 'MP4 Video'
+      }];
+    }
+
+    const dashManifest = node.video_dash_manifest || null;
+    const pageUrl = shortcode ? `https://www.instagram.com/reel/${shortcode}/` : location.href;
+
+    return {
+      id: shortcode || String(Date.now()),
+      shortcode,
+      username,
+      fullName,
+      caption,
+      duration,
+      thumbnail,
+      videoVersions,
+      dashManifest,
+      pageUrl
+    };
+  }
+
+  function reportInstagramMedia(items) {
+    if (!items || items.length === 0) return;
+    const newItems = items.filter(it => {
+      const key = it.shortcode || it.id || it.videoVersions?.[0]?.url;
+      if (!key || reportedIgMediaIds.has(key)) return false;
+      reportedIgMediaIds.add(key);
+      return true;
+    });
+    if (newItems.length > 0) {
+      window.postMessage({ type: 'MS_INSTAGRAM_RESPONSE', data: newItems }, '*');
+    }
+  }
+
+  function scanInstagramScripts() {
+    if (!location.hostname.includes('instagram.com')) return;
+    try {
+      if (window.__additionalData) {
+        for (const k of Object.keys(window.__additionalData)) {
+          const nodes = findInstagramMediaNodes(window.__additionalData[k]);
+          if (nodes.length > 0) reportInstagramMedia(nodes.map(formatInstagramItem));
+        }
+      }
+      if (window._sharedData) {
+        const nodes = findInstagramMediaNodes(window._sharedData);
+        if (nodes.length > 0) reportInstagramMedia(nodes.map(formatInstagramItem));
+      }
+
+      const scripts = document.querySelectorAll('script');
+      for (const s of scripts) {
+        const text = s.textContent;
+        if (!text || text.length > 2000000) continue;
+        if (text.includes('video_versions') || text.includes('video_dash_manifest') || text.includes('"GraphVideo"')) {
+          try {
+            const data = JSON.parse(text);
+            const nodes = findInstagramMediaNodes(data);
+            if (nodes.length > 0) {
+              reportInstagramMedia(nodes.map(formatInstagramItem));
+            }
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+  }
+
   // ─── Hook window.fetch ──────────────────────────────────────────────
   try {
     const originalFetch = window.fetch;
@@ -198,6 +320,25 @@
               response.clone().json().then(data => {
                 if (data && (data.request?.files || data.files || data.video)) {
                   window.postMessage({ type: 'MS_VIMEO_RESPONSE', data }, '*');
+                }
+              }).catch(() => {});
+            }
+          }).catch(() => {});
+        }
+
+        // 2b. Instagram GraphQL & API responses
+        if ((location.hostname.includes('instagram.com') || url.includes('/graphql/query') || url.includes('/api/v1/')) && !url.includes('.js') && !url.includes('.css')) {
+          result.then(response => {
+            if (response.ok) {
+              response.clone().text().then(text => {
+                if (text && (text.includes('video_versions') || text.includes('video_dash_manifest') || text.includes('"GraphVideo"'))) {
+                  try {
+                    const data = JSON.parse(text);
+                    const nodes = findInstagramMediaNodes(data);
+                    if (nodes.length > 0) {
+                      reportInstagramMedia(nodes.map(formatInstagramItem));
+                    }
+                  } catch (_) {}
                 }
               }).catch(() => {});
             }
@@ -283,6 +424,19 @@
                 window.postMessage({ type: 'MS_VIMEO_RESPONSE', data }, '*');
               }
             } catch (_) {}
+          }
+
+          // Instagram GraphQL / API responses
+          if ((location.hostname.includes('instagram.com') || url.includes('/graphql/query') || url.includes('/api/v1/')) && responseText) {
+            if (responseText.includes('video_versions') || responseText.includes('video_dash_manifest') || responseText.includes('"GraphVideo"')) {
+              try {
+                const data = JSON.parse(responseText);
+                const nodes = findInstagramMediaNodes(data);
+                if (nodes.length > 0) {
+                  reportInstagramMedia(nodes.map(formatInstagramItem));
+                }
+              } catch (_) {}
+            }
           }
 
           // Vimeo / general master.json
@@ -423,6 +577,9 @@
       getPlayerResponse();
     }
     getVimeoConfig();
+    if (location.hostname.includes('instagram.com')) {
+      scanInstagramScripts();
+    }
   }
 
   setTimeout(runScrapers, 500);

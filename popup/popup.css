@@ -187,6 +187,11 @@ html, body {
 .badge.dash { background: rgba(16,185,129,0.1); color: var(--success); }
 .badge.stream { background: rgba(139,92,246,0.1); color: var(--purple); }
 .badge.youtube { background: rgba(239,68,68,0.1); color: var(--danger); }
+.badge.instagram {
+  background: linear-gradient(45deg, #f09433, #e6683c, #dc2743, #cc2366, #bc1888);
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0,0,0,0.2);
+}
 .badge.video { background: var(--bg-tertiary); color: var(--text-secondary); }
 .badge.audio { background: rgba(245,158,11,0.1); color: var(--warning); }
 .badge.subtitle { background: rgba(16,185,129,0.1); color: var(--success); }
