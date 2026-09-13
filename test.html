@@ -316,6 +316,20 @@
     </div>
   </div>
 
+  <div class="test-group" id="filenameTests">
+    <h3>Filename Sanitizer</h3>
+    <div class="test-item" id="san-1">
+      <div class="status running">…</div>
+      <div class="test-name">Sanitize ellipsis, consecutive dots, and trailing spaces</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="san-2">
+      <div class="status running">…</div>
+      <div class="test-name">Windows reserved names and extension preservation</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
+
   <div id="summary"></div>
 
   <script type="module">
@@ -765,6 +779,67 @@ segment2.ts
         const ok = patchedVal === 5100;
         setResult('fmp4-1', ok, `patched offset = ${patchedVal} (expected 5100)`);
       } catch (e) { setResult('fmp4-1', false, e.message); }
+
+      // ─── Filename Sanitizer Tests ───
+      function sanitizeFilename(rawName, fallbackExt = '') {
+        if (!rawName || typeof rawName !== 'string') {
+          return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+        }
+        const raw = rawName.trim().replace(/^[\s.]+|[\s.]+$/g, '');
+        if (!raw) {
+          return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+        }
+        let ext = '';
+        let stem = raw;
+        const extMatch = stem.match(/\.(mp4|webm|m4a|mkv|ts|m4s|mp3|vtt|srt|aac|flv)$/i)
+          || stem.match(/\.([a-zA-Z0-9]{2,5})$/i);
+        if (extMatch) {
+          ext = extMatch[0].toLowerCase();
+          stem = stem.slice(0, -extMatch[0].length);
+        } else if (fallbackExt) {
+          ext = fallbackExt.startsWith('.') ? fallbackExt.toLowerCase() : '.' + fallbackExt.toLowerCase();
+        }
+        let cleanStem = stem
+          .replace(/_/g, ' ')
+          .replace(/&/g, 'and')
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .replace(/\.{2,}/g, ' ')
+          .replace(/\s+\./g, '.')
+          .replace(/\.\s+/g, ' ')
+          .replace(/\s+/g, ' ')
+          .replace(/^[\s.]+|[\s.]+$/g, '');
+        const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+        if (!cleanStem || reservedRegex.test(cleanStem)) {
+          cleanStem = cleanStem ? `${cleanStem}_media` : 'download';
+        }
+        if (cleanStem.length > 120) {
+          cleanStem = cleanStem.slice(0, 120).replace(/[\s.]+$/, '');
+        }
+        if (!cleanStem) cleanStem = 'download';
+        return `${cleanStem}${ext}`;
+      }
+
+      try {
+        const t1 = sanitizeFilename('AFUSIC - Afusic - Pal Pal (Official Music ...', '.mp4');
+        const t2 = sanitizeFilename('AFUSIC - Afusic - Pal Pal (Official Music ....mp4', '.mp4');
+        const t3 = sanitizeFilename('AFUSIC - Afusic - Pal Pal (Official Music ... (2160p).mp4', '.mp4');
+        const pass1 = t1 === 'AFUSIC - Afusic - Pal Pal (Official Music.mp4' &&
+                      t2 === 'AFUSIC - Afusic - Pal Pal (Official Music.mp4' &&
+                      t3 === 'AFUSIC - Afusic - Pal Pal (Official Music (2160p).mp4';
+        setResult('san-1', pass1, `t1: ${t1}, t2: ${t2}, t3: ${t3}`);
+      } catch (e) { setResult('san-1', false, e.message); }
+
+      try {
+        const r1 = sanitizeFilename('con.mp4', '.mp4');
+        const r2 = sanitizeFilename('aux.webm', '.mp4');
+        const r3 = sanitizeFilename('test.mp4.', '.mp4');
+        const r4 = sanitizeFilename('....', '.mp4');
+        const pass2 = r1 === 'con_media.mp4' &&
+                      r2 === 'aux_media.webm' &&
+                      r3 === 'test.mp4' &&
+                      r4 === 'download.mp4';
+        setResult('san-2', pass2, `r1: ${r1}, r2: ${r2}, r3: ${r3}, r4: ${r4}`);
+      } catch (e) { setResult('san-2', false, e.message); }
 
 
       // Summary

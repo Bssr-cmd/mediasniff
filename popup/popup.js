@@ -745,22 +745,25 @@ function getSmartName(item) {
     .replace(/[/\\_]+/g, ' ')
     .replace(/&/g, 'and')
     .replace(/[<>:"|?*\x00-\x1f]/g, '')
+    .replace(/\.{2,}/g, ' ')
+    .replace(/\s+\./g, '.')
+    .replace(/\.\s+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim();
+    .replace(/^[\s.]+|[\s.]+$/g, '');
 
   // Sanitize Windows reserved names
   const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
-  if (reservedRegex.test(name)) {
-    name = name + '_media';
+  if (!name || reservedRegex.test(name)) {
+    name = name ? `${name}_media` : 'download';
   }
 
   const suffix = quality ? ` (${quality})` : '';
   const totalExtLen = suffix.length + ext.length;
   if (name.length + totalExtLen > 80) {
-    name = name.substring(0, 80 - totalExtLen).trim();
+    name = name.substring(0, 80 - totalExtLen).replace(/^[\s.]+|[\s.]+$/g, '');
   }
 
-  return `${name}${suffix}${ext}`;
+  return sanitizeFilename(`${name}${suffix}${ext}`, ext);
 }
 
 // ─── Download Handlers ──────────────────────────────────────────────
@@ -1037,15 +1040,54 @@ function triggerBlobDownload(blob, filename) {
   reader.readAsDataURL(blob);
 }
 
-function sanitizeFilename(name) {
-  if (!name) return 'download.mp4';
-  return name
+function sanitizeFilename(rawName, fallbackExt = '.mp4') {
+  if (!rawName || typeof rawName !== 'string') {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : 'download.mp4';
+  }
+
+  // Trim whitespace and trailing dots from input
+  const raw = rawName.trim().replace(/^[\s.]+|[\s.]+$/g, '');
+  if (!raw) {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : 'download.mp4';
+  }
+
+  let ext = '';
+  let stem = raw;
+
+  // Match known media/subtitle extensions or generic 2-5 letter extension
+  const extMatch = stem.match(/\.(mp4|webm|m4a|mkv|ts|m4s|mp3|vtt|srt|aac|flv)$/i)
+    || stem.match(/\.([a-zA-Z0-9]{2,5})$/i);
+
+  if (extMatch) {
+    ext = extMatch[0].toLowerCase();
+    stem = stem.slice(0, -extMatch[0].length);
+  } else if (fallbackExt) {
+    ext = fallbackExt.startsWith('.') ? fallbackExt.toLowerCase() : '.' + fallbackExt.toLowerCase();
+  }
+
+  // Sanitize the stem
+  let cleanStem = stem
     .replace(/_/g, ' ')
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-    .replace(/\.\./g, ' ')
-    .replace(/^\.+/, '')
     .replace(/&/g, 'and')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\.{2,}/g, ' ')
+    .replace(/\s+\./g, '.')
+    .replace(/\.\s+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .substring(0, 200) || 'download.mp4';
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+
+  const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+  if (!cleanStem || reservedRegex.test(cleanStem)) {
+    cleanStem = cleanStem ? `${cleanStem}_media` : 'download';
+  }
+
+  if (cleanStem.length > 120) {
+    cleanStem = cleanStem.slice(0, 120).replace(/[\s.]+$/, '');
+  }
+
+  if (!cleanStem) {
+    cleanStem = 'download';
+  }
+
+  return `${cleanStem}${ext}`;
 }

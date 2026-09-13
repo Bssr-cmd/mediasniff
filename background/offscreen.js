@@ -310,6 +310,12 @@ class DownloadTask {
       audioResult = null;
     }
     // 3. Mux
+    console.log('[MediaSniff Mux] Final buffers:', {
+      videoBytes: videoBuffer.byteLength,
+      audioBytes: audioBuffer?.byteLength || 0,
+      videoFormat: WASMMuxer.detectFormat(videoBuffer),
+      audioFormat: audioBuffer ? WASMMuxer.detectFormat(audioBuffer) : null
+    });
     this.reportProgress(75, 'Muxing tracks (WASM)...', '');
     const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
       const overall = Math.round(75 + progress * 0.20);
@@ -535,6 +541,8 @@ class DownloadTask {
     console.log(`[MediaSniff YouTube] Audio URL resolved: ${audioUrl ? 'YES' : 'NO'}, isCombined: ${isCombined}`);
     
     // ─── Pipeline 1: Native Messaging Companion App (Lossless FFmpeg Merging) ───
+    // Temporarily disabled for diagnostic debugging:
+    /*
     try {
       this.reportProgress(8, 'Connecting to Companion App...', '');
       const nativeResult = await this.triggerNativeDownload(
@@ -549,6 +557,7 @@ class DownloadTask {
     } catch (e) {
       console.warn('[MediaSniff Offscreen] Companion App failed or not installed. Falling back to WASM:', e.message);
     }
+    */
     // ─── Pipeline 2: In-Browser WASM Muxer / Downloader Fallback ───
     let finalBlob;
 
@@ -616,14 +625,21 @@ class DownloadTask {
             this.abortController.signal
           );
         } catch (audioErr) {
-          console.warn('[MediaSniff YouTube] Audio stream download failed, continuing with video only:', audioErr.message);
-          audioBlob = null;
+          console.error('[MediaSniff YouTube] Audio stream download failed:', audioErr);
+          throw new Error('Audio download failed: ' + audioErr.message);
         }
       }
 
       this.reportProgress(80, 'Preparing to merge...', '');
       const videoBuffer = await videoBlob.arrayBuffer();
       const audioBuffer = audioBlob ? await audioBlob.arrayBuffer() : null;
+
+      console.log('[MediaSniff YouTube] Final buffers:', {
+        videoBytes: videoBuffer.byteLength,
+        audioBytes: audioBuffer?.byteLength || 0,
+        videoFormat: WASMMuxer.detectFormat(videoBuffer),
+        audioFormat: audioBuffer ? WASMMuxer.detectFormat(audioBuffer) : null
+      });
 
       // Always attempt muxing through WASMMuxer.mux() — it auto-detects
       // whether the input is fragmented MP4 or standard MP4 and routes
@@ -681,14 +697,7 @@ class DownloadTask {
 
   async triggerSave(blob, filename) {
     const url = URL.createObjectURL(blob);
-    const sanitized = filename
-      .replace(/_/g, ' ')
-      .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-      .replace(/\.\./g, ' ')
-      .replace(/^\.+/, '')
-      .replace(/\s+/g, ' ')
-      .trim()
-      .substring(0, 200) || 'download.mp4';
+    const sanitized = sanitizeFilename(filename, '.mp4');
 
     return new Promise((resolve, reject) => {
       chrome.runtime.sendMessage({
@@ -762,3 +771,55 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true; // async response
   }
 });
+
+function sanitizeFilename(rawName, fallbackExt = '') {
+  if (!rawName || typeof rawName !== 'string') {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+  }
+
+  // Trim whitespace and trailing dots from input
+  const raw = rawName.trim().replace(/^[\s.]+|[\s.]+$/g, '');
+  if (!raw) {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+  }
+
+  let ext = '';
+  let stem = raw;
+
+  // Match known media/subtitle extensions or generic 2-5 letter extension
+  const extMatch = stem.match(/\.(mp4|webm|m4a|mkv|ts|m4s|mp3|vtt|srt|aac|flv)$/i)
+    || stem.match(/\.([a-zA-Z0-9]{2,5})$/i);
+
+  if (extMatch) {
+    ext = extMatch[0].toLowerCase();
+    stem = stem.slice(0, -extMatch[0].length);
+  } else if (fallbackExt) {
+    ext = fallbackExt.startsWith('.') ? fallbackExt.toLowerCase() : '.' + fallbackExt.toLowerCase();
+  }
+
+  // Sanitize the stem
+  let cleanStem = stem
+    .replace(/_/g, ' ')
+    .replace(/&/g, 'and')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\.{2,}/g, ' ')
+    .replace(/\s+\./g, '.')
+    .replace(/\.\s+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+
+  const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+  if (!cleanStem || reservedRegex.test(cleanStem)) {
+    cleanStem = cleanStem ? `${cleanStem}_media` : 'download';
+  }
+
+  if (cleanStem.length > 120) {
+    cleanStem = cleanStem.slice(0, 120).replace(/[\s.]+$/, '');
+  }
+
+  if (!cleanStem) {
+    cleanStem = 'download';
+  }
+
+  return `${cleanStem}${ext}`;
+}

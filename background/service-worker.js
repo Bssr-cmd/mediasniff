@@ -1629,10 +1629,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'DOWNLOAD_DIRECT') {
-    let saveFilename = sanitizeFilename(message.filename) || 'download.mp4';
-    if (!/\.(mp4|webm|m4a|vtt)$/i.test(saveFilename)) {
-      saveFilename = saveFilename.replace(/\.[^.]+$/, '') + '.mp4';
-    }
+    let saveFilename = sanitizeFilename(message.filename, '.mp4');
     chrome.downloads.download({
       url: message.url,
       filename: saveFilename,
@@ -1644,7 +1641,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'DOWNLOAD_BLOB') {
     // The popup sends us base64 data + filename; we create a proper data URL
     const dataUrl = message.dataUrl;
-    const filename = sanitizeFilename(message.filename) || 'download.mp4';
+    const filename = sanitizeFilename(message.filename, '.mp4');
     chrome.downloads.download({
       url: dataUrl,
       filename: filename,
@@ -1705,10 +1702,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   // Handle requests from offscreen to trigger downloads (since offscreen cannot call downloads API)
   if (message.type === 'TRIGGER_DOWNLOAD_SAVE') {
-    let saveFilename = sanitizeFilename(message.filename) || 'download.mp4';
-    if (!/\.(mp4|webm|m4a|vtt)$/i.test(saveFilename)) {
-      saveFilename = saveFilename.replace(/\.[^.]+$/, '') + '.mp4';
-    }
+    let saveFilename = sanitizeFilename(message.filename, '.mp4');
     chrome.downloads.download({
       url: message.url,
       filename: saveFilename,
@@ -2716,7 +2710,7 @@ function extractFilename(url, mimeType) {
     name = name.replace(/_/g, ' ').replace(/\s+/g, ' ').trim();
     const ext = name.match(/\.[^.]+$/)?.[0] || '';
     const stem = name.replace(/\.[^.]+$/, '');
-    if (stem.length > 56) name = stem.substring(0, 56) + '...' + ext;
+    if (stem.length > 56) name = stem.substring(0, 56).trim() + ext;
     return name;
   } catch {
     return 'media';
@@ -2747,18 +2741,56 @@ function extractSubLanguage(url) {
   const langMatch = url.match(/[._-](en|es|fr|de|it|pt|ja|ko|zh|ru|ar|hi|nl|sv|no|da|fi|pl|tr|cs|el|he|th|vi|id|ms|uk|ro|hu|bg|hr|sr|sk|sl|lt|lv|et)[-_.]/i);
   return langMatch ? langMatch[1].toLowerCase() : null;
 }
-function sanitizeFilename(name) {
-  if (!name) return null;
-  // Remove path separators, illegal filesystem characters, and replace underscores with spaces
-  return name
+function sanitizeFilename(rawName, fallbackExt = '') {
+  if (!rawName || typeof rawName !== 'string') {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+  }
+
+  // Trim whitespace and trailing dots from input
+  const raw = rawName.trim().replace(/^[\s.]+|[\s.]+$/g, '');
+  if (!raw) {
+    return fallbackExt ? `download${fallbackExt.startsWith('.') ? fallbackExt : '.' + fallbackExt}` : null;
+  }
+
+  let ext = '';
+  let stem = raw;
+
+  // Match known media/subtitle extensions or generic 2-5 letter extension
+  const extMatch = stem.match(/\.(mp4|webm|m4a|mkv|ts|m4s|mp3|vtt|srt|aac|flv)$/i)
+    || stem.match(/\.([a-zA-Z0-9]{2,5})$/i);
+
+  if (extMatch) {
+    ext = extMatch[0].toLowerCase();
+    stem = stem.slice(0, -extMatch[0].length);
+  } else if (fallbackExt) {
+    ext = fallbackExt.startsWith('.') ? fallbackExt.toLowerCase() : '.' + fallbackExt.toLowerCase();
+  }
+
+  // Sanitize the stem
+  let cleanStem = stem
     .replace(/_/g, ' ')
-    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
-    .replace(/\.\./g, ' ')
-    .replace(/^\.+/, '')
     .replace(/&/g, 'and')
+    .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+    .replace(/\.{2,}/g, ' ')
+    .replace(/\s+\./g, '.')
+    .replace(/\.\s+/g, ' ')
     .replace(/\s+/g, ' ')
-    .trim()
-    .substring(0, 200);
+    .replace(/^[\s.]+|[\s.]+$/g, '');
+
+  const reservedRegex = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+  if (!cleanStem || reservedRegex.test(cleanStem)) {
+    cleanStem = cleanStem ? `${cleanStem}_media` : 'download';
+  }
+
+  if (cleanStem.length > 120) {
+    cleanStem = cleanStem.slice(0, 120).replace(/[\s.]+$/, '');
+  }
+
+  if (!cleanStem) {
+    cleanStem = 'download';
+  }
+
+  return `${cleanStem}${ext}`;
 }
 function getBaseUrl(urlStr) {
   try {
