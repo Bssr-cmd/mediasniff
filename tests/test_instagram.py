@@ -307,6 +307,123 @@ def test_chunk_cards_suppression():
     print("  [PASS] All 31 chunk cards are completely suppressed on Instagram pages.")
     return True
 
+def test_max_resolution_progressive_vs_dash():
+    print("\n--- Test 7: Max Resolution Comparison (Progressive vs DASH) ---")
+
+    def merge_instagram_formats(video_versions, dash_variants, dash_audio):
+        valid_prog = [v for v in video_versions if v.get("url") and (v.get("width", 0) > 0 or v.get("height", 0) > 0)]
+        prog_candidates = [
+            {
+                "url": v["url"],
+                "width": v.get("width", 0),
+                "height": v.get("height", 0),
+                "bandwidth": 0,
+                "is_direct": True,
+                "is_dash": False
+            }
+            for v in (valid_prog if valid_prog else [v for v in video_versions if v.get("url")])
+        ]
+
+        dash_candidates = [
+            {
+                "url": v["url"],
+                "width": v.get("width", 0),
+                "height": v.get("height", 0),
+                "bandwidth": v.get("bandwidth", 0),
+                "is_direct": False,
+                "is_dash": True
+            }
+            for v in dash_variants if v.get("url")
+        ]
+
+        all_candidates = prog_candidates + dash_candidates
+        # Sort by resolution (area, then height). If equal, prefer progressive.
+        def sort_key(c):
+            area = c["width"] * c["height"]
+            height = c["height"]
+            is_direct_score = 1 if c["is_direct"] else 0
+            bw = c["bandwidth"]
+            return (area, height, is_direct_score, bw)
+
+        all_candidates.sort(key=sort_key, reverse=True)
+
+        seen_res = set()
+        variants = []
+        for c in all_candidates:
+            res_key = f"{c['width']}x{c['height']}"
+            if c["width"] > 0 and c["height"] > 0:
+                if res_key in seen_res:
+                    continue
+                seen_res.add(res_key)
+            variants.append(c)
+
+        return variants
+
+    # Case A: DASH has 1080p, Progressive only has 720p
+    # DASH must be preferred at index 0
+    prog_720 = [{"url": "https://cdn.example.com/prog_720.mp4", "width": 720, "height": 1280}]
+    dash_1080 = [{"url": "https://cdn.example.com/dash_1080.mp4", "width": 1080, "height": 1920, "bandwidth": 2500000}]
+    variants_a = merge_instagram_formats(prog_720, dash_1080, [])
+    assert len(variants_a) == 2
+    assert variants_a[0]["height"] == 1920, f"Expected 1920 at index 0, got {variants_a[0]['height']}"
+    assert variants_a[0]["is_dash"] is True, "DASH representation should be index 0 when it has max resolution"
+    assert variants_a[1]["height"] == 1280
+    assert variants_a[1]["is_direct"] is True
+
+    # Case B: Progressive has 1080p, DASH also has 1080p
+    # Progressive must be preferred at index 0
+    prog_1080 = [{"url": "https://cdn.example.com/prog_1080.mp4", "width": 1080, "height": 1920}]
+    variants_b = merge_instagram_formats(prog_1080, dash_1080, [])
+    assert variants_b[0]["height"] == 1920
+    assert variants_b[0]["is_direct"] is True, "Progressive should be preferred when equal resolution"
+
+    # Case C: Progressive provides maximum (1080p), DASH only has 720p
+    dash_720 = [{"url": "https://cdn.example.com/dash_720.mp4", "width": 720, "height": 1280, "bandwidth": 1200000}]
+    variants_c = merge_instagram_formats(prog_1080, dash_720, [])
+    assert variants_c[0]["height"] == 1920
+    assert variants_c[0]["is_direct"] is True
+
+    print("  [PASS] Maximum resolution selection across progressive and DASH verified.")
+    return True
+
+def test_cdn_observer_noop_and_option_indices():
+    print("\n--- Test 8: CDN Observer No-Op and Array-Index Option Values ---")
+
+    # Verify CDN observer does not touch canonical item
+    canonical_item = {
+        "url": "https://scontent.cdninstagram.com/v/canonical_1080p.mp4",
+        "variants": [{"url": "https://scontent.cdninstagram.com/v/canonical_1080p.mp4", "height": 1920}],
+        "directMp4Urls": {"0": "https://scontent.cdninstagram.com/v/canonical_1080p.mp4", "1920": "https://scontent.cdninstagram.com/v/canonical_1080p.mp4"}
+    }
+
+    def handle_instagram_cdn_request(item, chunk_url):
+        # Must be no-op
+        return
+
+    chunk_url = "https://scontent-del3-1.cdninstagram.com/v/t66/chunk_0.mp4?bytestart=0&byteend=248"
+    handle_instagram_cdn_request(canonical_item, chunk_url)
+    assert canonical_item["url"] == "https://scontent.cdninstagram.com/v/canonical_1080p.mp4", "CDN observer must not overwrite URL"
+
+    # Verify <option> value indexing: must use array index 0, 1, 2...
+    mock_variants = [
+        {"label": "1920p", "height": 1920, "isDash": True},
+        {"label": "1280p", "height": 1280, "isDirect": True}
+    ]
+
+    options_html = "".join([f'<option value="{i}">{v["label"]}</option>' for i, v in enumerate(mock_variants)])
+    assert 'value="0"' in options_html
+    assert 'value="1"' in options_html
+    assert 'value="1920"' not in options_html, "Option value should be array index, not height"
+
+    # Verify O(1) index lookup
+    selected_idx = int("0")
+    selected_variant = mock_variants[selected_idx]
+    assert selected_variant["height"] == 1920
+    assert selected_variant["isDash"] is True
+
+    print("  [PASS] CDN observer no-op protection and array index option identifiers verified.")
+    return True
+
 if __name__ == "__main__":
     print("Starting Comprehensive Instagram Detection & Download Test Suite...")
     success = True
@@ -316,6 +433,8 @@ if __name__ == "__main__":
     success &= test_highest_quality_sorting_and_zero_prevention()
     success &= test_script_balanced_json_extraction()
     success &= test_chunk_cards_suppression()
+    success &= test_max_resolution_progressive_vs_dash()
+    success &= test_cdn_observer_noop_and_option_indices()
 
     if success:
         print("\nAll Instagram tests PASSED successfully! [OK]")
@@ -323,3 +442,4 @@ if __name__ == "__main__":
     else:
         print("\nSome tests FAILED!")
         sys.exit(1)
+

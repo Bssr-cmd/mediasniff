@@ -184,6 +184,114 @@
     return results;
   }
 
+  function parseInstagramDash(dashXml) {
+    const dashVariants = [];
+    const dashAudio = [];
+    if (!dashXml || typeof dashXml !== 'string') return { dashVariants, dashAudio };
+
+    // 1. Try DOMParser if available
+    if (typeof DOMParser !== 'undefined') {
+      try {
+        const parser = new DOMParser();
+        const doc = parser.parseFromString(dashXml, 'application/xml');
+        const adaptSets = Array.from(doc.querySelectorAll('AdaptationSet'));
+        for (const as of adaptSets) {
+          const mime = as.getAttribute('mimeType') || '';
+          const contentType = as.getAttribute('contentType') || (mime.includes('video') ? 'video' : mime.includes('audio') ? 'audio' : '');
+          const isVideo = contentType === 'video' || mime.includes('video');
+          const isAudio = contentType === 'audio' || mime.includes('audio');
+
+          const reps = Array.from(as.querySelectorAll('Representation'));
+          for (const rep of reps) {
+            const width = parseInt(rep.getAttribute('width')) || 0;
+            const height = parseInt(rep.getAttribute('height')) || 0;
+            const bandwidth = parseInt(rep.getAttribute('bandwidth')) || 0;
+            const codecs = rep.getAttribute('codecs') || '';
+            const baseUrlEl = rep.querySelector('BaseURL');
+            let rawUrl = baseUrlEl ? baseUrlEl.textContent.trim() : '';
+            if (!rawUrl) continue;
+            const cleanUrl = rawUrl
+              .replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
+              .replace(/\?&/, '?').replace(/\?(?=#|$)/, '');
+
+            if (isVideo) {
+              dashVariants.push({
+                url: cleanUrl,
+                width,
+                height,
+                bandwidth,
+                codecs,
+                label: height ? `${height}p` : 'DASH Video',
+                isDash: true
+              });
+            } else if (isAudio) {
+              dashAudio.push({
+                url: cleanUrl,
+                bandwidth,
+                codecs,
+                label: 'Default Audio',
+                isDash: true
+              });
+            }
+          }
+        }
+        if (dashVariants.length > 0 || dashAudio.length > 0) {
+          return { dashVariants, dashAudio };
+        }
+      } catch (_) {}
+    }
+
+    // 2. Regex fallback parser
+    try {
+      const repRegex = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/gi;
+      let match;
+      while ((match = repRegex.exec(dashXml)) !== null) {
+        const attrs = match[1];
+        const body = match[2];
+
+        const mimeMatch = attrs.match(/mimeType="([^"]+)"/i);
+        const mime = mimeMatch ? mimeMatch[1] : '';
+        const widthMatch = attrs.match(/width="(\d+)"/i);
+        const width = widthMatch ? parseInt(widthMatch[1]) : 0;
+        const heightMatch = attrs.match(/height="(\d+)"/i);
+        const height = heightMatch ? parseInt(heightMatch[1]) : 0;
+        const bwMatch = attrs.match(/bandwidth="(\d+)"/i);
+        const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+        const codecsMatch = attrs.match(/codecs="([^"]+)"/i);
+        const codecs = codecsMatch ? codecsMatch[1] : '';
+
+        const baseMatch = body.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
+        if (!baseMatch) continue;
+        let cleanUrl = baseMatch[1].trim()
+          .replace(/&amp;/g, '&')
+          .replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
+          .replace(/\?&/, '?').replace(/\?(?=#|$)/, '');
+
+        if (mime.includes('video') || width > 0 || height > 0) {
+          dashVariants.push({
+            url: cleanUrl,
+            width,
+            height,
+            bandwidth,
+            codecs,
+            label: height ? `${height}p` : 'DASH Video',
+            isDash: true
+          });
+        } else if (mime.includes('audio')) {
+          dashAudio.push({
+            url: cleanUrl,
+            bandwidth,
+            codecs,
+            label: 'Default Audio',
+            isDash: true
+          });
+        }
+      }
+    } catch (_) {}
+
+    return { dashVariants, dashAudio };
+  }
+
   function formatInstagramItem(node) {
     const shortcode = node.code || node.shortcode || (node.pk ? String(node.pk) : null);
     const user = node.user || node.owner || {};
@@ -201,14 +309,16 @@
         url: v.url,
         width: v.width || 0,
         height: v.height || 0,
-        label: v.height ? `${v.height}p` : 'HD Video'
+        label: v.height ? `${v.height}p` : 'HD Video',
+        isDirect: true
       })).filter(v => v.url);
     } else if (node.video_url) {
       videoVersions = [{
         url: node.video_url,
         width: node.dimensions?.width || 0,
         height: node.dimensions?.height || 0,
-        label: node.dimensions?.height ? `${node.dimensions.height}p` : 'HD Video'
+        label: node.dimensions?.height ? `${node.dimensions.height}p` : 'HD Video',
+        isDirect: true
       }];
     }
 
@@ -221,6 +331,7 @@
     });
 
     const dashManifest = node.video_dash_manifest || null;
+    const { dashVariants, dashAudio } = parseInstagramDash(dashManifest);
     const pageUrl = shortcode ? `https://www.instagram.com/reel/${shortcode}/` : location.href;
 
     return {
@@ -232,6 +343,8 @@
       duration,
       thumbnail,
       videoVersions,
+      dashVariants,
+      dashAudio,
       dashManifest,
       pageUrl
     };

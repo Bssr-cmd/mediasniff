@@ -422,19 +422,8 @@ function createMediaCard(item) {
       <select class="quality-select" id="quality-${item.id}">
         ${item.variants.map((v, i) => {
           const resStr = (v.resolution && v.resolution !== '0x0') ? ` (${v.resolution})` : '';
-          const codecStr = v.codecs ? ` [${v.codecs}]` : '';
-          return `<option value="${i}">${v.label || 'Video'}${resStr}${codecStr}</option>`;
-        }).join('')}
-      </select>
-    </div>`;
-  } else if (item.source === 'instagram' && item.availableQualities?.length > 1) {
-    html += `
-    <div class="quality-section">
-      <div class="quality-label">Video Quality</div>
-      <select class="quality-select" id="quality-${item.id}">
-        ${item.availableQualities.map((q, i) => {
-          const resStr = (q.width && q.height && `${q.width}x${q.height}` !== '0x0') ? ` (${q.width}x${q.height})` : '';
-          return `<option value="${q.height || i}">${q.label || (q.height ? q.height + 'p' : 'HD Video')}${resStr}</option>`;
+          const tag = v.isDash ? ' [HD Mux]' : v.isDirect ? ' [Direct]' : '';
+          return `<option value="${i}">${v.label || 'Video'}${resStr}${tag}</option>`;
         }).join('')}
       </select>
     </div>`;
@@ -813,10 +802,27 @@ async function handleDownload(item) {
     return;
   }
 
-  // Instagram reels & videos — download selected progressive MP4 directly
+  // Instagram reels & videos — download highest quality (mux DASH if DASH is max resolution, or direct progressive)
   if (item.source === 'instagram') {
+    const qualitySelect = document.getElementById(`quality-${item.id}`);
+    const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
+    const selectedVariant = item.variants?.[qualityIndex] || item.variants?.[0];
     const filename = getSmartName(item);
-    const downloadUrl = getSelectedUrl(item);
+
+    if (selectedVariant && selectedVariant.isDash && item.audioRenditions && item.audioRenditions.length > 0) {
+      showToast('Downloading & muxing 1080p Instagram Reel...');
+      setCardDownloadStarting(item.id, 'Muxing 1080p Reel...');
+      chrome.runtime.sendMessage({
+        type: 'START_DOWNLOAD',
+        itemId: item.id,
+        item,
+        downloadType: 'mux',
+        options: { filename, qualityIndex, audioIndex: 0 }
+      });
+      return;
+    }
+
+    const downloadUrl = selectedVariant?.url || getSelectedUrl(item) || item.url;
     chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: downloadUrl, filename });
     showToast('Downloading Instagram Reel...');
     return;

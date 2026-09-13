@@ -547,36 +547,137 @@ async function handleRequest(details) {
   }
 }
 
-function handleInstagramCdnRequest(details, url, headers, contentType, contentLength) {
-  if (details.tabId < 0) return;
+function parseInstagramDash(dashXml) {
+  const dashVariants = [];
+  const dashAudio = [];
+  if (!dashXml || typeof dashXml !== 'string') return { dashVariants, dashAudio };
+
   try {
-    const cleanUrl = url
-      .replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
-      .replace(/\?&/, '?').replace(/\?(?=#|$)/, '');
+    const repRegex = /<Representation\b([^>]*)>([\s\S]*?)<\/Representation>/gi;
+    let match;
+    while ((match = repRegex.exec(dashXml)) !== null) {
+      const attrs = match[1];
+      const body = match[2];
 
-    const tabMedia = getTabMedia(details.tabId);
-    let igItem = Array.from(tabMedia.values()).find(m => m.source === 'instagram');
+      const mimeMatch = attrs.match(/mimeType="([^"]+)"/i);
+      const mime = mimeMatch ? mimeMatch[1] : '';
+      const widthMatch = attrs.match(/width="(\d+)"/i);
+      const width = widthMatch ? parseInt(widthMatch[1]) : 0;
+      const heightMatch = attrs.match(/height="(\d+)"/i);
+      const height = heightMatch ? parseInt(heightMatch[1]) : 0;
+      const bwMatch = attrs.match(/bandwidth="(\d+)"/i);
+      const bandwidth = bwMatch ? parseInt(bwMatch[1]) : 0;
+      const codecsMatch = attrs.match(/codecs="([^"]+)"/i);
+      const codecs = codecsMatch ? codecsMatch[1] : '';
 
-    const isVideo = contentType.startsWith('video/') || url.includes('.mp4') || /[?&]mime=video/i.test(url);
-    const isAudio = contentType.startsWith('audio/') || /[?&]mime=audio/i.test(url);
+      const baseMatch = body.match(/<BaseURL>([^<]+)<\/BaseURL>/i);
+      if (!baseMatch) continue;
+      let cleanUrl = baseMatch[1].trim()
+        .replace(/&amp;/g, '&')
+        .replace(/([?&])(?:bytestart|byteend)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
+        .replace(/\?&/, '?').replace(/\?(?=#|$)/, '');
 
-    if (igItem) {
-      if (!igItem.directVideoUrls) igItem.directVideoUrls = {};
-      if (!igItem.directAudioUrls) igItem.directAudioUrls = {};
-
-      if (isVideo) {
-        if (!igItem.url || igItem.url.includes('/reel/')) {
-          igItem.url = cleanUrl;
-        }
-        igItem.directVideoUrls['default'] = cleanUrl;
-      } else if (isAudio) {
-        igItem.directAudioUrls['default'] = cleanUrl;
+      if (mime.includes('video') || width > 0 || height > 0) {
+        dashVariants.push({
+          url: cleanUrl,
+          width,
+          height,
+          bandwidth,
+          codecs,
+          label: height ? `${height}p` : 'DASH Video',
+          isDash: true
+        });
+      } else if (mime.includes('audio')) {
+        dashAudio.push({
+          url: cleanUrl,
+          bandwidth,
+          codecs,
+          label: 'Default Audio',
+          isDash: true
+        });
       }
-      notifyPopup(details.tabId);
     }
-  } catch (e) {
-    console.warn('[MediaSniff] Error handling Instagram CDN request:', e.message);
+  } catch (_) {}
+
+  return { dashVariants, dashAudio };
+}
+
+function mergeInstagramFormats(videoVersions = [], dashVariants = [], dashAudio = []) {
+  // Filter out any 0x0 stubs
+  const validProg = (videoVersions || []).filter(v => v.url && ((v.width || 0) > 0 || (v.height || 0) > 0));
+  const progCandidates = (validProg.length > 0 ? validProg : (videoVersions || []).filter(v => v.url)).map(v => ({
+    url: v.url,
+    width: v.width || 0,
+    height: v.height || 0,
+    bandwidth: 0,
+    isDirect: true,
+    isDash: false,
+    codecs: null
+  }));
+
+  const dashCandidates = (dashVariants || []).filter(v => v.url).map(v => ({
+    url: v.url,
+    width: v.width || 0,
+    height: v.height || 0,
+    bandwidth: v.bandwidth || 0,
+    isDirect: false,
+    isDash: true,
+    codecs: v.codecs || null
+  }));
+
+  // 1. Determine maximum resolution across BOTH progressive and DASH
+  // 2. Prefer progressive ONLY when it provides that maximum
+  const allCandidates = [...progCandidates, ...dashCandidates];
+  allCandidates.sort((a, b) => {
+    const areaA = a.width * a.height;
+    const areaB = b.width * b.height;
+    if (areaB !== areaA) return areaB - areaA;
+    if (b.height !== a.height) return b.height - a.height;
+    // Prefer progressive when resolution is identical
+    if (a.isDirect && !b.isDirect) return -1;
+    if (!a.isDirect && b.isDirect) return 1;
+    return (b.bandwidth || 0) - (a.bandwidth || 0);
+  });
+
+  // Deduplicate by resolution (keeping highest quality / progressive)
+  const seenRes = new Set();
+  const variants = [];
+  for (const c of allCandidates) {
+    const resKey = `${c.width}x${c.height}`;
+    if (c.width > 0 && c.height > 0) {
+      if (seenRes.has(resKey)) continue;
+      seenRes.add(resKey);
+    }
+    const label = c.height ? `${c.height}p` : 'HD Video';
+    variants.push({
+      url: c.url,
+      resolution: (c.width > 0 && c.height > 0) ? `${c.width}x${c.height}` : null,
+      width: c.width,
+      height: c.height,
+      bandwidth: c.bandwidth,
+      label,
+      isDirect: c.isDirect,
+      isDash: c.isDash,
+      codecs: c.codecs
+    });
   }
+
+  const audioRenditions = (dashAudio || []).map((a, i) => ({
+    url: a.url,
+    name: `Audio Track ${i + 1}`,
+    language: 'und',
+    bandwidth: a.bandwidth || 0,
+    codecs: a.codecs || '',
+    label: 'Default Audio',
+    isDash: true
+  }));
+
+  return { variants, audioRenditions };
+}
+
+function handleInstagramCdnRequest(details, url, headers, contentType, contentLength) {
+  // Never overwrite canonical extracted URLs with random live playback CDN chunks
+  return;
 }
 
 function handleSegmentRequest(details, url, contentType) {
@@ -1423,64 +1524,35 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           smartTitle = `Instagram Reel - ${captionSnippet}`;
         }
 
-        const rawVersions = (item.videoVersions || []).filter(v => v && v.url);
-        // Omit 0x0 versions if versions with valid dimensions exist
-        const validVersions = rawVersions.filter(v => (v.height || 0) > 0 || (v.width || 0) > 0);
-        const videoVersions = validVersions.length > 0 ? validVersions : rawVersions;
+        // Parse DASH manifest if available and not already parsed
+        let dashVariants = item.dashVariants || [];
+        let dashAudio = item.dashAudio || [];
+        if ((!dashVariants || dashVariants.length === 0) && item.dashManifest) {
+          const parsedDash = parseInstagramDash(item.dashManifest);
+          dashVariants = parsedDash.dashVariants;
+          dashAudio = parsedDash.dashAudio;
+        }
 
-        // Sort descending by resolution (area, then height)
-        videoVersions.sort((a, b) => {
-          const areaA = (a.width || 0) * (a.height || 0);
-          const areaB = (b.width || 0) * (b.height || 0);
-          if (areaB !== areaA) return areaB - areaA;
-          return (b.height || 0) - (a.height || 0);
-        });
+        // 1. Determine the maximum resolution across BOTH progressive and DASH.
+        // 2. Prefer progressive only when it provides that maximum.
+        // 3. Otherwise select the DASH representation and mux video + audio.
+        const { variants, audioRenditions } = mergeInstagramFormats(item.videoVersions || [], dashVariants, dashAudio);
 
-        const bestVideo = videoVersions[0];
+        const bestVideo = variants[0];
         const progressiveUrl = bestVideo?.url || item.url || '';
+        const isDashTop = bestVideo?.isDash === true;
 
-        // If DASH manifest is available, parse it
-        let variants = [];
-        let audioRenditions = [];
-        if (item.dashManifest) {
-          try {
-            const parsedDash = DASHParser.parse(item.dashManifest, item.pageUrl || sender.tab.url);
-            if (parsedDash.variants?.length > 0) variants = parsedDash.variants;
-            if (parsedDash.audioRenditions?.length > 0) audioRenditions = parsedDash.audioRenditions;
-          } catch (e) {
-            console.warn('[MediaSniff] Failed to parse Instagram DASH manifest:', e.message);
-          }
-        }
-
-        // If DASH variants are empty, use progressive MP4 versions
-        if (variants.length === 0 && videoVersions.length > 0) {
-          variants = videoVersions.map(v => {
-            const hasRes = (v.width || 0) > 0 && (v.height || 0) > 0;
-            return {
-              url: v.url,
-              resolution: hasRes ? `${v.width}x${v.height}` : null,
-              width: v.width || 0,
-              height: v.height || 0,
-              label: v.height ? `${v.height}p` : 'HD Video',
-              isDirect: true
-            };
-          });
-        }
-
-        const availableQualities = videoVersions.map(v => {
-          return {
-            label: v.height ? `${v.height}p` : 'HD Video',
-            height: v.height || 0,
-            width: v.width || 0,
-            url: v.url
-          };
-        });
+        const availableQualities = variants;
 
         const directMp4Urls = {};
-        for (const v of videoVersions) {
-          if (v.height && v.url) {
-            directMp4Urls[String(v.height)] = v.url;
-            directMp4Urls[`${v.height}p`] = v.url;
+        for (let idx = 0; idx < variants.length; idx++) {
+          const v = variants[idx];
+          if (v.url) {
+            directMp4Urls[String(idx)] = v.url;
+            if (v.height) {
+              directMp4Urls[String(v.height)] = v.url;
+              directMp4Urls[`${v.height}p`] = v.url;
+            }
           }
         }
 
@@ -1506,7 +1578,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             existing.audioRenditions = audioRenditions;
           }
           if (newHeight > existingHeight && newHeight > 0) {
-            existing.quality = `${newHeight}p`;
+            existing.quality = `${newHeight}p${isDashTop ? ' (HD Mux)' : ''}`;
+            existing.streamType = isDashTop ? 'mux' : 'direct';
           }
           if (smartTitle && smartTitle !== 'Instagram Reel' && (existing.filename === 'Instagram Reel' || !existing.filename)) {
             existing.filename = smartTitle;
@@ -1520,12 +1593,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           id,
           url: progressiveUrl || reelUrl,
           type: 'video',
-          streamType: 'direct',
+          streamType: isDashTop ? 'mux' : 'direct',
           mimeType: 'video/mp4',
           contentLength: 0,
           sizeLabel: 'Instagram',
           filename: smartTitle,
-          quality: bestVideo?.height ? `${bestVideo.height}p` : 'HD Video',
+          quality: bestVideo?.height ? `${bestVideo.height}p${isDashTop ? ' (HD Mux)' : ''}` : 'HD Video',
           variants,
           audioRenditions,
           subtitles: [],

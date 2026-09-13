@@ -195,22 +195,35 @@ class DownloadTask {
     this.reportProgress(5, 'Downloading video...', '');
     let videoSegments = videoVariant?.segments;
     let videoInitUrl = videoVariant?.initUrl;
-    if ((!videoSegments || videoSegments.length === 0) && videoVariant?.url) {
-      this.reportProgress(6, 'Fetching video playlist...', '');
-      const text = await this.fetchPlaylist(videoVariant.url, referer);
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, videoVariant.url);
-      if (parsed.segments && parsed.segments.length > 0) {
-        videoSegments = parsed.segments;
-        videoInitUrl = parsed.initSegment || null;
-      } else if (parsed.variants && parsed.variants.length > 0) {
-        const vFirst = parsed.variants[0];
-        const vText2 = await this.fetchPlaylist(vFirst.url, referer);
-        const vParsed2 = HLSParser.parse(vText2, vFirst.url);
-        videoSegments = vParsed2.segments;
-        videoInitUrl = vParsed2.initSegment || null;
+    // Direct stream track muxing (e.g. Instagram DASH single-file tracks)
+    if ((!videoSegments || videoSegments.length === 0) && videoVariant?.url && (videoVariant.isDash || !videoVariant.url.includes('.m3u8'))) {
+      this.reportProgress(10, 'Downloading video track...', '');
+      const respV = await fetch(videoVariant.url, { signal: this.abortController?.signal });
+      if (!respV.ok) throw new Error(`Failed to download video track: ${respV.status}`);
+      const videoBuffer = await respV.arrayBuffer();
+
+      let audioBuffer = null;
+      if (audioRendition?.url) {
+        this.reportProgress(50, 'Downloading audio track...', '');
+        const respA = await fetch(audioRendition.url, { signal: this.abortController?.signal });
+        if (respA.ok) {
+          audioBuffer = await respA.arrayBuffer();
+        }
       }
+
+      this.reportProgress(80, 'Muxing tracks (WASM)...', '');
+      const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
+        const overall = Math.round(80 + progress * 0.15);
+        this.reportProgress(overall, 'Muxing tracks (WASM)...', '');
+      });
+
+      let muxFilename = this.options.filename || 'download.mp4';
+      muxFilename = muxFilename.replace(/\.[^.]+$/, '') + '.mp4';
+      await this.triggerSave(muxedBlob, muxFilename);
+      this.reportStatus('complete', 'Complete!');
+      return;
     }
+
     if (!videoSegments || videoSegments.length === 0) {
       throw new Error('No video segments found');
     }
