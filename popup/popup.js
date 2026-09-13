@@ -837,7 +837,7 @@ async function handleDownload(item) {
   }
 
   // If HLS/DASH stream has separate audio renditions, we MUST mux it to get audio!
-  if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url)) {
+  if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url || a.uri)) {
     const qualitySelect = document.getElementById(`quality-${item.id}`);
     const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
     const variant = item.variants?.[qualityIndex];

@@ -299,6 +299,21 @@
       <div class="test-name">64-bit PTS math (prevents 40min+ overflow)</div>
       <div class="test-detail"></div>
     </div>
+    <div class="test-item" id="tsc-7">
+      <div class="status running">…</div>
+      <div class="test-name">Mux separate TS streams with identical PID (0x100)</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-8">
+      <div class="status running">…</div>
+      <div class="test-name">WASMMuxer.mux separate TS video and audio</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="fmp4-1">
+      <div class="status running">…</div>
+      <div class="test-name">FMP4ToMP4Converter.patchStco in-place offset integrity</div>
+      <div class="test-detail"></div>
+    </div>
   </div>
 
   <div id="summary"></div>
@@ -309,6 +324,7 @@
     import { WASMMuxer } from './lib/muxer.js';
     import { Transmuxer } from './lib/transmuxer.js';
     import { TSToMP4Converter } from './lib/ts-converter.js';
+    import { FMP4ToMP4Converter } from './lib/fmp4-converter.js';
 
     let passed = 0, failed = 0;
 
@@ -638,6 +654,117 @@ segment2.ts
         const ok = pts > 0 && Math.abs(pts - ptsVal) <= 1;
         setResult('tsc-6', ok, `PTS=${pts} (expected ${ptsVal}, diff=${Math.abs(pts - ptsVal)})`);
       } catch (e) { setResult('tsc-6', false, e.message); }
+
+      // Test tsc-7: Mux separate TS streams with identical PID (0x100 YouTube HLS scenario)
+      try {
+        const vSeg = new Uint8Array(188 * 3);
+        vSeg.set(makePAT(0x1000), 0);
+        vSeg.set(makePMT(0x1000, 0x100, 0x101), 188);
+        vSeg.set(makeVideoPkt(0x100), 376);
+
+        const makeAudioOnlyPmt = (pmtPid = 0x1000, audioPid = 0x100) => {
+          const pkt = new Uint8Array(188);
+          pkt.fill(0xFF);
+          pkt[0] = 0x47;
+          pkt[1] = 0x40 | ((pmtPid >> 8) & 0x1F);
+          pkt[2] = pmtPid & 0xFF;
+          pkt[3] = 0x10; pkt[4] = 0x00;
+          pkt[5] = 0x02; pkt[6] = 0xB0; pkt[7] = 0x12;
+          pkt[8] = 0x00; pkt[9] = 0x01; pkt[10] = 0xC1;
+          pkt[11] = 0x00; pkt[12] = 0x00;
+          pkt[13] = 0xE0 | ((audioPid >> 8) & 0x1F);
+          pkt[14] = audioPid & 0xFF;
+          pkt[15] = 0xF0; pkt[16] = 0x00;
+          pkt[17] = 0x0F; // AAC stream
+          pkt[18] = 0xE0 | ((audioPid >> 8) & 0x1F);
+          pkt[19] = audioPid & 0xFF;
+          pkt[20] = 0xF0; pkt[21] = 0x00;
+          return pkt;
+        };
+
+        const aSeg = new Uint8Array(188 * 3);
+        aSeg.set(makePAT(0x1000), 0);
+        aSeg.set(makeAudioOnlyPmt(0x1000, 0x100), 188);
+        aSeg.set(makeAudioPkt(0x100), 376);
+
+        const muxBlob = TSToMP4Converter.convertMux([vSeg], [aSeg]);
+        const muxBuf = await muxBlob.arrayBuffer();
+        const boxes = WASMMuxer.parseBoxes(new Uint8Array(muxBuf));
+        const moov = boxes.find(b => b.type === 'moov');
+        const traks = moov ? WASMMuxer.parseSubBoxes(moov.data, 8).filter(b => b.type === 'trak') : [];
+        const ok = muxBlob.type === 'video/mp4' && traks.length === 2;
+        setResult('tsc-7', ok, `Muxed size: ${muxBuf.byteLength}B, traks: ${traks.length} (video + audio)`);
+      } catch (e) { setResult('tsc-7', false, e.message); }
+
+      // Test tsc-8: WASMMuxer.mux separate TS video and audio
+      try {
+        const vSeg = new Uint8Array(188 * 3);
+        vSeg.set(makePAT(0x1000), 0);
+        vSeg.set(makePMT(0x1000, 0x100, 0x101), 188);
+        vSeg.set(makeVideoPkt(0x100), 376);
+
+        const makeAudioOnlyPmt = (pmtPid = 0x1000, audioPid = 0x100) => {
+          const pkt = new Uint8Array(188);
+          pkt.fill(0xFF);
+          pkt[0] = 0x47;
+          pkt[1] = 0x40 | ((pmtPid >> 8) & 0x1F);
+          pkt[2] = pmtPid & 0xFF;
+          pkt[3] = 0x10; pkt[4] = 0x00;
+          pkt[5] = 0x02; pkt[6] = 0xB0; pkt[7] = 0x12;
+          pkt[8] = 0x00; pkt[9] = 0x01; pkt[10] = 0xC1;
+          pkt[11] = 0x00; pkt[12] = 0x00;
+          pkt[13] = 0xE0 | ((audioPid >> 8) & 0x1F);
+          pkt[14] = audioPid & 0xFF;
+          pkt[15] = 0xF0; pkt[16] = 0x00;
+          pkt[17] = 0x0F;
+          pkt[18] = 0xE0 | ((audioPid >> 8) & 0x1F);
+          pkt[19] = audioPid & 0xFF;
+          pkt[20] = 0xF0; pkt[21] = 0x00;
+          return pkt;
+        };
+        const aSeg = new Uint8Array(188 * 3);
+        aSeg.set(makePAT(0x1000), 0);
+        aSeg.set(makeAudioOnlyPmt(0x1000, 0x100), 188);
+        aSeg.set(makeAudioPkt(0x100), 376);
+
+        const muxBlob = await WASMMuxer.mux(vSeg.buffer, aSeg.buffer);
+        const muxBuf = await muxBlob.arrayBuffer();
+        const boxes = WASMMuxer.parseBoxes(new Uint8Array(muxBuf));
+        const moov = boxes.find(b => b.type === 'moov');
+        const traks = moov ? WASMMuxer.parseSubBoxes(moov.data, 8).filter(b => b.type === 'trak') : [];
+        const ok = muxBlob.type === 'video/mp4' && traks.length === 2;
+        setResult('tsc-8', ok, `WASMMuxer Blob: ${muxBuf.byteLength}B, traks: ${traks.length}`);
+      } catch (e) { setResult('tsc-8', false, e.message); }
+
+      // Test fmp4-1: FMP4ToMP4Converter.patchStco in-place offset integrity
+      try {
+        const makeSyntheticMoovWithStco = () => {
+          const stcoPayload = new Uint8Array([0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 100]);
+          const stco = FMP4ToMP4Converter.writeBox('stco', stcoPayload);
+          const stbl = FMP4ToMP4Converter.writeBox('stbl', stco);
+          const minf = FMP4ToMP4Converter.writeBox('minf', stbl);
+          const mdia = FMP4ToMP4Converter.writeBox('mdia', minf);
+          
+          const tkhdPayload = new Uint8Array(84);
+          const tv = new DataView(tkhdPayload.buffer);
+          tv.setUint32(12, 1); // trackId = 1 (at byte 8 + 12 = 20 in tkhd box)
+          const tkhd = FMP4ToMP4Converter.writeBox('tkhd', tkhdPayload);
+          
+          const trak = FMP4ToMP4Converter.writeBox('trak', FMP4ToMP4Converter.concatBoxes([tkhd, mdia]));
+          return FMP4ToMP4Converter.writeBox('moov', trak);
+        };
+        const moov = makeSyntheticMoovWithStco();
+        FMP4ToMP4Converter.patchStco(moov, 1, 5000);
+        let patchedVal = 0;
+        for (let i = 0; i < moov.length - 8; i++) {
+          if (moov[i+4] === 0x73 && moov[i+5] === 0x74 && moov[i+6] === 0x63 && moov[i+7] === 0x6F) {
+            patchedVal = new DataView(moov.buffer, moov.byteOffset, moov.byteLength).getUint32(i + 16);
+            break;
+          }
+        }
+        const ok = patchedVal === 5100;
+        setResult('fmp4-1', ok, `patched offset = ${patchedVal} (expected 5100)`);
+      } catch (e) { setResult('fmp4-1', false, e.message); }
 
 
       // Summary

@@ -80,6 +80,12 @@ class DownloadTask {
     return await resp.text();
   }
   async downloadStream() {
+    // If the stream has separate audio renditions and video variants, delegate to downloadMux
+    if (this.item.audioRenditions && this.item.audioRenditions.length > 0 && this.item.variants && this.item.variants.length > 0) {
+      console.log('[MediaSniff Offscreen] Stream has separate audio renditions, delegating downloadStream to downloadMux');
+      return await this.downloadMux();
+    }
+
     let targetUrl = this.item.url;
     let segments = null;
     let initUrl = null;
@@ -107,6 +113,14 @@ class DownloadTask {
       } else {
         throw new Error('Unknown manifest format');
       }
+
+      if (parsed.audioRenditions && parsed.audioRenditions.length > 0 && parsed.variants && parsed.variants.length > 0) {
+        console.log('[MediaSniff Offscreen] Parsed manifest has separate audio renditions, delegating to downloadMux');
+        this.item.audioRenditions = parsed.audioRenditions;
+        this.item.variants = parsed.variants;
+        return await this.downloadMux();
+      }
+
       if (parsed.type === 'media' || (parsed.segments && parsed.segments.length > 0)) {
         segments = parsed.segments;
         initUrl = parsed.initSegment || null;
@@ -187,25 +201,27 @@ class DownloadTask {
   async downloadMux() {
     const qualityIndex = this.options.qualityIndex !== undefined ? parseInt(this.options.qualityIndex) : 0;
     const audioIndex = this.options.audioIndex !== undefined ? parseInt(this.options.audioIndex) : 0;
-    const videoVariant = this.item.variants[qualityIndex];
-    const audioRendition = this.item.audioRenditions?.[audioIndex];
+    const videoVariant = this.item.variants?.[qualityIndex] || this.item.variants?.[0];
+    const audioRendition = this.item.audioRenditions?.[audioIndex] || this.item.audioRenditions?.[0];
     const referer = this.options.referer || this.item.referer || null;
 
     // 1. Download video
     this.reportProgress(5, 'Downloading video...', '');
     let videoSegments = videoVariant?.segments;
     let videoInitUrl = videoVariant?.initUrl;
+    const videoUrl = videoVariant?.url || videoVariant?.uri;
     // Direct stream track muxing (e.g. Instagram DASH single-file tracks)
-    if ((!videoSegments || videoSegments.length === 0) && videoVariant?.url && (videoVariant.isDash || !videoVariant.url.includes('.m3u8'))) {
+    if ((!videoSegments || videoSegments.length === 0) && videoUrl && (videoVariant.isDash || !videoUrl.includes('.m3u8'))) {
       this.reportProgress(10, 'Downloading video track...', '');
-      const respV = await fetch(videoVariant.url, { signal: this.abortController?.signal });
+      const respV = await fetch(videoUrl, { signal: this.abortController?.signal });
       if (!respV.ok) throw new Error(`Failed to download video track: ${respV.status}`);
       const videoBuffer = await respV.arrayBuffer();
 
       let audioBuffer = null;
-      if (audioRendition?.url) {
+      const directAudioUrl = audioRendition?.url || audioRendition?.uri;
+      if (directAudioUrl) {
         this.reportProgress(50, 'Downloading audio track...', '');
-        const respA = await fetch(audioRendition.url, { signal: this.abortController?.signal });
+        const respA = await fetch(directAudioUrl, { signal: this.abortController?.signal });
         if (respA.ok) {
           audioBuffer = await respA.arrayBuffer();
         }
@@ -222,6 +238,17 @@ class DownloadTask {
       await this.triggerSave(muxedBlob, muxFilename);
       this.reportStatus('complete', 'Complete!');
       return;
+    }
+
+    if ((!videoSegments || videoSegments.length === 0) && videoUrl) {
+      this.reportProgress(6, 'Fetching video playlist...', '');
+      const textV = await this.fetchPlaylist(videoUrl, referer);
+      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
+      const parsedV = HLSParser.parse(textV, videoUrl);
+      if (parsedV.segments && parsedV.segments.length > 0) {
+        videoSegments = parsedV.segments;
+        videoInitUrl = parsedV.initSegment || null;
+      }
     }
 
     if (!videoSegments || videoSegments.length === 0) {
@@ -243,24 +270,30 @@ class DownloadTask {
     this.reportProgress(40, 'Downloading audio...', '');
     let audioSegments = audioRendition?.segments;
     let audioInitUrl = audioRendition?.initUrl;
-    if ((!audioSegments || audioSegments.length === 0) && audioRendition?.url) {
+    const audioUrl = audioRendition?.url || audioRendition?.uri;
+    if ((!audioSegments || audioSegments.length === 0) && audioUrl) {
       this.reportProgress(41, 'Fetching audio playlist...', '');
-      const text = await this.fetchPlaylist(audioRendition.url, referer);
-      const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
-      const parsed = HLSParser.parse(text, audioRendition.url);
-      if (parsed.segments && parsed.segments.length > 0) {
-        audioSegments = parsed.segments;
-        audioInitUrl = parsed.initSegment || null;
-      } else if (parsed.variants && parsed.variants.length > 0) {
-        const aFirst = parsed.variants[0];
-        const aText2 = await this.fetchPlaylist(aFirst.url, referer);
-        const aParsed2 = HLSParser.parse(aText2, aFirst.url);
-        audioSegments = aParsed2.segments;
-        audioInitUrl = aParsed2.initSegment || null;
+      try {
+        const text = await this.fetchPlaylist(audioUrl, referer);
+        const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
+        const parsed = HLSParser.parse(text, audioUrl);
+        if (parsed.segments && parsed.segments.length > 0) {
+          audioSegments = parsed.segments;
+          audioInitUrl = parsed.initSegment || null;
+        } else if (parsed.variants && parsed.variants.length > 0) {
+          const aFirst = parsed.variants[0];
+          const aFirstUrl = aFirst.url || aFirst.uri;
+          const aText2 = await this.fetchPlaylist(aFirstUrl, referer);
+          const aParsed2 = HLSParser.parse(aText2, aFirstUrl);
+          audioSegments = aParsed2.segments;
+          audioInitUrl = aParsed2.initSegment || null;
+        }
+      } catch (aErr) {
+        console.warn('[MediaSniff Offscreen] Failed to fetch audio playlist:', aErr);
       }
     }
     let audioBuffer = null;
-    if (audioSegments) {
+    if (audioSegments && audioSegments.length > 0) {
       const audioDownloader = new SegmentDownloader({
         concurrency: 8,
         referer,
@@ -271,7 +304,9 @@ class DownloadTask {
       });
       audioDownloader.abortController = this.abortController;
       let audioResult = await audioDownloader.downloadAll(audioSegments, audioInitUrl);
-      audioBuffer = await Transmuxer.merge(audioResult.init, audioResult.segments).arrayBuffer();
+      if (audioResult && audioResult.segments && audioResult.segments.length > 0) {
+        audioBuffer = await Transmuxer.merge(audioResult.init, audioResult.segments).arrayBuffer();
+      }
       audioResult = null;
     }
     // 3. Mux

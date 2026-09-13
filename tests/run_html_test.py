@@ -19,6 +19,6 @@ if fails > 0:
         if 'fail' in m.group(0):
             print(f"FAILED TEST: {m.group(1)} ({m.group(2)}) -> {m.group(3)}")
 print(f"Results: {passes} PASSED, {fails} FAILED (Total: {passes + fails})")
-assert passes == 23 and fails == 0, f"Expected 23/23 pass, got {passes} pass, {fails} fail"
-print("SUCCESS: Exact 23/23 parser and transmuxer tests verified in Chrome.")
+assert passes == 26 and fails == 0, f"Expected 26/26 pass, got {passes} pass, {fails} fail"
+print("SUCCESS: Exact 26/26 parser and transmuxer tests verified in Chrome.")
 
