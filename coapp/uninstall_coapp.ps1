@@ -1,13 +1,19 @@
 # MediaSniff Companion App Uninstaller
 $ErrorActionPreference = "SilentlyContinue"
-Write-Host "Removing MediaSniff Native Messaging Host Registry Entries..." -ForegroundColor Yellow
+Write-Host ">>> Removing MediaSniff Native Messaging Host Registry Entries..." -ForegroundColor Yellow
 
-$regPath = "HKCU:\Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp"
-if (Test-Path $regPath) {
-    Remove-Item -Path $regPath -Force -Recurse
-    Write-Host "  -> Removed Chrome native messaging registration." -ForegroundColor Green
-} else {
-    Write-Host "  -> Registry entry not found (already clean)." -ForegroundColor Gray
+$registryPaths = @(
+    "HKCU:\Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\net.mediasniff.coapp",
+    "HKCU:\Software\Chromium\NativeMessagingHosts\net.mediasniff.coapp"
+)
+
+foreach ($regPath in $registryPaths) {
+    if (Test-Path $regPath) {
+        Remove-Item -Path $regPath -Force -Recurse
+        Write-Host "  -> Removed: $regPath" -ForegroundColor Green
+    }
 }
 
-Write-Host "`nUninstallation complete. You may safely delete this folder." -ForegroundColor Cyan
+Write-Host "`n>>> Uninstallation complete. Native messaging registrations have been removed." -ForegroundColor Cyan

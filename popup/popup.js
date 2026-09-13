@@ -586,7 +586,8 @@ function createMediaCard(item) {
   if (streamToDiskBtn) {
     streamToDiskBtn.addEventListener('click', () => {
       const filename = getSmartName(item);
-      const url = chrome.runtime.getURL(`downloader.html?itemId=${item.id}&tabId=${currentTabId}&filename=${encodeURIComponent(filename)}`);
+      const qualityIdx = document.getElementById(`quality-${item.id}`)?.value || '0';
+      const url = chrome.runtime.getURL(`downloader.html?itemId=${item.id}&tabId=${currentTabId}&filename=${encodeURIComponent(filename)}&qualityIndex=${qualityIdx}`);
       chrome.tabs.create({ url });
     });
   }

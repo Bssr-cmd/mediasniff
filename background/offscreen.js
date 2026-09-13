@@ -1,6 +1,7 @@
 import { SegmentDownloader } from '../lib/segment-downloader.js';
 import { Transmuxer } from '../lib/transmuxer.js';
 import { WASMMuxer } from '../lib/muxer.js';
+import { TSToMP4Converter } from '../lib/ts-converter.js';
 import { YouTubeDownloader } from '../lib/youtube-downloader.js';
 
 function parseCipher(cipherStr) {
@@ -140,19 +141,27 @@ class DownloadTask {
     let finalFilename = this.options.filename || 'download';
 
     if (format === 'ts') {
-      // MPEG-TS segments: TS already contains muxed audio+video.
-      // Simple concatenation produces a valid TS file.
-      // We MUST ensure the extension is .ts — saving TS data with .mp4
-      // extension causes "can't open this file" because players try to
-      // parse it as ISO BMFF and fail.
-      this.reportProgress(92, 'Merging TS segments...', '');
-      const parts = [];
-      for (const seg of result.segments) {
-        if (seg) parts.push(seg);
+      // MPEG-TS segments: Transmux H.264 video and AAC audio from TS
+      // into a standard ISO BMFF MP4 container (.mp4).
+      this.reportProgress(92, 'Converting MPEG-TS to MP4...', '');
+      try {
+        finalBlob = TSToMP4Converter.convert(result.segments, (progress) => {
+          const overall = Math.round(92 + progress * 0.06);
+          this.reportProgress(overall, 'Converting MPEG-TS to MP4...', '');
+        });
+      } catch (convErr) {
+        console.warn('[MediaSniff Offscreen] TSToMP4Converter failed, fallback to raw TS:', convErr);
+        const parts = [];
+        for (const seg of result.segments) {
+          if (seg) parts.push(seg);
+        }
+        finalBlob = new Blob(parts, { type: 'video/mp2t' });
+        finalFilename = finalFilename.replace(/\.[^.]+$/, '.ts');
       }
-      finalBlob = new Blob(parts, { type: 'video/mp2t' });
-      // Force .ts extension
-      finalFilename = finalFilename.replace(/\.[^.]+$/, '.ts');
+      // Ensure .mp4 extension if converted to MP4
+      if (finalBlob.type === 'video/mp4' && !/\.mp4$/i.test(finalFilename)) {
+        finalFilename = finalFilename.replace(/\.[^.]+$/, '.mp4');
+      }
     } else {
       // fMP4/CMAF segments: init segment (ftyp+moov) + media segments
       // (moof+mdat). Build a proper MP4 by concatenating init + segments
@@ -277,8 +286,17 @@ class DownloadTask {
     // 5. Save video — detect actual output format and fix extension
     this.reportProgress(98, 'Saving video...', '');
     let muxFilename = this.options.filename;
-    const muxedBuffer = await muxedBlob.arrayBuffer();
-    const outputFormat = WASMMuxer.detectFormat(muxedBuffer);
+    let muxedBuffer = await muxedBlob.arrayBuffer();
+    let outputFormat = WASMMuxer.detectFormat(muxedBuffer);
+    if (outputFormat === 'ts') {
+      try {
+        const mp4Buf = TSToMP4Converter.convertToArrayBuffer([muxedBuffer]);
+        muxedBuffer = mp4Buf;
+        outputFormat = 'mp4';
+      } catch (convErr) {
+        console.warn('[MediaSniff Offscreen] TS-to-MP4 conversion in downloadMux failed:', convErr);
+      }
+    }
     if (outputFormat === 'ts') {
       muxFilename = muxFilename.replace(/\.[^.]+$/, '.ts');
     } else if (!/\.mp4$/i.test(muxFilename)) {

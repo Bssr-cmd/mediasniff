@@ -42,12 +42,23 @@ def package_companion_app():
         for fname in include_files:
             fpath = os.path.join(COAPP_DIR, fname)
             if os.path.exists(fpath):
-                # Put them inside a 'coapp/' directory within the zip
                 arcname = os.path.join("mediasniff-companion", fname)
                 zf.write(fpath, arcname)
                 print(f"  + Added: {fname} ({os.path.getsize(fpath):,} bytes)")
             else:
                 print(f"  - Missing: {fname}")
+
+        # Include portable Python directory if present
+        py_dir = os.path.join(COAPP_DIR, "python")
+        if os.path.exists(py_dir):
+            print("  + Packaging portable Python runtime...")
+            for root, dirs, files in os.walk(py_dir):
+                for file in files:
+                    fpath = os.path.join(root, file)
+                    rel_to_coapp = os.path.relpath(fpath, COAPP_DIR)
+                    arcname = os.path.join("mediasniff-companion", rel_to_coapp)
+                    zf.write(fpath, arcname)
+            print("  + Portable Python packaged successfully.")
 
     print(f"Package created: {zip_path} ({os.path.getsize(zip_path):,} bytes)")
     return zip_path

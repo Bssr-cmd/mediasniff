@@ -267,6 +267,40 @@
     </div>
   </div>
 
+  <div class="test-group" id="tsConverterTests">
+    <h3>MPEG-TS to MP4 Transmuxer</h3>
+    <div class="test-item" id="tsc-1">
+      <div class="status running">…</div>
+      <div class="test-name">Demux TS packets (PAT/PMT & PES)</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-2">
+      <div class="status running">…</div>
+      <div class="test-name">Parse H.264 SPS & NAL units</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-3">
+      <div class="status running">…</div>
+      <div class="test-name">Parse AAC ADTS audio</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-4">
+      <div class="status running">…</div>
+      <div class="test-name">Transmux TS to valid ISO BMFF MP4</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-5">
+      <div class="status running">…</div>
+      <div class="test-name">TSToMP4Converter.convertToArrayBuffer</div>
+      <div class="test-detail"></div>
+    </div>
+    <div class="test-item" id="tsc-6">
+      <div class="status running">…</div>
+      <div class="test-name">64-bit PTS math (prevents 40min+ overflow)</div>
+      <div class="test-detail"></div>
+    </div>
+  </div>
+
   <div id="summary"></div>
 
   <script type="module">
@@ -274,6 +308,7 @@
     import { DASHParser } from './lib/dash-parser.js';
     import { WASMMuxer } from './lib/muxer.js';
     import { Transmuxer } from './lib/transmuxer.js';
+    import { TSToMP4Converter } from './lib/ts-converter.js';
 
     let passed = 0, failed = 0;
 
@@ -444,6 +479,166 @@ segment2.ts
         const fmtTs = Transmuxer.detectFormat(null, tsBuf);
         setResult('tx-3', fmtMp4 === 'mp4' && fmtTs === 'ts', `mp4=${fmtMp4}, ts=${fmtTs}`);
       } catch (e) { setResult('tx-3', false, e.message); }
+
+      // ─── MPEG-TS to MP4 Transmuxer Tests ─────────────────────────────
+      const makePAT = (pmtPid = 0x1000) => {
+        const pkt = new Uint8Array(188);
+        pkt.fill(0xFF);
+        pkt[0] = 0x47; pkt[1] = 0x40; pkt[2] = 0x00; pkt[3] = 0x10; pkt[4] = 0x00;
+        pkt[5] = 0x00; pkt[6] = 0xB0; pkt[7] = 0x0D;
+        pkt[8] = 0x00; pkt[9] = 0x01; pkt[10] = 0xC1;
+        pkt[11] = 0x00; pkt[12] = 0x00; pkt[13] = 0x00; pkt[14] = 0x01;
+        pkt[15] = 0xE0 | ((pmtPid >> 8) & 0x1F);
+        pkt[16] = pmtPid & 0xFF;
+        return pkt;
+      };
+
+      const makePMT = (pmtPid = 0x1000, videoPid = 0x100, audioPid = 0x101) => {
+        const pkt = new Uint8Array(188);
+        pkt.fill(0xFF);
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((pmtPid >> 8) & 0x1F);
+        pkt[2] = pmtPid & 0xFF;
+        pkt[3] = 0x10; pkt[4] = 0x00;
+        pkt[5] = 0x02; pkt[6] = 0xB0; pkt[7] = 0x17;
+        pkt[8] = 0x00; pkt[9] = 0x01; pkt[10] = 0xC1;
+        pkt[11] = 0x00; pkt[12] = 0x00;
+        pkt[13] = 0xE0 | ((videoPid >> 8) & 0x1F);
+        pkt[14] = videoPid & 0xFF;
+        pkt[15] = 0xF0; pkt[16] = 0x00;
+        pkt[17] = 0x1B; // H.264
+        pkt[18] = 0xE0 | ((videoPid >> 8) & 0x1F);
+        pkt[19] = videoPid & 0xFF;
+        pkt[20] = 0xF0; pkt[21] = 0x00;
+        pkt[22] = 0x0F; // AAC
+        pkt[23] = 0xE0 | ((audioPid >> 8) & 0x1F);
+        pkt[24] = audioPid & 0xFF;
+        pkt[25] = 0xF0; pkt[26] = 0x00;
+        return pkt;
+      };
+
+      const makeVideoPkt = (videoPid = 0x100) => {
+        const pkt = new Uint8Array(188);
+        pkt.fill(0xFF);
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((videoPid >> 8) & 0x1F);
+        pkt[2] = videoPid & 0xFF;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00; pkt[5] = 0x00; pkt[6] = 0x01;
+        pkt[7] = 0xE0;
+        pkt[8] = 0x00; pkt[9] = 0x40;
+        pkt[10] = 0x80; pkt[11] = 0x80; pkt[12] = 0x05;
+        pkt[13] = 0x21; pkt[14] = 0x00; pkt[15] = 0x01; pkt[16] = 0x5F; pkt[17] = 0x91;
+        const sps = [0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50, 0x05, 0xBB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x83, 0x19, 0x60];
+        const pps = [0, 0, 0, 1, 0x68, 0xEB, 0xEC, 0xB2, 0x2C];
+        const idr = [0, 0, 0, 1, 0x65, 0x88, 0x84, 0x00];
+        pkt.set([...sps, ...pps, ...idr], 18);
+        return pkt;
+      };
+
+      const makeAudioPkt = (audioPid = 0x101) => {
+        const pkt = new Uint8Array(188);
+        pkt.fill(0xFF);
+        pkt[0] = 0x47;
+        pkt[1] = 0x40 | ((audioPid >> 8) & 0x1F);
+        pkt[2] = audioPid & 0xFF;
+        pkt[3] = 0x10;
+        pkt[4] = 0x00; pkt[5] = 0x00; pkt[6] = 0x01;
+        pkt[7] = 0xC0;
+        pkt[8] = 0x00; pkt[9] = 17; // 3 bytes PES header + 5 bytes PTS + 9 bytes ADTS
+        pkt[10] = 0x80; pkt[11] = 0x80; pkt[12] = 0x05;
+        pkt[13] = 0x21; pkt[14] = 0x00; pkt[15] = 0x01; pkt[16] = 0x5F; pkt[17] = 0x91;
+        const adts = [0xFF, 0xF1, 0x50, 0x80, 0x01, 0x3F, 0xFC, 0xDE, 0xAD];
+        pkt.set(adts, 18);
+        return pkt;
+      };
+
+      const buildSyntheticTS = () => {
+        const pat = makePAT(0x1000);
+        const pmt = makePMT(0x1000, 0x100, 0x101);
+        const vid = makeVideoPkt(0x100);
+        const aud = makeAudioPkt(0x101);
+        const tsSeg = new Uint8Array(188 * 4);
+        tsSeg.set(pat, 0);
+        tsSeg.set(pmt, 188);
+        tsSeg.set(vid, 376);
+        tsSeg.set(aud, 564);
+        return tsSeg;
+      };
+
+      // Test tsc-1: Demux TS packets
+      try {
+        const tsSeg = buildSyntheticTS();
+        const { videoPes, audioPes } = TSToMP4Converter.demuxTS([tsSeg]);
+        const ok = videoPes.length === 1 && audioPes.length === 1;
+        setResult('tsc-1', ok, `videoPES=${videoPes.length}, audioPES=${audioPes.length}`);
+      } catch (e) { setResult('tsc-1', false, e.message); }
+
+      // Test tsc-2: Parse H.264 SPS & NAL units
+      try {
+        const rawSps = new Uint8Array([0x67, 0x64, 0x00, 0x1F, 0xAC, 0xD9, 0x40, 0x50, 0x05, 0xBB, 0x01, 0x10, 0x00, 0x00, 0x03, 0x00, 0x10, 0x00, 0x00, 0x03, 0x03, 0x20, 0xF1, 0x83, 0x19, 0x60]);
+        const dims = TSToMP4Converter.parseSPS(rawSps);
+        const ok = dims.width === 1280 && dims.height === 720 && dims.profile === 100;
+        setResult('tsc-2', ok, `${dims.width}x${dims.height}, profile=${dims.profile}`);
+      } catch (e) { setResult('tsc-2', false, e.message); }
+
+      // Test tsc-3: Parse AAC ADTS audio
+      try {
+        const tsSeg = buildSyntheticTS();
+        const { audioPes } = TSToMP4Converter.demuxTS([tsSeg]);
+        const audioData = TSToMP4Converter.parseAudioPes(audioPes);
+        const ok = audioData && audioData.sampleRate === 44100 && audioData.channels === 2 && audioData.samples.length === 1;
+        setResult('tsc-3', ok, `${audioData?.sampleRate}Hz, ${audioData?.channels}ch, ${audioData?.samples.length} sample`);
+      } catch (e) { setResult('tsc-3', false, e.message); }
+
+      // Test tsc-4: Transmux TS to valid ISO BMFF MP4
+      try {
+        const tsSeg = buildSyntheticTS();
+        const mp4Blob = TSToMP4Converter.convert([tsSeg]);
+        const mp4Buf = await mp4Blob.arrayBuffer();
+        const boxes = WASMMuxer.parseBoxes(new Uint8Array(mp4Buf));
+        const format = WASMMuxer.detectFormat(mp4Buf);
+        const hasFtyp = boxes.some(b => b.type === 'ftyp');
+        const hasMoov = boxes.some(b => b.type === 'moov');
+        const hasMdat = boxes.some(b => b.type === 'mdat');
+        const ok = mp4Blob.type === 'video/mp4' && format === 'mp4' && hasFtyp && hasMoov && hasMdat;
+        setResult('tsc-4', ok, `Blob: ${mp4Blob.size}B (${mp4Blob.type}), boxes: [${boxes.map(b => b.type).join(', ')}]`);
+      } catch (e) { setResult('tsc-4', false, e.message); }
+
+      // Test tsc-5: convertToArrayBuffer
+      try {
+        const tsSeg = buildSyntheticTS();
+        const mp4Buf = TSToMP4Converter.convertToArrayBuffer([tsSeg]);
+        const fmt = WASMMuxer.detectFormat(mp4Buf);
+        const boxes = WASMMuxer.parseBoxes(new Uint8Array(mp4Buf));
+        const ok = fmt === 'mp4' && boxes.some(b => b.type === 'ftyp') && boxes.some(b => b.type === 'moov');
+        setResult('tsc-5', ok, `ArrayBuffer: ${mp4Buf.byteLength}B, format=${fmt}`);
+      } catch (e) { setResult('tsc-5', false, e.message); }
+
+      // Test tsc-6: 64-bit PTS math (prevents 40min+ overflow)
+      try {
+        // High timestamp: 2 hours 10 mins = 700,000,000 in 90kHz timescale
+        // In 33-bit MPEG-2 TS PTS:
+        // PTS 32..30: 3 bits in pes[9]
+        // PTS 29..22: 8 bits in pes[10]
+        // PTS 21..15: 7 bits in pes[11]
+        // PTS 14..07: 8 bits in pes[12]
+        // PTS 06..00: 7 bits in pes[13]
+        const ptsVal = 700000000;
+        const fakePes = new Uint8Array(19);
+        fakePes[7] = 0x80; // PTS present flag
+        fakePes[8] = 10;
+        fakePes[9] = 0x21 | (((Math.floor(ptsVal / 1073741824) & 0x07) << 1));
+        fakePes[10] = Math.floor(ptsVal / 4194304) & 0xFF;
+        fakePes[11] = 0x01 | (((Math.floor(ptsVal / 32768) & 0x7F) << 1));
+        fakePes[12] = Math.floor(ptsVal / 128) & 0xFF;
+        fakePes[13] = 0x01 | ((ptsVal & 0x7F) << 1);
+
+        const { pts } = TSToMP4Converter.parsePtsDts(fakePes);
+        const ok = pts > 0 && Math.abs(pts - ptsVal) <= 1;
+        setResult('tsc-6', ok, `PTS=${pts} (expected ${ptsVal}, diff=${Math.abs(pts - ptsVal)})`);
+      } catch (e) { setResult('tsc-6', false, e.message); }
+
 
       // Summary
       const total = passed + failed;
