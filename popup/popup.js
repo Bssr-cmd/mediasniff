@@ -420,7 +420,11 @@ function createMediaCard(item) {
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
       <select class="quality-select" id="quality-${item.id}">
-        ${item.variants.map((v, i) => `<option value="${i}">${v.label}${v.resolution ? ' (' + v.resolution + ')' : ''}${v.codecs ? ' [' + v.codecs + ']' : ''}</option>`).join('')}
+        ${item.variants.map((v, i) => {
+          const resStr = (v.resolution && v.resolution !== '0x0') ? ` (${v.resolution})` : '';
+          const codecStr = v.codecs ? ` [${v.codecs}]` : '';
+          return `<option value="${i}">${v.label || 'Video'}${resStr}${codecStr}</option>`;
+        }).join('')}
       </select>
     </div>`;
   } else if (item.source === 'instagram' && item.availableQualities?.length > 1) {
@@ -428,7 +432,10 @@ function createMediaCard(item) {
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
       <select class="quality-select" id="quality-${item.id}">
-        ${item.availableQualities.map((q, i) => `<option value="${q.height || i}">${q.label || (q.height + 'p')}${q.width ? ' (' + q.width + 'x' + q.height + ')' : ''}</option>`).join('')}
+        ${item.availableQualities.map((q, i) => {
+          const resStr = (q.width && q.height && `${q.width}x${q.height}` !== '0x0') ? ` (${q.width}x${q.height})` : '';
+          return `<option value="${q.height || i}">${q.label || (q.height ? q.height + 'p' : 'HD Video')}${resStr}</option>`;
+        }).join('')}
       </select>
     </div>`;
   }
@@ -708,8 +715,11 @@ function getSmartName(item) {
   if (item.variants && item.variants.length > 0) {
     const idx = qualityIdx ? parseInt(qualityIdx) : 0;
     const v = item.variants[idx];
-    if (v.height) quality = `${v.height}p`;
-    else if (v.resolution) quality = v.resolution;
+    if (v.height && v.height > 0) quality = `${v.height}p`;
+    else if (v.resolution && v.resolution !== '0x0') quality = v.resolution;
+  }
+  if (quality === '0x0' || quality === '0p') {
+    quality = '';
   }
 
   // Determine extension
@@ -966,6 +976,12 @@ function getSelectedUrl(item) {
       if (item.variants && item.variants[idx]?.url) return item.variants[idx].url;
       if (item.availableQualities && item.availableQualities[idx]?.url) return item.availableQualities[idx].url;
     }
+  }
+  if (item.availableQualities && item.availableQualities[0]?.url) {
+    return item.availableQualities[0].url;
+  }
+  if (item.variants && item.variants[0]?.url) {
+    return item.variants[0].url;
   }
   return item.url;
 }

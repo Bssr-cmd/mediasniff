@@ -201,16 +201,24 @@
         url: v.url,
         width: v.width || 0,
         height: v.height || 0,
-        label: v.height ? `${v.height}p` : 'MP4 Video'
+        label: v.height ? `${v.height}p` : 'HD Video'
       })).filter(v => v.url);
     } else if (node.video_url) {
       videoVersions = [{
         url: node.video_url,
         width: node.dimensions?.width || 0,
         height: node.dimensions?.height || 0,
-        label: node.dimensions?.height ? `${node.dimensions.height}p` : 'MP4 Video'
+        label: node.dimensions?.height ? `${node.dimensions.height}p` : 'HD Video'
       }];
     }
+
+    // Sort descending by resolution (area, then height) so index 0 is always highest quality
+    videoVersions.sort((a, b) => {
+      const areaA = (a.width || 0) * (a.height || 0);
+      const areaB = (b.width || 0) * (b.height || 0);
+      if (areaB !== areaA) return areaB - areaA;
+      return (b.height || 0) - (a.height || 0);
+    });
 
     const dashManifest = node.video_dash_manifest || null;
     const pageUrl = shortcode ? `https://www.instagram.com/reel/${shortcode}/` : location.href;
@@ -229,17 +237,59 @@
     };
   }
 
+  const reportedIgMedia = new Map(); // key -> { height, formatCount }
+
   function reportInstagramMedia(items) {
     if (!items || items.length === 0) return;
     const newItems = items.filter(it => {
       const key = it.shortcode || it.id || it.videoVersions?.[0]?.url;
-      if (!key || reportedIgMediaIds.has(key)) return false;
-      reportedIgMediaIds.add(key);
+      if (!key) return false;
+      const bestH = it.videoVersions?.[0]?.height || 0;
+      const fmtCount = it.videoVersions?.length || 0;
+      const prev = reportedIgMedia.get(key);
+      if (prev && prev.height >= bestH && prev.formatCount >= fmtCount) {
+        return false;
+      }
+      reportedIgMedia.set(key, { height: bestH, formatCount: fmtCount });
       return true;
     });
     if (newItems.length > 0) {
       window.postMessage({ type: 'MS_INSTAGRAM_RESPONSE', data: newItems }, '*');
     }
+  }
+
+  function extractBalancedJson(text, startIndex, openChar = '{', closeChar = '}') {
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    let start = -1;
+    for (let i = startIndex; i < text.length; i++) {
+      const ch = text[i];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (ch === '\\' && inString) {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (!inString) {
+        if (ch === openChar) {
+          if (depth === 0) start = i;
+          depth++;
+        } else if (ch === closeChar) {
+          depth--;
+          if (depth === 0 && start !== -1) {
+            return text.slice(start, i + 1);
+          }
+        }
+      }
+    }
+    return null;
   }
 
   function scanInstagramScripts() {
@@ -259,15 +309,66 @@
       const scripts = document.querySelectorAll('script');
       for (const s of scripts) {
         const text = s.textContent;
-        if (!text || text.length > 2000000) continue;
+        if (!text || text.length > 3000000) continue;
         if (text.includes('video_versions') || text.includes('video_dash_manifest') || text.includes('"GraphVideo"')) {
+          // 1. Try direct JSON.parse if script is pure JSON
           try {
             const data = JSON.parse(text);
             const nodes = findInstagramMediaNodes(data);
             if (nodes.length > 0) {
               reportInstagramMedia(nodes.map(formatInstagramItem));
+              continue;
             }
           } catch (_) {}
+
+          // 2. Extract balanced JSON objects (e.g. xdt_shortcode_media, xdt_api__v1__media, items)
+          const objMarkers = ['"xdt_shortcode_media"', '"xdt_api__v1__media__shortcode__web_info"', '"items"'];
+          for (const marker of objMarkers) {
+            let idx = text.indexOf(marker);
+            while (idx !== -1) {
+              const openBrace = text.indexOf('{', idx + marker.length);
+              if (openBrace !== -1 && openBrace - idx < 50) {
+                const jsonStr = extractBalancedJson(text, openBrace, '{', '}');
+                if (jsonStr) {
+                  try {
+                    const parsed = JSON.parse(jsonStr);
+                    const nodes = findInstagramMediaNodes(parsed);
+                    if (nodes.length > 0) {
+                      reportInstagramMedia(nodes.map(formatInstagramItem));
+                    }
+                  } catch (_) {}
+                }
+              }
+              idx = text.indexOf(marker, idx + marker.length);
+            }
+          }
+
+          // 3. Fallback: Extract isolated video_versions array directly from JS text
+          let vvIdx = text.indexOf('"video_versions"');
+          while (vvIdx !== -1) {
+            const openBracket = text.indexOf('[', vvIdx + 16);
+            if (openBracket !== -1 && openBracket - vvIdx < 30) {
+              const arrayStr = extractBalancedJson(text, openBracket, '[', ']');
+              if (arrayStr) {
+                try {
+                  const versions = JSON.parse(arrayStr);
+                  if (Array.isArray(versions) && versions.length > 0 && versions[0].url) {
+                    const scMatch = location.pathname.match(/\/(?:reel|reels|p)\/([a-zA-Z0-9_-]+)/);
+                    const shortcode = scMatch ? scMatch[1] : null;
+                    const pseudoNode = {
+                      shortcode,
+                      code: shortcode,
+                      video_versions: versions,
+                      caption: { text: document.title || '' },
+                      user: {}
+                    };
+                    reportInstagramMedia([formatInstagramItem(pseudoNode)]);
+                  }
+                } catch (_) {}
+              }
+            }
+            vvIdx = text.indexOf('"video_versions"', vvIdx + 16);
+          }
         }
       }
     } catch (_) {}
@@ -539,6 +640,36 @@
     }
   } catch (_) {}
 
+  const fetchedIgShortcodes = new Set();
+  async function fetchInstagramReelData(shortcode) {
+    if (!shortcode || fetchedIgShortcodes.has(shortcode)) return;
+    fetchedIgShortcodes.add(shortcode);
+    try {
+      const queryUrl = `https://www.instagram.com/graphql/query/?doc_id=8845758582119845&variables=${encodeURIComponent(JSON.stringify({ shortcode }))}`;
+      const resp = await fetch(queryUrl, { credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+      if (resp.ok) {
+        const json = await resp.json();
+        const nodes = findInstagramMediaNodes(json);
+        if (nodes.length > 0) {
+          reportInstagramMedia(nodes.map(formatInstagramItem));
+          return;
+        }
+      }
+    } catch (_) {}
+
+    try {
+      const fallbackUrl = `https://www.instagram.com/p/${shortcode}/?__a=1&__d=dis`;
+      const resp2 = await fetch(fallbackUrl, { credentials: 'include', headers: { 'X-Requested-With': 'XMLHttpRequest' } });
+      if (resp2.ok) {
+        const json2 = await resp2.json();
+        const nodes2 = findInstagramMediaNodes(json2);
+        if (nodes2.length > 0) {
+          reportInstagramMedia(nodes2.map(formatInstagramItem));
+        }
+      }
+    } catch (_) {}
+  }
+
   // ─── Page Messages & Scrapers ───────────────────────────────────────
   window.addEventListener('message', (event) => {
     if (event && event.data) {
@@ -549,7 +680,7 @@
         getVimeoConfig();
       }
       if (event.data.type === 'MS_TRIGGER_INJECT_SCAN') {
-        runScrapers();
+        runScrapers(event.data.shortcode);
       }
     }
   });
@@ -572,13 +703,17 @@
     } catch (_) {}
   }
 
-  function runScrapers() {
+  function runScrapers(shortcodeHint) {
     if (location.hostname.includes('youtube.com')) {
       getPlayerResponse();
     }
     getVimeoConfig();
     if (location.hostname.includes('instagram.com')) {
       scanInstagramScripts();
+      const sc = shortcodeHint || location.pathname.match(/\/(?:reel|reels|p)\/([a-zA-Z0-9_-]+)/)?.[1];
+      if (sc) {
+        fetchInstagramReelData(sc);
+      }
     }
   }
 

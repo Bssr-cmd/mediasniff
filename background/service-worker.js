@@ -573,44 +573,6 @@ function handleInstagramCdnRequest(details, url, headers, contentType, contentLe
         igItem.directAudioUrls['default'] = cleanUrl;
       }
       notifyPopup(details.tabId);
-      return;
-    }
-
-    const isChunk = (contentLength > 0 && contentLength < MIN_CONTENT_LENGTH) ||
-                    /[?&](?:bytestart|byteend)=/i.test(url) ||
-                    headers['content-range'] ||
-                    details.statusCode === 206;
-
-    // Deduplicate against existing cards on this tab
-    const existingClean = Array.from(tabMedia.values()).find(m => getBaseUrl(m.url) === getBaseUrl(cleanUrl));
-    if (!existingClean && isVideo) {
-      const id = `media_${++idCounter}`;
-      tabMedia.set(id, {
-        id,
-        url: cleanUrl,
-        type: 'video',
-        streamType: 'direct',
-        mimeType: 'video/mp4',
-        contentLength: isChunk ? 0 : contentLength,
-        sizeLabel: 'Instagram',
-        filename: 'Instagram Reel',
-        quality: 'HD',
-        variants: [],
-        audioRenditions: [],
-        subtitles: [],
-        isEncrypted: false,
-        isLive: false,
-        totalDuration: 0,
-        segmentCount: 0,
-        parsed: true,
-        source: 'instagram',
-        directVideoUrls: { default: cleanUrl },
-        directAudioUrls: {},
-        referer: details.initiator || details.documentUrl || null,
-        timestamp: Date.now()
-      });
-      updateBadge(details.tabId);
-      notifyPopup(details.tabId);
     }
   } catch (e) {
     console.warn('[MediaSniff] Error handling Instagram CDN request:', e.message);
@@ -1111,7 +1073,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.type === 'DOM_MEDIA') {
     if (sender.tab) {
       const tabId = sender.tab.id;
+      const tabUrl = sender.tab.url || '';
+      // Drop all generic DOM_MEDIA messages on Instagram (handled exclusively by Instagram pipeline)
+      if (tabUrl.includes('instagram.com')) {
+        return;
+      }
       for (const mediaUrl of message.urls) {
+        if (INSTAGRAM_CDN_PATTERN.test(mediaUrl) || /[?&](?:bytestart|byteend)=/i.test(mediaUrl)) {
+          continue;
+        }
         if (mediaUrl.toLowerCase().includes('.m3u8')) {
           handleManifestDetected({
             tabId,
@@ -1426,16 +1396,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tabId = sender.tab.id;
       const tabMedia = getTabMedia(tabId);
       const items = message.items || [];
+
+      // Clean up any individual chunk cards, raw CDN stubs, or DOM cards on this tab
+      for (const [mId, m] of tabMedia.entries()) {
+        if (m.source !== 'instagram' && (
+          m.quality === 'DOM Element' ||
+          (m.url && (m.url.includes('cdninstagram.com') || m.url.includes('fbcdn.net')))
+        )) {
+          tabMedia.delete(mId);
+        }
+      }
+
       for (const item of items) {
         const shortcode = item.shortcode || item.id;
         const existing = Array.from(tabMedia.values()).find(m => m.source === 'instagram' && (m.shortcode === shortcode || m.id === item.id));
-
-        // Clean up individual chunk cards or raw CDN stubs on this tab
-        for (const [mId, m] of tabMedia.entries()) {
-          if (m.source !== 'instagram' && m.url && (m.url.includes('cdninstagram.com') || m.url.includes('fbcdn.net'))) {
-            tabMedia.delete(mId);
-          }
-        }
 
         // Format clean title
         let captionSnippet = (item.caption || '').replace(/\r?\n/g, ' ').replace(/\s+/g, ' ').trim();
@@ -1449,8 +1423,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           smartTitle = `Instagram Reel - ${captionSnippet}`;
         }
 
-        const videoVersions = item.videoVersions || [];
-        const bestVideo = [...videoVersions].sort((a, b) => (b.height || 0) - (a.height || 0))[0];
+        const rawVersions = (item.videoVersions || []).filter(v => v && v.url);
+        // Omit 0x0 versions if versions with valid dimensions exist
+        const validVersions = rawVersions.filter(v => (v.height || 0) > 0 || (v.width || 0) > 0);
+        const videoVersions = validVersions.length > 0 ? validVersions : rawVersions;
+
+        // Sort descending by resolution (area, then height)
+        videoVersions.sort((a, b) => {
+          const areaA = (a.width || 0) * (a.height || 0);
+          const areaB = (b.width || 0) * (b.height || 0);
+          if (areaB !== areaA) return areaB - areaA;
+          return (b.height || 0) - (a.height || 0);
+        });
+
+        const bestVideo = videoVersions[0];
         const progressiveUrl = bestVideo?.url || item.url || '';
 
         // If DASH manifest is available, parse it
@@ -1468,22 +1454,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         // If DASH variants are empty, use progressive MP4 versions
         if (variants.length === 0 && videoVersions.length > 0) {
-          variants = videoVersions.map(v => ({
-            url: v.url,
-            resolution: `${v.width}x${v.height}`,
-            width: v.width,
-            height: v.height,
-            label: v.label || `${v.height}p`,
-            isDirect: true
-          }));
+          variants = videoVersions.map(v => {
+            const hasRes = (v.width || 0) > 0 && (v.height || 0) > 0;
+            return {
+              url: v.url,
+              resolution: hasRes ? `${v.width}x${v.height}` : null,
+              width: v.width || 0,
+              height: v.height || 0,
+              label: v.height ? `${v.height}p` : 'HD Video',
+              isDirect: true
+            };
+          });
         }
 
-        const availableQualities = videoVersions.map(v => ({
-          label: v.label || `${v.height}p`,
-          height: v.height,
-          width: v.width,
-          url: v.url
-        }));
+        const availableQualities = videoVersions.map(v => {
+          return {
+            label: v.height ? `${v.height}p` : 'HD Video',
+            height: v.height || 0,
+            width: v.width || 0,
+            url: v.url
+          };
+        });
 
         const directMp4Urls = {};
         for (const v of videoVersions) {
@@ -1494,14 +1485,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         if (existing) {
-          if (progressiveUrl && (!existing.url || existing.url.length < 10 || existing.url.includes('/reel/'))) {
+          const existingHeight = existing.variants?.[0]?.height || 0;
+          const newHeight = bestVideo?.height || 0;
+          if (progressiveUrl && (!existing.url || existing.url.length < 10 || existing.url.includes('/reel/') || newHeight > existingHeight)) {
             existing.url = progressiveUrl;
           }
-          if (item.thumbnail && !existing.thumbnail) existing.thumbnail = item.thumbnail;
-          if (availableQualities.length > 0) existing.availableQualities = availableQualities;
-          if (Object.keys(directMp4Urls).length > 0) existing.directMp4Urls = { ...existing.directMp4Urls, ...directMp4Urls };
-          if (variants.length > 0) existing.variants = variants;
-          if (audioRenditions.length > 0) existing.audioRenditions = audioRenditions;
+          if (item.thumbnail && (!existing.thumbnail || existing.thumbnail.length < 10)) {
+            existing.thumbnail = item.thumbnail;
+          }
+          if (availableQualities.length > 0) {
+            existing.availableQualities = availableQualities;
+          }
+          if (Object.keys(directMp4Urls).length > 0) {
+            existing.directMp4Urls = { ...existing.directMp4Urls, ...directMp4Urls };
+          }
+          if (variants.length > 0) {
+            existing.variants = variants;
+          }
+          if (audioRenditions.length > 0) {
+            existing.audioRenditions = audioRenditions;
+          }
+          if (newHeight > existingHeight && newHeight > 0) {
+            existing.quality = `${newHeight}p`;
+          }
+          if (smartTitle && smartTitle !== 'Instagram Reel' && (existing.filename === 'Instagram Reel' || !existing.filename)) {
+            existing.filename = smartTitle;
+          }
           continue;
         }
 
@@ -1516,7 +1525,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           contentLength: 0,
           sizeLabel: 'Instagram',
           filename: smartTitle,
-          quality: bestVideo?.height ? `${bestVideo.height}p` : 'HD',
+          quality: bestVideo?.height ? `${bestVideo.height}p` : 'HD Video',
           variants,
           audioRenditions,
           subtitles: [],

@@ -147,20 +147,35 @@
     } catch (_) {}
   }
 
+  function isChunkUrl(url) {
+    if (!url || typeof url !== 'string') return false;
+    if (/(?:cdninstagram\.com|fbcdn\.net)/i.test(url)) return true;
+    if (/[?&](?:bytestart|byteend)=/i.test(url)) return true;
+    if (/[?&]range=\d+-\d+/i.test(url) && !/\.(m3u8|mpd)/i.test(url)) return true;
+    return false;
+  }
+
   function extractMediaUrls() {
+    // If on Instagram, skip DOM media URL extraction entirely.
+    // Instagram uses segmented MP4/DASH chunks and custom players,
+    // which are handled exclusively by extractInstagramData() and inject.js.
+    if (location.hostname.includes('instagram.com')) {
+      return [];
+    }
+
     const urls = [];
 
     // Find all video and audio elements
     const mediaElements = document.querySelectorAll('video, audio');
     for (const el of mediaElements) {
-      if (el.src && !el.src.startsWith('blob:') && !el.src.startsWith('data:')) {
+      if (el.src && !el.src.startsWith('blob:') && !el.src.startsWith('data:') && !isChunkUrl(el.src)) {
         urls.push(el.src);
       }
-      if (el.currentSrc && !el.currentSrc.startsWith('blob:') && !el.currentSrc.startsWith('data:')) {
+      if (el.currentSrc && !el.currentSrc.startsWith('blob:') && !el.currentSrc.startsWith('data:') && !isChunkUrl(el.currentSrc)) {
         urls.push(el.currentSrc);
       }
       for (const source of el.querySelectorAll('source')) {
-        if (source.src && !source.src.startsWith('blob:') && !source.src.startsWith('data:')) {
+        if (source.src && !source.src.startsWith('blob:') && !source.src.startsWith('data:') && !isChunkUrl(source.src)) {
           urls.push(source.src);
         }
       }
@@ -168,7 +183,7 @@
       const dataAttrs = ['data-src', 'data-video', 'data-mp4', 'data-stream', 'data-url', 'data-hls', 'data-hls-url', 'data-playlist', 'data-stream-src', 'data-file', 'data-media'];
       for (const attr of dataAttrs) {
         const val = el.getAttribute(attr);
-        if (val && !val.startsWith('blob:') && !val.startsWith('data:')) {
+        if (val && !val.startsWith('blob:') && !val.startsWith('data:') && !isChunkUrl(val)) {
           try {
             const resolved = new URL(val, document.baseURI).href;
             if (resolved.startsWith('http') && (MEDIA_REGEX.test(resolved) || /\.(m3u8|mpd)(\?|#|$)/i.test(resolved))) urls.push(resolved);
@@ -181,7 +196,7 @@
     const embedsAndObjects = document.querySelectorAll('embed, object');
     for (const el of embedsAndObjects) {
       const src = el.src || el.getAttribute('data');
-      if (src && !src.startsWith('blob:') && !src.startsWith('data:')) {
+      if (src && !src.startsWith('blob:') && !src.startsWith('data:') && !isChunkUrl(src)) {
         try {
           const resolved = new URL(src, document.baseURI).href;
           if (resolved.startsWith('http') && (MEDIA_REGEX.test(resolved) || /\.(m3u8|mpd)(\?|#|$)/i.test(resolved))) urls.push(resolved);
@@ -193,7 +208,7 @@
     const anchors = document.querySelectorAll('a');
     for (const a of anchors) {
       const href = a.href;
-      if (href && MEDIA_REGEX.test(href)) {
+      if (href && MEDIA_REGEX.test(href) && !isChunkUrl(href)) {
         urls.push(href);
       }
     }
@@ -207,8 +222,8 @@
           if (iframeDoc) {
             const iframeMedia = iframeDoc.querySelectorAll('video, audio');
             for (const el of iframeMedia) {
-              if (el.src && !el.src.startsWith('blob:')) urls.push(el.src);
-              if (el.currentSrc && !el.currentSrc.startsWith('blob:')) urls.push(el.currentSrc);
+              if (el.src && !el.src.startsWith('blob:') && !isChunkUrl(el.src)) urls.push(el.src);
+              if (el.currentSrc && !el.currentSrc.startsWith('blob:') && !isChunkUrl(el.currentSrc)) urls.push(el.currentSrc);
             }
           }
         } catch (e) { /* Cross-origin iframe */ }
@@ -238,7 +253,7 @@
         const entries = performance.getEntriesByType('resource');
         for (const entry of entries) {
           const name = entry.name;
-          if (!name || typeof name !== 'string') continue;
+          if (!name || typeof name !== 'string' || isChunkUrl(name)) continue;
           const nameLower = name.toLowerCase();
           if (nameLower.includes('.m3u8') || nameLower.includes('.mpd') || nameLower.includes('master.json') ||
               (name.includes('vimeocdn.com') && (name.includes('playlist.m3u8') || name.includes('/v2/playlist/av/') || name.includes('/avf/')))) {
@@ -581,15 +596,20 @@
   }
 
   // ─── Instagram Detection ────────────────────────────────────────────
-  const reportedInstagramCodes = new Set();
+  const reportedInstagramMedia = new Map(); // key -> { height, formatCount }
 
   function processInstagramResponse(items) {
     if (!items || !Array.isArray(items) || items.length === 0) return;
     const newItems = items.filter(item => {
       const key = item.shortcode || item.id;
       if (!key) return true;
-      if (reportedInstagramCodes.has(key)) return false;
-      reportedInstagramCodes.add(key);
+      const bestH = item.videoVersions?.[0]?.height || 0;
+      const fmtCount = item.videoVersions?.length || 0;
+      const prev = reportedInstagramMedia.get(key);
+      if (prev && prev.height >= bestH && prev.formatCount >= fmtCount) {
+        return false;
+      }
+      reportedInstagramMedia.set(key, { height: bestH, formatCount: fmtCount });
       return true;
     });
 
@@ -612,16 +632,28 @@
     const match = location.pathname.match(/\/(?:reel|reels|p)\/([a-zA-Z0-9_-]+)/);
     const shortcode = match ? match[1] : null;
 
-    // Trigger inject.js scan
+    // Trigger inject.js scan with shortcode
     try {
-      window.postMessage({ type: 'MS_TRIGGER_INJECT_SCAN' }, '*');
+      window.postMessage({ type: 'MS_TRIGGER_INJECT_SCAN', shortcode }, '*');
     } catch (_) {}
 
-    // 2. Scan direct video tags on Instagram page
+    // 2. Scan direct video tags on Instagram page ONLY if metadata is loaded and dimensions > 0
     try {
       const videoElements = document.querySelectorAll('video');
       const items = [];
       for (const v of videoElements) {
+        if (v.readyState < 1) {
+          v.addEventListener('loadedmetadata', () => {
+            setTimeout(extractInstagramData, 200);
+          }, { once: true });
+          continue;
+        }
+
+        // Never extract stubs with 0x0 resolution
+        if (!v.videoHeight || v.videoHeight === 0 || !v.videoWidth || v.videoWidth === 0) {
+          continue;
+        }
+
         let src = v.src || v.currentSrc;
         if (src && !src.startsWith('blob:') && !src.startsWith('data:')) {
           // Clean bytestart & byteend
@@ -635,9 +667,9 @@
             thumbnail: v.poster || null,
             videoVersions: [{
               url: src,
-              width: v.videoWidth || 0,
-              height: v.videoHeight || 0,
-              label: v.videoHeight ? `${v.videoHeight}p` : 'MP4 Video'
+              width: v.videoWidth,
+              height: v.videoHeight,
+              label: `${v.videoHeight}p`
             }],
             dashManifest: null,
             pageUrl: shortcode ? `https://www.instagram.com/reel/${shortcode}/` : location.href
@@ -697,7 +729,7 @@
   function fullRescan() {
     reportedUrls.clear();
     reportedEmbedIds.clear();
-    reportedInstagramCodes.clear();
+    reportedInstagramMedia.clear();
     ytDataReported = false;
     reportedVimeoIds.clear();
     lastReportedVideoId = null;
@@ -759,7 +791,7 @@
       lastUrl = location.href;
       ytDataReported = false;
       reportedVimeoIds.clear();
-      reportedInstagramCodes.clear();
+      reportedInstagramMedia.clear();
       lastReportedVideoId = null;
       lastReportedJsUrl = null;
       lastReportedFormatCount = 0;
