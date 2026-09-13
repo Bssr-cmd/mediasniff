@@ -1340,9 +1340,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return true;
   }
   if (message.type === 'DOWNLOAD_DIRECT') {
+    let saveFilename = sanitizeFilename(message.filename) || 'download.mp4';
+    if (!/\.(mp4|webm|m4a|vtt)$/i.test(saveFilename)) {
+      saveFilename = saveFilename.replace(/\.[^.]+$/, '') + '.mp4';
+    }
     chrome.downloads.download({
       url: message.url,
-      filename: sanitizeFilename(message.filename) || undefined,
+      filename: saveFilename,
       saveAs: true
     });
     return true;
@@ -1412,9 +1416,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   // Handle requests from offscreen to trigger downloads (since offscreen cannot call downloads API)
   if (message.type === 'TRIGGER_DOWNLOAD_SAVE') {
+    let saveFilename = sanitizeFilename(message.filename) || 'download.mp4';
+    if (!/\.(mp4|webm|m4a|vtt)$/i.test(saveFilename)) {
+      saveFilename = saveFilename.replace(/\.[^.]+$/, '') + '.mp4';
+    }
     chrome.downloads.download({
       url: message.url,
-      filename: sanitizeFilename(message.filename) || undefined,
+      filename: saveFilename,
       saveAs: false
     }, (downloadId) => {
       if (chrome.runtime.lastError) {

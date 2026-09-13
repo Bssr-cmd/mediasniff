@@ -150,18 +150,11 @@ class DownloadTask {
           this.reportProgress(overall, 'Converting MPEG-TS to MP4...', '');
         });
       } catch (convErr) {
-        console.warn('[MediaSniff Offscreen] TSToMP4Converter failed, fallback to raw TS:', convErr);
-        const parts = [];
-        for (const seg of result.segments) {
-          if (seg) parts.push(seg);
-        }
-        finalBlob = new Blob(parts, { type: 'video/mp2t' });
-        finalFilename = finalFilename.replace(/\.[^.]+$/, '.ts');
+        console.error('[MediaSniff Offscreen] TSToMP4Converter failed:', convErr);
+        throw new Error('Transmuxing MPEG-TS to MP4 failed: ' + convErr.message);
       }
-      // Ensure .mp4 extension if converted to MP4
-      if (finalBlob.type === 'video/mp4' && !/\.mp4$/i.test(finalFilename)) {
-        finalFilename = finalFilename.replace(/\.[^.]+$/, '.mp4');
-      }
+      // Ensure .mp4 extension
+      finalFilename = finalFilename.replace(/\.[^.]+$/, '') + '.mp4';
     } else {
       // fMP4/CMAF segments: init segment (ftyp+moov) + media segments
       // (moof+mdat). Build a proper MP4 by concatenating init + segments
@@ -290,19 +283,16 @@ class DownloadTask {
     let outputFormat = WASMMuxer.detectFormat(muxedBuffer);
     if (outputFormat === 'ts') {
       try {
-        const mp4Buf = TSToMP4Converter.convertToArrayBuffer([muxedBuffer]);
+        const mp4Buf = await TSToMP4Converter.convertToArrayBuffer([muxedBuffer]);
         muxedBuffer = mp4Buf;
         outputFormat = 'mp4';
       } catch (convErr) {
-        console.warn('[MediaSniff Offscreen] TS-to-MP4 conversion in downloadMux failed:', convErr);
+        console.error('[MediaSniff Offscreen] TS-to-MP4 conversion in downloadMux failed:', convErr);
+        throw new Error('Converting muxed TS to MP4 failed: ' + convErr.message);
       }
     }
-    if (outputFormat === 'ts') {
-      muxFilename = muxFilename.replace(/\.[^.]+$/, '.ts');
-    } else if (!/\.mp4$/i.test(muxFilename)) {
-      muxFilename = muxFilename.replace(/\.[^.]+$/, '.mp4');
-    }
-    await this.triggerSave(new Blob([muxedBuffer], { type: outputFormat === 'ts' ? 'video/mp2t' : 'video/mp4' }), muxFilename);
+    muxFilename = muxFilename.replace(/\.[^.]+$/, '') + '.mp4';
+    await this.triggerSave(new Blob([muxedBuffer], { type: 'video/mp4' }), muxFilename);
     this.reportStatus('complete', 'Complete!');
   }
   async downloadYouTube() {
