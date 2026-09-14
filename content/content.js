@@ -367,6 +367,7 @@
 
   function processYouTubePlayerResponse(data, mainWorldJsUrl) {
     if (!data) return;
+    if (data.adPlacement || data.playerAds || data.adSlots) return;
     
     const streamingData = data.streamingData;
     const videoDetails = data.videoDetails;
@@ -374,6 +375,15 @@
     
     const videoId = videoDetails.videoId;
     if (!videoId) return;
+
+    if (location.hostname.includes('youtube.com')) {
+      let pageVideoId = null;
+      try {
+        pageVideoId = new URLSearchParams(location.search).get('v')
+          || location.pathname.match(/\/(?:shorts|live)\/([a-zA-Z0-9_-]+)/)?.[1];
+      } catch (_) {}
+      if (pageVideoId && videoId !== pageVideoId) return;
+    }
 
     const adaptiveFormats = [];
     if (streamingData.adaptiveFormats) {
@@ -800,4 +810,13 @@
       setTimeout(extractVimeoData, 2000);
     }
   }, 1000);
+
+  document.addEventListener('yt-navigate-finish', () => {
+    lastUrl = location.href;
+    ytDataReported = false;
+    lastReportedVideoId = null;
+    lastReportedJsUrl = null;
+    lastReportedFormatCount = 0;
+    setTimeout(extractYouTubeData, 200);
+  });
 })();

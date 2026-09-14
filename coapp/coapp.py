@@ -209,7 +209,7 @@ def handle_ytdlp_download(msg):
         "--no-playlist",
         "--socket-timeout", "15",
         "--retries", "2",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
         "--merge-output-format", "mp4",
         "-o", output_path,
         url
@@ -322,8 +322,8 @@ def handle_download_and_mux(msg):
             try:
                 download_file(audio_url, temp_audio, "audio", 50, 80, custom_headers=headers, job_id=job_id)
             except Exception as audio_err:
-                log(f"Audio download failed, falling back to video only: {audio_err}")
-                audio_url = None
+                log(f"Audio download failed: {audio_err}")
+                raise Exception(f"Audio download failed: {audio_err}")
         
         # 3. Locate FFmpeg
         ffmpeg_bin = find_ffmpeg()

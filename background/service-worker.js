@@ -257,6 +257,45 @@ async function extractNetscapeCookies(targetUrl) {
 const mediaRegistry = new Map(); // tabId -> Map<id, MediaItem>
 let idCounter = 0;
 
+const tabLastOrigin = new Map();
+const tabLastTitle = new Map();
+const pendingYouTubeAudio = new Map(); // `${tabId}_${videoId}` -> { mp4, webm, default }
+const pendingYouTubeVideo = new Map(); // `${tabId}_${videoId}` -> { [heightStr]: url, default: url }
+
+function getActiveYouTubeVideoId(tabUrl) {
+  if (!tabUrl || typeof tabUrl !== 'string') return null;
+  try {
+    const u = new URL(tabUrl);
+    const host = u.hostname.toLowerCase();
+    if (!host.includes('youtube.com') && !host.includes('youtu.be')) return null;
+
+    if (host.includes('youtu.be')) {
+      const vid = u.pathname.slice(1).split('/')[0];
+      return (/^[a-zA-Z0-9_-]{11}$/.test(vid)) ? vid : null;
+    }
+
+    // Must be watch, shorts, or live
+    if (u.pathname === '/watch' || u.pathname.startsWith('/watch/')) {
+      const v = u.searchParams.get('v');
+      return (v && /^[a-zA-Z0-9_-]{11}$/.test(v)) ? v : (v || null);
+    }
+
+    const shortsMatch = u.pathname.match(/^\/shorts\/([a-zA-Z0-9_-]{11})/);
+    if (shortsMatch) {
+      return shortsMatch[1];
+    }
+
+    const liveMatch = u.pathname.match(/^\/live\/([a-zA-Z0-9_-]{11})/);
+    if (liveMatch) {
+      return liveMatch[1];
+    }
+
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
 // Eagerly restore all tabs from storage on service worker spin-up
 const storageInitPromise = (async () => {
   try {
@@ -329,7 +368,7 @@ const MEDIA_MIME_TYPES = [
   'application/dash+xml',
   'application/octet-stream'
 ];
-const YOUTUBE_VIDEO_PATTERN = /\.googlevideo\.com\/videoplayback/i;
+const GOOGLEVIDEO_PATTERN = /\.googlevideo\.com\//i;
 const INSTAGRAM_CDN_PATTERN = /(?:cdninstagram\.com|fbcdn\.net)/i;
 const IGNORE_PATTERNS = [
   /^chrome-extension:\/\//,
@@ -366,43 +405,339 @@ async function handleRequest(details) {
   let mediaType = null;
   let streamType = 'direct';
   let mimeType = contentType.split(';')[0].trim();
-  // 0. Check for YouTube/Google Video streams
-  if (YOUTUBE_VIDEO_PATTERN.test(url)) {
-
+  // 0. Check for YouTube/Google Video streams (Three-Case Classification)
+  if (GOOGLEVIDEO_PATTERN.test(url)) {
     try {
       const urlObj = new URL(url);
       const urlParams = urlObj.searchParams;
+
+      // ─── Case B: Non-media / internal YouTube requests (ads, tracking, pings) ───
+      const isAd = urlParams.get('ctier') === 'A' ||
+                   urlParams.has('adformat') ||
+                   urlParams.has('ad_type') ||
+                   urlParams.get('sparams')?.includes('adformat') ||
+                   url.includes('&adformat=') ||
+                   url.includes('?adformat=') ||
+                   url.includes('&ctier=A') ||
+                   url.includes('?ctier=A');
+
+      if (isAd) {
+        return; // Ads discarded completely
+      }
+
+      const itagHeights = {
+        401: 2160, 313: 2160, 315: 2160, 272: 2160, 266: 2160, 337: 2160, 701: 2160, 555: 2160,
+        400: 1440, 308: 1440, 271: 1440, 336: 1440, 700: 1440, 554: 1440,
+        137: 1080, 248: 1080, 399: 1080, 335: 1080, 303: 1080, 299: 1080, 553: 1080,
+        136: 720, 247: 720, 398: 720, 22: 720, 302: 720, 298: 720, 552: 720,
+        135: 480, 244: 480, 397: 480, 551: 480,
+        134: 360, 243: 360, 396: 360, 18: 360, 550: 360,
+        133: 240, 242: 240, 395: 240,
+        160: 144, 278: 144, 394: 144
+      };
+
+      const isHls = url.includes('.m3u8') || contentType.includes('mpegurl');
+      const isDash = url.includes('.mpd') || contentType.includes('dash');
       const itag = urlParams.get('itag') || '';
       const mime = urlParams.get('mime') || contentType || '';
 
-      if (mime.startsWith('video/') || mime.startsWith('audio/')) {
-        // Strip range, sequence, and buffer params to create full-length direct download URLs
-        const cleanUrl = url
-          .replace(/([?&])(?:range|sq|rn|rbuf)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
-          .replace(/\?&/, '?')
-          .replace(/\?(?=#|$)/, '');
-        const tabMedia = getTabMedia(details.tabId);
-        // Find registered YouTube card on this tab
-        const ytItem = Array.from(tabMedia.values()).find(m => m.source === 'youtube');
-        if (ytItem) {
-          if (!ytItem.directVideoUrls) ytItem.directVideoUrls = {};
-          if (!ytItem.directAudioUrls) ytItem.directAudioUrls = {};
-          if (mime.startsWith('video/')) {
-            const format = ytItem.availableQualities?.find(q => q.itag === parseInt(itag));
-            const height = format ? String(format.height) : (urlParams.get('lmt') ? '1080' : 'default');
-            ytItem.directVideoUrls[height] = cleanUrl;
-            console.log(`[MediaSniff] Associated video stream quality ${height} with YouTube item.`);
-          } else if (mime.startsWith('audio/')) {
-            ytItem.directAudioUrls['default'] = cleanUrl;
-            console.log(`[MediaSniff] Associated default audio stream with YouTube item.`);
+      const itagNum = parseInt(itag, 10);
+      const isMp4AudioItag = [140, 139, 141].includes(itagNum);
+      const isWebmAudioItag = [251, 250, 249].includes(itagNum);
+      const isAudioItag = isMp4AudioItag || isWebmAudioItag;
+
+      const isMp4AudioMime = mime.includes('audio/mp4') || mime.includes('audio/m4a') || mime.includes('audio/aac');
+      const isWebmAudioMime = mime.includes('audio/webm') || mime.includes('audio/opus');
+      const isAudioMime = mime.startsWith('audio/') || isMp4AudioMime || isWebmAudioMime;
+
+      const isAudio = isAudioItag || isAudioMime;
+      const isMp4Audio = isMp4AudioItag || isMp4AudioMime || (isAudio && !isWebmAudioItag && !isWebmAudioMime);
+      const isWebmAudio = isWebmAudioItag || isWebmAudioMime;
+
+      const isVideo = !isAudio && ((mime.startsWith('video/') && !mime.startsWith('audio/')) || Boolean(itagHeights[itagNum]) || [137, 136, 135, 134, 133, 160, 248, 247, 244, 243, 242, 278, 399, 398, 397, 396, 395, 394, 18, 22].includes(itagNum));
+
+      if (!isHls && !isDash && !isVideo && !isAudio) {
+        return; // Non-media internal googlevideo request ignored
+      }
+
+      // Clean URL: strip range, sq, rn, rbuf to preserve full-length signed URL
+      const cleanUrl = url
+        .replace(/([?&])(?:range|sq|rn|rbuf)=[^&#]*/g, (m, p) => p === '?' ? '?' : '')
+        .replace(/\?&/, '?')
+        .replace(/\?(?=#|$)/, '');
+
+      const tabMedia = getTabMedia(details.tabId);
+      const tabOrigin = tabLastOrigin.get(details.tabId) || '';
+      const tabTitle = tabLastTitle.get(details.tabId) || '';
+
+      // Determine active YouTube video ID strictly from valid watch/shorts/live page URLs
+      let activeVideoId = getActiveYouTubeVideoId(tabOrigin)
+        || getActiveYouTubeVideoId(details.documentUrl)
+        || getActiveYouTubeVideoId(details.initiator);
+
+      // If activeVideoId not cached, check current live tab URL
+      if (!activeVideoId && details.tabId >= 0) {
+        try {
+          const tab = await chrome.tabs.get(details.tabId);
+          if (tab?.url) {
+            tabLastOrigin.set(details.tabId, tab.url);
+            if (tab.title) tabLastTitle.set(details.tabId, tab.title);
+            activeVideoId = getActiveYouTubeVideoId(tab.url);
           }
-          notifyPopup(details.tabId);
+        } catch (_) {}
+      }
+
+      // Also check if an active YouTube item already exists on this tab
+      const existingYt = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId);
+      if (!activeVideoId && existingYt) {
+        activeVideoId = existingYt.youtubeId;
+      }
+
+      // Check pending YouTube records for this tab
+      if (!activeVideoId) {
+        for (const k of pendingYouTubeVideo.keys()) {
+          if (k.startsWith(`${details.tabId}_`)) {
+            activeVideoId = k.slice(`${details.tabId}_`.length);
+            break;
+          }
         }
       }
+      if (!activeVideoId) {
+        for (const k of pendingYouTubeAudio.keys()) {
+          if (k.startsWith(`${details.tabId}_`)) {
+            activeVideoId = k.slice(`${details.tabId}_`.length);
+            break;
+          }
+        }
+      }
+
+      // If still not found and URL has valid docid parameter
+      if (!activeVideoId && urlParams.get('docid')) {
+        const d = urlParams.get('docid');
+        if (/^[a-zA-Z0-9_-]{11}$/.test(d)) {
+          activeVideoId = d;
+        }
+      }
+
+      // If no valid active video identity exists on the tab, do NOT create or process YouTube media
+      if (!activeVideoId) {
+        return;
+      }
+
+      // For video requests, enforce strict docid matching to reject ads/stray videos
+      const docId = urlParams.get('docid') || '';
+      if (isVideo && docId && docId !== activeVideoId) {
+        return; // Request belongs to another video/ad, ignore it
+      }
+
+      const formatHeight = itagHeights[itagNum] || (urlParams.get('lmt') ? 1080 : 720);
+      const heightStr = String(formatHeight);
+
+      // Quality ranking for audio itags: 141 > 140 > 139 for MP4; 251 > 250 > 249 for WebM
+      const itagRanks = { 141: 300, 140: 200, 139: 100, 251: 250, 250: 150, 249: 50 };
+      const incomingAudioRank = itagRanks[itagNum] || 100;
+
+      // ─── Case A: Request belongs to an already-known active YouTube item ───
+      let ytItem = existingYt || Array.from(tabMedia.values()).find(m => 
+        m.source === 'youtube' && (m.youtubeId === activeVideoId || !m.youtubeId)
+      );
+
+      if (ytItem) {
+        if (!ytItem.directVideoUrls) ytItem.directVideoUrls = {};
+        if (!ytItem.directAudioUrls) ytItem.directAudioUrls = {};
+
+        if (isVideo) {
+          ytItem.directVideoUrls[heightStr] = cleanUrl;
+          ytItem.directVideoUrls['default'] = cleanUrl;
+          ytItem.videoUrl = cleanUrl;
+
+          // Buffer in pendingYouTubeVideo
+          let pendingV = pendingYouTubeVideo.get(`${details.tabId}_${activeVideoId}`) || {};
+          pendingV[heightStr] = cleanUrl;
+          pendingV['default'] = cleanUrl;
+          pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId}`, pendingV);
+
+          if (!ytItem.availableQualities) ytItem.availableQualities = [];
+          if (!ytItem.availableQualities.some(q => q.height === formatHeight)) {
+            ytItem.availableQualities.push({
+              label: `${formatHeight}p`,
+              height: formatHeight,
+              width: 0,
+              bitrate: parseInt(urlParams.get('bitrate')) || 0,
+              itag: itagNum || 0
+            });
+            ytItem.availableQualities.sort((a, b) => (b.height || 0) - (a.height || 0));
+          }
+        } else if (isAudio) {
+          let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+
+          if (isMp4Audio) {
+            let shouldUpdate = true;
+            if (ytItem.directAudioUrls.mp4) {
+              try {
+                const u = new URL(ytItem.directAudioUrls.mp4);
+                const exItag = parseInt(u.searchParams.get('itag'), 10);
+                if ((itagRanks[exItag] || 100) > incomingAudioRank) shouldUpdate = false;
+              } catch (_) {}
+            }
+            if (shouldUpdate) {
+              ytItem.directAudioUrls.mp4 = cleanUrl;
+              ytItem.directAudioUrls.default = cleanUrl;
+              ytItem.audioUrl = cleanUrl;
+              pendingA.mp4 = cleanUrl;
+              pendingA.default = cleanUrl;
+            }
+          } else if (isWebmAudio) {
+            let shouldUpdate = true;
+            if (ytItem.directAudioUrls.webm) {
+              try {
+                const u = new URL(ytItem.directAudioUrls.webm);
+                const exItag = parseInt(u.searchParams.get('itag'), 10);
+                if ((itagRanks[exItag] || 100) > incomingAudioRank) shouldUpdate = false;
+              } catch (_) {}
+            }
+            if (shouldUpdate) {
+              ytItem.directAudioUrls.webm = cleanUrl;
+              if (!ytItem.directAudioUrls.default || !ytItem.directAudioUrls.mp4) {
+                ytItem.directAudioUrls.default = cleanUrl;
+              }
+              if (!ytItem.audioUrl) {
+                ytItem.audioUrl = cleanUrl;
+              }
+              pendingA.webm = cleanUrl;
+              if (!pendingA.default || !pendingA.mp4) pendingA.default = cleanUrl;
+            }
+          }
+
+          pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+
+          console.log('[YT AUDIO CAPTURE]', {
+            tabId: details.tabId,
+            videoId: activeVideoId,
+            itag,
+            mime,
+            source: 'googlevideo',
+            matchedActiveItem: true,
+            buffered: true,
+            directAudioKeys: Object.keys(ytItem.directAudioUrls || {})
+          });
+        }
+        notifyPopup(details.tabId);
+        return;
+      }
+
+      // If YouTube item does not exist yet and this is an audio request:
+      // Store in pendingYouTubeAudio so it is merged when video / YOUTUBE_DATA arrives.
+      // Do NOT create an audio-only card or a second YouTube card.
+      if (isAudio) {
+        let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+        if (isMp4Audio) {
+          let shouldUpdate = true;
+          if (pendingA.mp4) {
+            try {
+              const u = new URL(pendingA.mp4);
+              const exItag = parseInt(u.searchParams.get('itag'), 10);
+              if ((itagRanks[exItag] || 100) > incomingAudioRank) shouldUpdate = false;
+            } catch (_) {}
+          }
+          if (shouldUpdate) {
+            pendingA.mp4 = cleanUrl;
+            pendingA.default = cleanUrl;
+          }
+        } else if (isWebmAudio) {
+          let shouldUpdate = true;
+          if (pendingA.webm) {
+            try {
+              const u = new URL(pendingA.webm);
+              const exItag = parseInt(u.searchParams.get('itag'), 10);
+              if ((itagRanks[exItag] || 100) > incomingAudioRank) shouldUpdate = false;
+            } catch (_) {}
+          }
+          if (shouldUpdate) {
+            pendingA.webm = cleanUrl;
+            if (!pendingA.default || !pendingA.mp4) pendingA.default = cleanUrl;
+          }
+        }
+        pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+
+        console.log('[YT AUDIO CAPTURE]', {
+          tabId: details.tabId,
+          videoId: activeVideoId,
+          itag,
+          mime,
+          source: 'googlevideo',
+          matchedActiveItem: false,
+          buffered: true,
+          directAudioKeys: Object.keys(pendingA)
+        });
+        return;
+      }
+
+      // ─── Case C: Real downloadable video request before YOUTUBE_DATA arrives ───
+      let cleanTitle = '';
+      if (tabTitle) {
+        cleanTitle = tabTitle
+          .replace(/\s*[-–—|]\s*(YouTube|Vimeo).*$/i, '')
+          .replace(/[<>:"/\\|?*\x00-\x1f]/g, '')
+          .trim();
+      }
+      if (!cleanTitle || cleanTitle.toLowerCase() === 'youtube') {
+        cleanTitle = `YouTube Video ${activeVideoId}`;
+      }
+
+      // Buffer this video
+      let pendingV = pendingYouTubeVideo.get(`${details.tabId}_${activeVideoId}`) || {};
+      pendingV[heightStr] = cleanUrl;
+      pendingV['default'] = cleanUrl;
+      pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId}`, pendingV);
+
+      // Merge buffered audio if any
+      const pendingAudio = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+
+      const id = `media_${++idCounter}`;
+      const fallbackItem = {
+        id,
+        url: `https://www.youtube.com/watch?v=${activeVideoId}`,
+        type: 'video',
+        streamType: (isHls || isDash) ? (isHls ? 'hls' : 'dash') : 'direct',
+        mimeType: mime || 'video/mp4',
+        contentLength: contentLength || 0,
+        sizeLabel: 'YouTube',
+        filename: cleanTitle,
+        quality: `${heightStr}p`,
+        variants: [],
+        audioRenditions: [],
+        subtitles: [],
+        isEncrypted: false,
+        isLive: false,
+        totalDuration: 0,
+        segmentCount: 0,
+        parsed: true,
+        source: 'youtube',
+        youtubeId: activeVideoId,
+        thumbnail: `https://i.ytimg.com/vi/${activeVideoId}/hqdefault.jpg`,
+        directVideoUrls: { [heightStr]: cleanUrl, default: cleanUrl },
+        directAudioUrls: { ...pendingAudio },
+        videoUrl: cleanUrl,
+        audioUrl: pendingAudio.mp4 || pendingAudio.default || pendingAudio.webm || null,
+        availableQualities: [{
+          label: `${heightStr}p`,
+          height: formatHeight,
+          width: 0,
+          bitrate: parseInt(urlParams.get('bitrate')) || 0,
+          itag: itagNum || 0
+        }],
+        timestamp: Date.now()
+      };
+
+      tabMedia.set(id, fallbackItem);
+      updateBadge(details.tabId);
+      notifyPopup(details.tabId);
+      return;
     } catch (e) {
-      console.warn('[MediaSniff] Error capturing YouTube video stream:', e.message);
+      console.warn('[MediaSniff] Error handling googlevideo request:', e.message);
     }
-    return; // Stop processing so we don't register individual chunks as duplicate cards
+    return;
   }
   // 0b. Check for Vimeo player config
   else if (url.includes('player.vimeo.com/video/') && url.includes('/config')) {
@@ -476,6 +811,20 @@ async function handleRequest(details) {
     return;
   }
   if (!mediaType) return;
+
+  // Prevent internal YouTube/youtu.be requests (such as /s/search/audio/failure.mp3 or assets)
+  // or stray media requests on YouTube pages from creating phantom media cards
+  try {
+    const reqUrlObj = new URL(url);
+    if (reqUrlObj.hostname.includes('youtube.com') || reqUrlObj.hostname.includes('youtu.be')) {
+      return; // Never create generic media card for internal youtube.com requests
+    }
+  } catch (_) {}
+
+  if (details.initiator && (details.initiator.includes('youtube.com') || details.initiator.includes('youtu.be'))) {
+    return; // On a YouTube tab, real media is handled only via the YouTube googlevideo pipeline
+  }
+
   // ─── Smart deduplication ──────────────────────────────────────────
   const tabMedia = getTabMedia(details.tabId);
   const baseUrl = getBaseUrl(url);
@@ -509,6 +858,8 @@ async function handleRequest(details) {
     segmentCount: 0,
     parsed: false,
     referer: details.initiator || details.documentUrl || null,
+    source: (url.includes('youtube.com') || url.includes('googlevideo.com')) ? 'youtube' : undefined,
+    pageUrl: (url.includes('youtube.com') || url.includes('googlevideo.com')) ? (details.initiator || details.documentUrl || null) : undefined,
     timestamp: Date.now()
   };
   // For subtitle files, extract format info
@@ -1301,19 +1652,53 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const tabId = sender.tab.id;
       const tabMedia = getTabMedia(tabId);
       const info = message.videoInfo;
-      // Check if we already have this YouTube video (could be placeholder registered by DOM_EMBED)
-      const existing = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId === info.videoId);
+      if (!info || !info.videoId) return;
+
+      // Filter ads and non-matching background requests when on a YouTube watch/shorts/live page
+      const tabUrl = sender.tab?.url || '';
+      const activeVid = getActiveYouTubeVideoId(tabUrl);
+      if (activeVid && info.videoId !== activeVid) {
+        console.log(`[MediaSniff] Ignoring YouTube ad / secondary player response for ${info.videoId} (expected ${activeVid})`);
+        return;
+      }
+
+      if (activeVid) {
+        // Clean up any stale YouTube cards or ad stubs on this tab so only the active video is presented
+        for (const [existingId, existingItem] of tabMedia.entries()) {
+          if (existingItem.source === 'youtube' && existingItem.youtubeId !== info.videoId) {
+            tabMedia.delete(existingId);
+          }
+        }
+      }
+
+      const reliableThumbnail = info.thumbnail || `https://i.ytimg.com/vi/${info.videoId}/hqdefault.jpg`;
+
+      // Check if we already have this YouTube video (could be placeholder registered by DOM_EMBED or Case C fallback)
+      let existing = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && (m.youtubeId === info.videoId || !m.youtubeId));
+      if (!existing && tabMedia.size === 1) {
+        const onlyItem = Array.from(tabMedia.values())[0];
+        if (onlyItem.source === 'youtube') existing = onlyItem;
+      }
+
+      const pendingKey = `${tabId}_${info.videoId}`;
+      const pendingAudio = pendingYouTubeAudio.get(pendingKey);
+      const pendingVideo = pendingYouTubeVideo.get(pendingKey);
+
       if (existing) {
-        // Update placeholder or existing card with latest player data
+        // Update placeholder or fallback card with latest official player data
         const videoFormats = (message.adaptiveFormats || []).filter(f => f.mimeType?.startsWith('video/'));
         const bestVideo = videoFormats.sort((a, b) => b.height - a.height)[0];
         const qualityLabel = bestVideo
           ? `${bestVideo.qualityLabel || bestVideo.height + 'p'} · ${formatBitrate(bestVideo.bitrate)}`
-          : 'Unknown';
+          : (existing.quality || 'Unknown');
 
         existing.quality = qualityLabel;
         existing.filename = info.author ? `${info.author} - ${info.title}` : info.title || existing.filename;
-        existing.thumbnail = info.thumbnail || existing.thumbnail;
+        existing.thumbnail = reliableThumbnail;
+        existing.youtubeId = info.videoId;
+        existing.url = `https://www.youtube.com/watch?v=${info.videoId}`;
+        existing.totalDuration = info.lengthSeconds || existing.totalDuration;
+        existing.isLive = info.isLive !== undefined ? info.isLive : existing.isLive;
         if (message.jsUrl) existing.jsUrl = message.jsUrl;
         if (message.adaptiveFormats && message.adaptiveFormats.length > 0) {
           existing.rawAdaptiveFormats = message.adaptiveFormats;
@@ -1332,6 +1717,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               itag: f.itag
             }));
         }
+
+        // Merge any captured direct audio/video URLs
+        if (pendingAudio) {
+          existing.directAudioUrls = Object.assign(existing.directAudioUrls || {}, pendingAudio);
+          if (!existing.audioUrl && pendingAudio.default) {
+            existing.audioUrl = pendingAudio.default;
+          }
+        }
+        if (pendingVideo) {
+          existing.directVideoUrls = Object.assign(existing.directVideoUrls || {}, pendingVideo);
+          if (!existing.videoUrl) {
+            existing.videoUrl = pendingVideo['1080'] || Object.values(pendingVideo)[0] || null;
+          }
+        }
+
         updateBadge(tabId);
         notifyPopup(tabId);
         return true;
@@ -1349,6 +1749,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const smartTitle = info.author
         ? `${info.author} - ${info.title}`
         : info.title || 'YouTube Video';
+      const initialAudioUrls = pendingAudio ? { ...pendingAudio } : {};
+      const initialVideoUrls = pendingVideo ? { ...pendingVideo } : {};
       tabMedia.set(id, {
         id,
         url: watchUrl,
@@ -1369,10 +1771,14 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         parsed: true,
         source: 'youtube',
         youtubeId: info.videoId,
-        thumbnail: info.thumbnail,
+        thumbnail: reliableThumbnail,
         jsUrl: message.jsUrl,
         rawAdaptiveFormats: message.adaptiveFormats || [],
         rawFormats: message.formats || [],
+        directAudioUrls: initialAudioUrls,
+        directVideoUrls: initialVideoUrls,
+        audioUrl: initialAudioUrls.default || null,
+        videoUrl: initialVideoUrls['1080'] || Object.values(initialVideoUrls)[0] || null,
         availableQualities: videoFormats
           .sort((a, b) => (b.height || 0) - (a.height || 0))
           .map(f => ({
@@ -1731,7 +2137,48 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   // Start background download (opens offscreen document and delegates task)
   if (message.type === 'START_DOWNLOAD') {
     const { itemId, item, downloadType, options } = message;
+    console.log('[MediaSniff SW] START_DOWNLOAD received:', { itemId, downloadType, options });
     (async () => {
+      // Sync latest direct URLs and audioUrl from mediaRegistry and pending maps
+      for (const [tId, tabMedia] of mediaRegistry.entries()) {
+        if (tabMedia.has(itemId)) {
+          const regItem = tabMedia.get(itemId);
+          if (regItem.directAudioUrls) {
+            item.directAudioUrls = Object.assign({}, regItem.directAudioUrls, item.directAudioUrls || {});
+          }
+          if (regItem.directVideoUrls) {
+            item.directVideoUrls = Object.assign({}, regItem.directVideoUrls, item.directVideoUrls || {});
+          }
+          if (regItem.audioUrl) {
+            item.audioUrl = regItem.audioUrl;
+          }
+          if (regItem.videoUrl && !item.videoUrl) {
+            item.videoUrl = regItem.videoUrl;
+          }
+          break;
+        }
+      }
+
+      const yId = item?.youtubeId || (item?.url && getActiveYouTubeVideoId(item.url));
+      if (yId) {
+        for (const [key, pendingA] of pendingYouTubeAudio.entries()) {
+          if (key.endsWith(`_${yId}`)) {
+            item.directAudioUrls = Object.assign({}, pendingA, item.directAudioUrls || {});
+            if (!item.audioUrl && (pendingA.mp4 || pendingA.default)) {
+              item.audioUrl = pendingA.mp4 || pendingA.default;
+            }
+          }
+        }
+        for (const [key, pendingV] of pendingYouTubeVideo.entries()) {
+          if (key.endsWith(`_${yId}`)) {
+            item.directVideoUrls = Object.assign({}, pendingV, item.directVideoUrls || {});
+            if (!item.videoUrl) {
+              item.videoUrl = pendingV['1080'] || Object.values(pendingV)[0];
+            }
+          }
+        }
+      }
+
       const referer = item?.referer || options?.referer || null;
       const involvedUrls = [item?.url];
       const qualityIndex = options?.qualityIndex !== undefined ? parseInt(options.qualityIndex) : 0;
@@ -1812,7 +2259,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             console.warn('[MediaSniff] Failed pre-fetching video variant in worker:', e.message);
           }
         }
-        if (selectedAudio && selectedAudio.url && (!selectedAudio.segments || selectedAudio.segments.length === 0)) {
+        if (selectedAudio && selectedAudio.url && (!selectedAudio.segments || selectedAudio.segments.length === 0 || !selectedAudio.initUrl)) {
           try {
             const aContent = await fetchManifest(selectedAudio.url, referer);
             const aParsed = HLSParser.parse(aContent, selectedAudio.url);
@@ -1907,7 +2354,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       //    ├─ Native available → native yt-dlp
       //    └─ Native unavailable → existing browser pipeline
       const isInstagram = item.source === 'instagram' || (item.url && (item.url.includes('instagram.com') || item.url.includes('cdninstagram.com')));
-      const isYouTube = downloadType === 'youtube' || (downloadType === 'ytdlp' && !isInstagram) || item.source === 'youtube' || (item.url && item.url.includes('youtube.com'));
+      const isYouTube = downloadType !== 'mux' && (downloadType === 'youtube' || (downloadType === 'ytdlp' && !isInstagram) || item.source === 'youtube' || (item.url && (item.url.includes('youtube.com') || item.url.includes('googlevideo.com'))));
       const isYtDlp = downloadType === 'ytdlp';
 
       // 2. Authenticated / Native-Required HLS / DASH:
@@ -1920,7 +2367,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         item.requiresNative
       );
 
-      if (isYouTube || isAuthStream || (isInstagram && isYtDlp)) {
+      if ((isYouTube && !options?.forceMux) || isAuthStream || (isInstagram && isYtDlp)) {
         const isNativeAvailable = await nativeBridge.connect();
 
         if (isNativeAvailable) {
@@ -1995,10 +2442,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       // 3. Public / Simple HLS/DASH or Native Fallback:
       //    → existing browser/WASM path
       await ensureOffscreen();
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise(r => setTimeout(r, 200));
+      const offscreenType = isYouTube ? 'youtube' : downloadType;
+      console.log('[MediaSniff SW] Dispatching START_BACKGROUND_DOWNLOAD to offscreen:', { itemId, downloadType: offscreenType, options });
       chrome.runtime.sendMessage({
         type: 'START_BACKGROUND_DOWNLOAD',
-        itemId, item, downloadType, options
+        itemId, item, downloadType: offscreenType, options
       });
     })().catch(err => {
       console.error('[MediaSniff] Failed to start background download:', err);
@@ -2130,12 +2579,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   mediaRegistry.delete(tabId);
   tabLastOrigin.delete(tabId);
+  tabLastTitle.delete(tabId);
+  for (const key of pendingYouTubeAudio.keys()) {
+    if (key.startsWith(`${tabId}_`)) pendingYouTubeAudio.delete(key);
+  }
+  for (const key of pendingYouTubeVideo.keys()) {
+    if (key.startsWith(`${tabId}_`)) pendingYouTubeVideo.delete(key);
+  }
   clearTabMediaStorage(tabId);
 });
 
-const tabLastOrigin = new Map();
-
-// Seed tabLastOrigin from currently open tabs
+// Seed tabLastOrigin and tabLastTitle from currently open tabs
 chrome.tabs.query({}, (tabs) => {
   if (tabs) {
     for (const t of tabs) {
@@ -2145,11 +2599,17 @@ chrome.tabs.query({}, (tabs) => {
           tabLastOrigin.set(t.id, urlObj.origin + urlObj.pathname + urlObj.search);
         } catch (_) {}
       }
+      if (t.id && t.title) {
+        tabLastTitle.set(t.id, t.title);
+      }
     }
   }
 });
 
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (tab?.title) {
+    tabLastTitle.set(tabId, tab.title);
+  }
   if (changeInfo.url) {
     try {
       const newUrlObj = new URL(changeInfo.url);
@@ -2162,6 +2622,12 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
         console.log(`[MediaSniff] Tab ${tabId} navigated from ${oldUrlPath} to ${newUrlPath}, clearing media.`);
         mediaRegistry.delete(tabId);
         clearTabMediaStorage(tabId);
+        for (const key of pendingYouTubeAudio.keys()) {
+          if (key.startsWith(`${tabId}_`)) pendingYouTubeAudio.delete(key);
+        }
+        for (const key of pendingYouTubeVideo.keys()) {
+          if (key.startsWith(`${tabId}_`)) pendingYouTubeVideo.delete(key);
+        }
         updateBadge(tabId);
         notifyPopup(tabId);
       }
@@ -2271,6 +2737,21 @@ function updateBadge(tabId) {
 
 const popupNotifyTimers = new Map();
 function notifyPopup(tabId, debounceMs = 0) {
+  // Diagnostic log for active YouTube items on this tab
+  const tabMedia = mediaRegistry.get(tabId);
+  if (tabMedia) {
+    for (const item of tabMedia.values()) {
+      if (item.source === 'youtube') {
+        console.log(`[YT ITEM] ${JSON.stringify({
+          youtubeId: item.youtubeId,
+          videoQualities: (item.availableQualities || []).map(q => q.label || `${q.height}p`),
+          hasDirectVideo: !!(item.directVideoUrls && Object.keys(item.directVideoUrls).length > 0),
+          directAudioKeys: item.directAudioUrls ? Object.keys(item.directAudioUrls) : []
+        })}`);
+      }
+    }
+  }
+
   if (debounceMs <= 0) {
     if (popupNotifyTimers.has(tabId)) {
       clearTimeout(popupNotifyTimers.get(tabId));

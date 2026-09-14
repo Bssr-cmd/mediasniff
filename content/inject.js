@@ -93,6 +93,20 @@
       }
 
       if (response && response.streamingData) {
+        if (response.adPlacement || response.playerAds || response.adSlots) return;
+
+        const videoId = response.videoDetails?.videoId;
+        if (!videoId) return;
+
+        if (location.hostname.includes('youtube.com')) {
+          let pageVideoId = null;
+          try {
+            pageVideoId = new URLSearchParams(location.search).get('v')
+              || location.pathname.match(/\/(?:shorts|live)\/([a-zA-Z0-9_-]+)/)?.[1];
+          } catch (_) {}
+          if (pageVideoId && videoId !== pageVideoId) return;
+        }
+
         let jsUrl = window.ytcfg && typeof window.ytcfg.get === 'function' ? window.ytcfg.get('PLAYER_JS_URL') : null;
         if (!jsUrl) {
           const scripts = Array.from(document.querySelectorAll('script'));
@@ -107,7 +121,6 @@
         if (jsUrl && jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
         else if (jsUrl && jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
 
-        const videoId = response.videoDetails?.videoId;
         if (videoId && window._lastSentYtVideoId === videoId) return;
         window._lastSentYtVideoId = videoId;
 
@@ -516,6 +529,18 @@
             if (response.ok) {
               response.clone().json().then(data => {
                 if (data && data.streamingData) {
+                  if (data.adPlacement || data.playerAds || data.adSlots) return;
+
+                  let pageVideoId = null;
+                  try {
+                    pageVideoId = new URLSearchParams(location.search).get('v')
+                      || location.pathname.match(/\/(?:shorts|live)\/([a-zA-Z0-9_-]+)/)?.[1];
+                  } catch (_) {}
+
+                  if (pageVideoId && data.videoDetails?.videoId && data.videoDetails.videoId !== pageVideoId) {
+                    return;
+                  }
+
                   let jsUrl = window.ytcfg && typeof window.ytcfg.get === 'function' ? window.ytcfg.get('PLAYER_JS_URL') : null;
                   if (jsUrl && jsUrl.startsWith('//')) jsUrl = 'https:' + jsUrl;
                   else if (jsUrl && jsUrl.startsWith('/')) jsUrl = 'https://www.youtube.com' + jsUrl;
@@ -833,4 +858,10 @@
   setTimeout(runScrapers, 500);
   setTimeout(runScrapers, 1500);
   setInterval(runScrapers, 5000);
+
+  // Instant YouTube SPA navigation update
+  document.addEventListener('yt-navigate-finish', () => {
+    window._lastSentYtVideoId = null;
+    setTimeout(getPlayerResponse, 150);
+  });
 })();

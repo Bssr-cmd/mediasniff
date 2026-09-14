@@ -387,11 +387,13 @@ function createMediaCard(item) {
   const isDrm = !!(item.isEncrypted || item.isProtected);
   const lockIcon = isDrm ? '🔒 ' : '';
 
+  const thumbUrl = item.thumbnail || (item.source === 'youtube' && item.youtubeId ? `https://i.ytimg.com/vi/${item.youtubeId}/hqdefault.jpg` : pageThumbnail);
+
   let html = `
     <div class="card-header">
-      ${item.thumbnail || pageThumbnail ? `
+      ${thumbUrl ? `
         <div class="card-thumb">
-          <img src="${escHtml(item.thumbnail || pageThumbnail)}" alt="" loading="lazy" onerror="if(this.src.includes('maxresdefault')){this.src=this.src.replace('maxresdefault','hqdefault')}else{this.style.display='none'}">
+          <img src="${escHtml(thumbUrl)}" alt="" loading="lazy" onerror="if(this.src.includes('maxresdefault')){this.src=this.src.replace('maxresdefault','hqdefault')}else{const p=this.closest('.card-thumb');if(p)p.style.display='none';this.style.display='none'}">
         </div>
       ` : ''}
       <div class="media-icon ${iconClass}">${iconSvg}</div>
@@ -406,7 +408,7 @@ function createMediaCard(item) {
     <div class="card-badges">
       ${item.source === 'youtube' ? '<span class="badge youtube">YOUTUBE</span>' : item.source === 'instagram' ? '<span class="badge instagram">INSTAGRAM</span>' : `<span class="badge ${item.streamType}">${item.streamType.toUpperCase()}</span>`}
       <span class="badge ${item.type}">${item.type.toUpperCase()}</span>
-      ${item.sizeLabel && item.sizeLabel !== 'Unknown' && item.sizeLabel.toUpperCase() !== item.streamType?.toUpperCase() && item.sizeLabel.toUpperCase() !== item.type?.toUpperCase() ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
+      ${item.sizeLabel && item.sizeLabel !== 'Unknown' && item.sizeLabel.toUpperCase() !== item.streamType?.toUpperCase() && item.sizeLabel.toUpperCase() !== item.type?.toUpperCase() && item.sizeLabel.toUpperCase() !== item.source?.toUpperCase() ? `<span class="badge size">${item.sizeLabel}</span>` : ''}
       ${item.totalDuration ? `<span class="badge duration">${formatDuration(item.totalDuration)}</span>` : ''}
       ${item.segmentCount > 0 ? `<span class="badge segments">${item.segmentCount} segs</span>` : ''}
       ${isDrm ? `<span class="badge drm">${lockIcon}DRM</span>` : ''}
@@ -450,6 +452,23 @@ function createMediaCard(item) {
         ${item.audioRenditions.map((a, i) => `<option value="${i}">${a.name || a.language || 'Track ' + (i + 1)}${a.label ? ' (' + a.label + ')' : ''}</option>`).join('')}
       </select>
     </div>`;
+  } else if (item.source === 'youtube' && ((item.directAudioUrls && Object.keys(item.directAudioUrls).length > 0) || item.audioUrl)) {
+    const audioOpts = [];
+    if (item.directAudioUrls?.['mp4'] || item.directAudioUrls?.['default'] || item.audioUrl) {
+      audioOpts.push('<option value="mp4">Original Audio (AAC 128k)</option>');
+    }
+    if (item.directAudioUrls?.['webm']) {
+      audioOpts.push('<option value="webm">High Quality Audio (Opus 160k)</option>');
+    }
+    if (audioOpts.length > 0) {
+      html += `
+      <div class="audio-section quality-section">
+        <div class="quality-label">Audio Track</div>
+        <select class="quality-select" id="audio-${item.id}">
+          ${audioOpts.join('')}
+        </select>
+      </div>`;
+    }
   }
 
   // Subtitle download options — auto-download subs alongside video
@@ -485,7 +504,7 @@ function createMediaCard(item) {
       <button class="btn btn-download" id="dl-${item.id}" title="Download">
         ${ICONS.download} Download
       </button>
-      ${(item.variants?.length > 0 && item.audioRenditions?.length > 0) ? `
+      ${(item.variants?.length > 0 && item.audioRenditions?.length > 0) || (item.source === 'youtube') ? `
         <button class="btn btn-mux" id="mux-${item.id}" title="Download & combine video+audio">
           ${ICONS.mux} Mux
         </button>
@@ -583,7 +602,11 @@ function createMediaCard(item) {
   // Mux button
   const muxBtn = card.querySelector(`#mux-${item.id}`);
   if (muxBtn) {
-    muxBtn.addEventListener('click', () => handleMuxDownload(item));
+    if (item.source === 'youtube' || (item.url && (item.url.includes('youtube.com') || item.url.includes('googlevideo.com')))) {
+      muxBtn.addEventListener('click', () => handleYouTubeMux(item));
+    } else {
+      muxBtn.addEventListener('click', () => handleMuxDownload(item));
+    }
   }
 
   const streamToDiskBtn = card.querySelector(`#streamToDisk-${item.id}`);
@@ -799,9 +822,25 @@ async function handleDownload(item) {
     return;
   }
 
-  // YouTube videos — use background YouTube downloader
-  if (item.source === 'youtube') {
+  // YouTube videos — use dedicated background YouTube pipeline
+  if (item.source === 'youtube' || (item.url && (item.url.includes('youtube.com') || item.url.includes('googlevideo.com')))) {
     await handleYouTubeDownload(item);
+    return;
+  }
+
+  // If HLS/DASH stream has separate audio renditions, we MUST mux it to get audio!
+  if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url || a.uri)) {
+    const qualitySelect = document.getElementById(`quality-${item.id}`);
+    const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
+    const variant = item.variants?.[qualityIndex];
+    const height = variant?.height;
+    if (item.directMp4Urls && height && item.directMp4Urls[height]) {
+      const filename = getSmartName(item);
+      chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: item.directMp4Urls[height], filename });
+      showToast('Downloading direct MP4...');
+      return;
+    }
+    await handleMuxDownload(item);
     return;
   }
 
@@ -839,22 +878,6 @@ async function handleDownload(item) {
     return;
   }
 
-  // If HLS/DASH stream has separate audio renditions, we MUST mux it to get audio!
-  if (item.audioRenditions && item.audioRenditions.length > 0 && item.audioRenditions.some(a => a.url || a.uri)) {
-    const qualitySelect = document.getElementById(`quality-${item.id}`);
-    const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
-    const variant = item.variants?.[qualityIndex];
-    const height = variant?.height;
-    if (item.directMp4Urls && height && item.directMp4Urls[height]) {
-      const filename = getSmartName(item);
-      chrome.runtime.sendMessage({ type: 'DOWNLOAD_DIRECT', url: item.directMp4Urls[height], filename });
-      showToast('Downloading direct MP4...');
-      return;
-    }
-    await handleMuxDownload(item);
-    return;
-  }
-
   // Streaming download — delegate to background
   const qualitySelect = document.getElementById(`quality-${item.id}`);
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
@@ -889,10 +912,35 @@ async function handleYouTubeDownload(item) {
   });
 }
 
+async function handleYouTubeMux(item) {
+  const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
+  const ytQuality = ytQualitySelect ? ytQualitySelect.value : '1080';
+  const filename = getSmartName(item);
+
+  setCardDownloadStarting(item.id, 'Starting YouTube mux...');
+
+  chrome.runtime.sendMessage({
+    type: 'START_DOWNLOAD',
+    itemId: item.id,
+    item,
+    downloadType: 'youtube',
+    options: {
+      filename,
+      ytQuality,
+      forceMux: true
+    }
+  });
+}
+
 async function handleMuxDownload(item) {
   if (item.isEncrypted) {
     showToast('Cannot download DRM-protected content');
     return;
+  }
+
+  // YouTube items — route through dedicated YouTube muxing pipeline
+  if (item.source === 'youtube' || (item.url && (item.url.includes('youtube.com') || item.url.includes('googlevideo.com')))) {
+    return handleYouTubeMux(item);
   }
 
   const qualitySelect = document.getElementById(`quality-${item.id}`);
@@ -974,6 +1022,17 @@ async function downloadSubtitles(item, videoFilename) {
 
 // ─── Helpers ────────────────────────────────────────────────────────
 function getSelectedUrl(item) {
+  const ytQualitySelect = document.getElementById(`ytquality-${item.id}`);
+  if (ytQualitySelect) {
+    const qVal = ytQualitySelect.value;
+    if (item.directVideoUrls && item.directVideoUrls[qVal]) return item.directVideoUrls[qVal];
+    if (item.directMp4Urls && item.directMp4Urls[qVal]) return item.directMp4Urls[qVal];
+    if (item.directVideoUrls?.['default']) return item.directVideoUrls['default'];
+  }
+  if (item.directVideoUrls) {
+    const firstVal = Object.values(item.directVideoUrls)[0];
+    if (firstVal) return firstVal;
+  }
   const qualitySelect = document.getElementById(`quality-${item.id}`);
   if (qualitySelect) {
     const val = qualitySelect.value;
@@ -986,6 +1045,7 @@ function getSelectedUrl(item) {
       if (item.availableQualities && item.availableQualities[idx]?.url) return item.availableQualities[idx].url;
     }
   }
+  if (item.videoUrl) return item.videoUrl;
   if (item.availableQualities && item.availableQualities[0]?.url) {
     return item.availableQualities[0].url;
   }
