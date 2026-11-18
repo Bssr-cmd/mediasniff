@@ -4,6 +4,9 @@ import { WASMMuxer } from '../lib/muxer.js';
 import { TSToMP4Converter } from '../lib/ts-converter.js';
 import { YouTubeDownloader } from '../lib/youtube-downloader.js';
 
+export const MEDIA_SNIFF_BUILD = 'YT-AUDIO-FIX-2026-09-14-01';
+console.log('[MediaSniff Offscreen] Build:', MEDIA_SNIFF_BUILD);
+
 function parseCipher(cipherStr) {
   const params = {};
   const parts = cipherStr.split('&');
@@ -290,42 +293,56 @@ class DownloadTask {
     let videoSegments = videoVariant?.segments;
     let videoInitUrl = videoVariant?.initUrl;
     const videoUrl = videoVariant?.url || videoVariant?.uri;
-    // Direct stream track muxing (e.g. Instagram DASH single-file tracks)
-    if ((!videoSegments || videoSegments.length === 0) && videoUrl && (videoVariant.isDash || !videoUrl.includes('.m3u8'))) {
+    const isHls = this.item.streamType === 'hls' || this.item.type === 'hls' || Boolean(videoVariant?.isHls);
+
+    // Direct stream track muxing (e.g. Instagram DASH single-file tracks, NEVER for HLS streams)
+    if (!isHls && (!videoSegments || videoSegments.length === 0) && videoUrl && (videoVariant.isDash || videoVariant.isDirect || this.item.source === 'instagram')) {
       this.reportProgress(10, 'Downloading video track...', '');
       const respV = await fetch(videoUrl, { signal: this.abortController?.signal });
       if (!respV.ok) throw new Error(`Failed to download video track: ${respV.status}`);
       const videoBuffer = await respV.arrayBuffer();
 
-      let audioBuffer = null;
-      const directAudioUrl = audioRendition?.url || audioRendition?.uri;
-      if (directAudioUrl) {
-        this.reportProgress(50, 'Downloading audio track...', '');
-        const respA = await fetch(directAudioUrl, { signal: this.abortController?.signal });
-        if (!respA.ok) throw new Error(`Failed to download audio track: HTTP ${respA.status}`);
-        audioBuffer = await respA.arrayBuffer();
-      }
-      if (audioRendition && (!audioBuffer || audioBuffer.byteLength === 0)) {
-        throw new Error('Audio download failed: unable to fetch audio track for muxing.');
-      }
+      // Content sniffing: verify videoBuffer is not an HLS playlist starting with #EXTM3U
+      const headerStr = new TextDecoder('utf-8').decode(new Uint8Array(videoBuffer.slice(0, 15)));
+      if (headerStr.startsWith('#EXTM3U')) {
+        const textV = new TextDecoder('utf-8').decode(videoBuffer);
+        const { HLSParser } = await import(chrome.runtime.getURL('lib/hls-parser.js'));
+        const parsedV = HLSParser.parse(textV, videoUrl);
+        if (parsedV.segments && parsedV.segments.length > 0) {
+          videoSegments = parsedV.segments;
+          videoInitUrl = parsedV.initSegment || null;
+        }
+      } else {
+        let audioBuffer = null;
+        const directAudioUrl = audioRendition?.url || audioRendition?.uri;
+        if (directAudioUrl) {
+          this.reportProgress(50, 'Downloading audio track...', '');
+          const respA = await fetch(directAudioUrl, { signal: this.abortController?.signal });
+          if (!respA.ok) throw new Error(`Failed to download audio track: HTTP ${respA.status}`);
+          audioBuffer = await respA.arrayBuffer();
+        }
+        if (audioRendition && (!audioBuffer || audioBuffer.byteLength === 0)) {
+          throw new Error('Audio download failed: unable to fetch audio track for muxing.');
+        }
 
-      this.reportProgress(80, 'Muxing tracks (WASM)...', '');
-      const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
-        const overall = Math.round(80 + progress * 0.15);
-        this.reportProgress(overall, 'Muxing tracks (WASM)...', '');
-      });
+        this.reportProgress(80, 'Muxing tracks (WASM)...', '');
+        const muxedBlob = await WASMMuxer.mux(videoBuffer, audioBuffer, (progress) => {
+          const overall = Math.round(80 + progress * 0.15);
+          this.reportProgress(overall, 'Muxing tracks (WASM)...', '');
+        });
 
-      const muxedBuf = await muxedBlob.arrayBuffer();
-      const val = WASMMuxer.validateMP4(new Uint8Array(muxedBuf), !!audioRendition);
-      if (!val.valid) {
-        throw new Error(`Generated MP4 validation failed: ${val.error}`);
+        const muxedBuf = await muxedBlob.arrayBuffer();
+        const val = WASMMuxer.validateMP4(new Uint8Array(muxedBuf), !!audioRendition);
+        if (!val.valid) {
+          throw new Error(`Generated MP4 validation failed: ${val.error}`);
+        }
+
+        let muxFilename = this.options.filename || 'download.mp4';
+        muxFilename = muxFilename.replace(/\.[^.]+$/, '') + '.mp4';
+        await this.triggerSave(new Blob([muxedBuf], { type: 'video/mp4' }), muxFilename);
+        this.reportStatus('complete', 'Complete!');
+        return;
       }
-
-      let muxFilename = this.options.filename || 'download.mp4';
-      muxFilename = muxFilename.replace(/\.[^.]+$/, '') + '.mp4';
-      await this.triggerSave(new Blob([muxedBuf], { type: 'video/mp4' }), muxFilename);
-      this.reportStatus('complete', 'Complete!');
-      return;
     }
 
     if ((!videoSegments || videoSegments.length === 0) && videoUrl) {
@@ -604,7 +621,7 @@ class DownloadTask {
       if (itemAudio) return itemAudio;
       if (directAudio.mp4) return directAudio.mp4;
     } else {
-      // For MP4 video
+      // For MP4 video: prefer MP4/AAC audio, but fall back to WebM/Opus audio if that is all that was captured
       if (directAudio.mp4) return directAudio.mp4;
       if (directAudio.default && !directAudio.default.includes('mime=audio%2Fwebm') && !directAudio.default.includes('mime=audio/webm') && !directAudio.default.includes('itag=251') && !directAudio.default.includes('itag=250') && !directAudio.default.includes('itag=249')) {
         return directAudio.default;
@@ -614,6 +631,7 @@ class DownloadTask {
       }
       if (directAudio.default) return directAudio.default;
       if (itemAudio) return itemAudio;
+      if (directAudio.webm) return directAudio.webm;
     }
 
     return null;
@@ -778,13 +796,17 @@ class DownloadTask {
         try {
           const result = await YouTubeDownloader.getDownloadUrl(targetWatchUrl, targetHeightStr);
           if (result) {
-            const returnedVideo = result.url || result.videoUrl;
-            if (!videoUrl && returnedVideo) {
-              videoUrl = returnedVideo;
-              if (result.isCombined !== undefined) isCombined = result.isCombined;
-            }
-            if (!audioUrl && result.audioUrl) {
-              audioUrl = result.audioUrl;
+            if (result.isCombined) {
+              videoUrl = result.url || result.videoUrl;
+              audioUrl = null;
+              isCombined = true;
+            } else {
+              if (result.url || result.videoUrl) {
+                videoUrl = result.url || result.videoUrl;
+              }
+              if (result.audioUrl) {
+                audioUrl = result.audioUrl;
+              }
             }
             if (result.filename && !resultFilename) {
               resultFilename = result.filename;
@@ -829,7 +851,18 @@ class DownloadTask {
       const isCurrentWebm = (videoUrl && (videoUrl.includes('mime=video%2Fwebm') || videoUrl.includes('mime=video/webm'))) || resultFilename?.endsWith('.webm');
       audioUrl = this.getBestDirectAudioUrl(isCurrentWebm);
       if (!audioUrl) {
-        audioUrl = this.item.directAudioUrls?.mp4 || this.item.directAudioUrls?.default || this.item.audioUrl || null;
+        audioUrl = this.item.directAudioUrls?.mp4 || this.item.directAudioUrls?.default || this.item.directAudioUrls?.webm || this.item.audioUrl || null;
+      }
+    }
+
+    // Direct combined format fallback from rawFormats if audio is still missing
+    if (!isCombined && !audioUrl && this.item.rawFormats?.length > 0) {
+      const directCombined = this.item.rawFormats.find(f => f.url && !f.signatureCipher && !f.cipher);
+      if (directCombined?.url) {
+        videoUrl = directCombined.url;
+        audioUrl = null;
+        isCombined = true;
+        console.log('[MediaSniff Offscreen] Falling back to direct combined format from rawFormats:', directCombined.itag);
       }
     }
 
@@ -838,16 +871,13 @@ class DownloadTask {
       throw new Error('Unable to resolve YouTube video stream: no usable direct, adaptive, or fallback video URL was found.');
     }
     if (!isCombined && !audioUrl) {
-      const isWebmVideo = (videoUrl && (videoUrl.includes('mime=video%2Fwebm') || videoUrl.includes('mime=video/webm'))) || (this.item.mimeType && this.item.mimeType.includes('webm'));
-      console.log('[YT AUDIO RESOLVE FINAL]', {
-        requestedQuality: this.options.ytQuality,
-        isWebmVideo,
+      console.log('[YT AUDIO FINAL INPUT]', {
         directAudioKeys: Object.keys(this.item.directAudioUrls || {}),
         directMp4: !!this.item.directAudioUrls?.mp4,
         directWebm: !!this.item.directAudioUrls?.webm,
         directDefault: !!this.item.directAudioUrls?.default,
         itemAudioUrl: !!this.item.audioUrl,
-        rawAudioCount: this._resolvedAudioStreams?.length || 0
+        resolvedAudioCount: this._resolvedAudioStreams?.length || 0
       });
 
       throw new Error(
@@ -855,37 +885,24 @@ class DownloadTask {
       );
     }
 
+    console.log('[YT AUDIO FINAL INPUT]', {
+      directAudioKeys: Object.keys(this.item.directAudioUrls || {}),
+      directMp4: !!this.item.directAudioUrls?.mp4,
+      directWebm: !!this.item.directAudioUrls?.webm,
+      directDefault: !!this.item.directAudioUrls?.default,
+      itemAudioUrl: !!this.item.audioUrl,
+      resolvedAudioCount: this._resolvedAudioStreams?.length || 0
+    });
+
+    console.log('[YT RESOLVED STREAMS]', {
+      videoUrl: !!videoUrl,
+      audioUrl: !!audioUrl,
+      isCombined
+    });
+
     this.reportProgress(10, 'Video URL resolved', '');
     if (!isCombined && audioUrl) {
       this.reportProgress(15, 'Audio URL resolved', '');
-    }
-
-    // ─── YouTube 'n' parameter Anti-403 Bypass ───
-    let validNParam = null;
-    if (this.item.directVideoUrls || this.item.directAudioUrls) {
-      const anyDirect = (this.item.directVideoUrls && Object.values(this.item.directVideoUrls)[0]) 
-                     || (this.item.directAudioUrls && (this.item.directAudioUrls['mp4'] || this.item.directAudioUrls['default']));
-      if (anyDirect) {
-        try {
-          validNParam = new URL(anyDirect).searchParams.get('n');
-        } catch(e) {}
-      }
-    }
-    
-    if (validNParam) {
-      const injectN = (uStr) => {
-        if (!uStr) return uStr;
-        try {
-          const u = new URL(uStr);
-          if (u.hostname.includes('googlevideo.com') && u.searchParams.has('n')) {
-            u.searchParams.set('n', validNParam);
-            return u.href;
-          }
-        } catch(e) {}
-        return uStr;
-      };
-      videoUrl = injectN(videoUrl);
-      audioUrl = injectN(audioUrl);
     }
 
     // ─── Download and Mux Pipeline ───
@@ -952,10 +969,6 @@ class DownloadTask {
         throw new Error('Audio buffer is empty. Cannot produce a valid video with audio.');
       }
 
-      if (videoFormat === 'mp4' && audioFormat === 'webm') {
-        throw new Error('Incompatible audio container (received WebM audio for MP4 video container).');
-      }
-
       // Try native companion muxing if available
       try {
         const nativeResult = await this.triggerNativeDownload(
@@ -963,11 +976,15 @@ class DownloadTask {
           audioUrl,
           resultFilename
         );
-        if (nativeResult && nativeResult.status === 'complete') {
+        if (nativeResult && (nativeResult.status === 'complete' || nativeResult.success)) {
           this.reportStatus('complete', nativeResult.statusLabel || 'Complete!');
           return;
         }
       } catch (_) {}
+
+      if (videoFormat === 'mp4' && audioFormat === 'webm') {
+        throw new Error('Incompatible audio container (received WebM audio for MP4 video container). Please install/connect the Companion App to mux MP4 video with WebM audio.');
+      }
 
       // In-browser WASM Mux (82% to 95%)
       this.reportProgress(82, 'Remuxing tracks (WASM)...', '');

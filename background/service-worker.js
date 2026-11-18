@@ -6,6 +6,9 @@ import { HLSParser } from '../lib/hls-parser.js';
 import { DASHParser } from '../lib/dash-parser.js';
 import { MSG_TYPE, generateMediaId, ERROR_TYPE, classifyError } from '../shared/protocol.js';
 
+export const MEDIA_SNIFF_BUILD = 'YT-AUDIO-FIX-2026-09-14-01';
+console.log('[MediaSniff SW] Build:', MEDIA_SNIFF_BUILD);
+
 // ─── Native Messaging Bridge ─────────────────────────────────────────
 // Single managed connection to the native companion app (coapp.py).
 // The service worker is the ONLY context allowed to call connectNative in MV3.
@@ -385,15 +388,41 @@ chrome.webRequest.onCompleted.addListener(
   { urls: ['<all_urls>'], types: ['media', 'xmlhttprequest', 'other'] },
   ['responseHeaders']
 );
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    if (GOOGLEVIDEO_PATTERN.test(details.url)) {
+      handleRequest(details);
+    }
+  },
+  { urls: ['<all_urls>'] }
+);
+console.log('[MediaSniff SW] Initialized and listening for webRequest');
 const inFlightRequests = new Set();
 async function handleRequest(details) {
   await storageInitPromise;
   // Skip extension/internal requests
-  if (details.tabId < 0) return;
+  if (details.tabId < 0) {
+    if (!GOOGLEVIDEO_PATTERN.test(details.url)) return;
+    for (const [tId, map] of mediaRegistry.entries()) {
+      if (Array.from(map.values()).some(m => m.source === 'youtube')) {
+        details.tabId = tId;
+        break;
+      }
+    }
+    if (details.tabId < 0) {
+      for (const [tId, origin] of tabLastOrigin.entries()) {
+        if (origin.includes('youtube.com')) {
+          details.tabId = tId;
+          break;
+        }
+      }
+    }
+    if (details.tabId < 0) return;
+  }
   if (IGNORE_PATTERNS.some(p => p.test(details.url))) return;
   if (details.type === 'image' || details.type === 'stylesheet' || details.type === 'font') return;
 
-  const reqKey = `${details.tabId}_${details.url}`;
+  const reqKey = `${details.tabId}_${details.url}_${details.responseHeaders ? 'completed' : 'before'}`;
   if (inFlightRequests.has(reqKey)) return;
   inFlightRequests.add(reqKey);
   setTimeout(() => inFlightRequests.delete(reqKey), 4000);
@@ -487,8 +516,17 @@ async function handleRequest(details) {
         } catch (_) {}
       }
 
-      // Also check if an active YouTube item already exists on this tab
-      const existingYt = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId);
+      // Also check if an active YouTube item already exists on this tab or any tab
+      let existingYt = Array.from(tabMedia.values()).find(m => m.source === 'youtube' && m.youtubeId);
+      if (!existingYt && mediaRegistry.size > 0) {
+        for (const map of mediaRegistry.values()) {
+          const cand = Array.from(map.values()).find(m => m.source === 'youtube' && m.youtubeId);
+          if (cand) {
+            existingYt = cand;
+            break;
+          }
+        }
+      }
       if (!activeVideoId && existingYt) {
         activeVideoId = existingYt.youtubeId;
       }
@@ -497,16 +535,22 @@ async function handleRequest(details) {
       if (!activeVideoId) {
         for (const k of pendingYouTubeVideo.keys()) {
           if (k.startsWith(`${details.tabId}_`)) {
-            activeVideoId = k.slice(`${details.tabId}_`.length);
-            break;
+            const cand = k.slice(`${details.tabId}_`.length);
+            if (cand && cand !== 'active') {
+              activeVideoId = cand;
+              break;
+            }
           }
         }
       }
       if (!activeVideoId) {
         for (const k of pendingYouTubeAudio.keys()) {
           if (k.startsWith(`${details.tabId}_`)) {
-            activeVideoId = k.slice(`${details.tabId}_`.length);
-            break;
+            const cand = k.slice(`${details.tabId}_`.length);
+            if (cand && cand !== 'active') {
+              activeVideoId = cand;
+              break;
+            }
           }
         }
       }
@@ -520,7 +564,7 @@ async function handleRequest(details) {
       }
 
       // If no valid active video identity exists on the tab, do NOT create or process YouTube media
-      if (!activeVideoId) {
+      if (!activeVideoId && !isAudio) {
         return;
       }
 
@@ -552,10 +596,13 @@ async function handleRequest(details) {
           ytItem.videoUrl = cleanUrl;
 
           // Buffer in pendingYouTubeVideo
-          let pendingV = pendingYouTubeVideo.get(`${details.tabId}_${activeVideoId}`) || {};
+          let pendingV = pendingYouTubeVideo.get(`${details.tabId}_${activeVideoId || 'active'}`) || {};
           pendingV[heightStr] = cleanUrl;
           pendingV['default'] = cleanUrl;
-          pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId}`, pendingV);
+          pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId || 'active'}`, pendingV);
+          if (activeVideoId) {
+            pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId}`, pendingV);
+          }
 
           if (!ytItem.availableQualities) ytItem.availableQualities = [];
           if (!ytItem.availableQualities.some(q => q.height === formatHeight)) {
@@ -569,7 +616,7 @@ async function handleRequest(details) {
             ytItem.availableQualities.sort((a, b) => (b.height || 0) - (a.height || 0));
           }
         } else if (isAudio) {
-          let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+          let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId || 'active'}`) || {};
 
           if (isMp4Audio) {
             let shouldUpdate = true;
@@ -609,17 +656,30 @@ async function handleRequest(details) {
             }
           }
 
-          pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+          pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId || 'active'}`, pendingA);
+          if (activeVideoId) {
+            pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+          }
 
-          console.log('[YT AUDIO CAPTURE]', {
+          console.log('[YT AUDIO RUNTIME CAPTURE]', {
             tabId: details.tabId,
-            videoId: activeVideoId,
-            itag,
+            activeVideoId: activeVideoId || null,
+            requestVideoId: urlParams.get('id') || '',
+            docid: docId || '',
+            itag: itagNum,
             mime,
-            source: 'googlevideo',
-            matchedActiveItem: true,
-            buffered: true,
-            directAudioKeys: Object.keys(ytItem.directAudioUrls || {})
+            matchedItemId: ytItem.id,
+            attached: true,
+            buffered: true
+          });
+
+          console.log('[YT ITEM AFTER AUDIO]', {
+            itemId: ytItem.id,
+            youtubeId: ytItem.youtubeId,
+            directAudioKeys: Object.keys(ytItem.directAudioUrls || {}),
+            hasMp4Audio: Boolean(ytItem.directAudioUrls?.mp4),
+            hasWebmAudio: Boolean(ytItem.directAudioUrls?.webm),
+            hasAudioUrl: Boolean(ytItem.audioUrl)
           });
         }
         notifyPopup(details.tabId);
@@ -630,7 +690,7 @@ async function handleRequest(details) {
       // Store in pendingYouTubeAudio so it is merged when video / YOUTUBE_DATA arrives.
       // Do NOT create an audio-only card or a second YouTube card.
       if (isAudio) {
-        let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+        let pendingA = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId || 'active'}`) || {};
         if (isMp4Audio) {
           let shouldUpdate = true;
           if (pendingA.mp4) {
@@ -658,17 +718,21 @@ async function handleRequest(details) {
             if (!pendingA.default || !pendingA.mp4) pendingA.default = cleanUrl;
           }
         }
-        pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+        pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId || 'active'}`, pendingA);
+        if (activeVideoId) {
+          pendingYouTubeAudio.set(`${details.tabId}_${activeVideoId}`, pendingA);
+        }
 
-        console.log('[YT AUDIO CAPTURE]', {
+        console.log('[YT AUDIO RUNTIME CAPTURE]', {
           tabId: details.tabId,
-          videoId: activeVideoId,
-          itag,
+          activeVideoId: activeVideoId || null,
+          requestVideoId: urlParams.get('id') || '',
+          docid: docId || '',
+          itag: itagNum,
           mime,
-          source: 'googlevideo',
-          matchedActiveItem: false,
-          buffered: true,
-          directAudioKeys: Object.keys(pendingA)
+          matchedItemId: null,
+          attached: false,
+          buffered: true
         });
         return;
       }
@@ -692,7 +756,7 @@ async function handleRequest(details) {
       pendingYouTubeVideo.set(`${details.tabId}_${activeVideoId}`, pendingV);
 
       // Merge buffered audio if any
-      const pendingAudio = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || {};
+      const pendingAudio = pendingYouTubeAudio.get(`${details.tabId}_${activeVideoId}`) || pendingYouTubeAudio.get(`${details.tabId}_active`) || {};
 
       const id = `media_${++idCounter}`;
       const fallbackItem = {
@@ -729,6 +793,15 @@ async function handleRequest(details) {
         }],
         timestamp: Date.now()
       };
+
+      console.log('[YT ITEM AFTER AUDIO]', {
+        itemId: fallbackItem.id,
+        youtubeId: fallbackItem.youtubeId,
+        directAudioKeys: Object.keys(fallbackItem.directAudioUrls || {}),
+        hasMp4Audio: Boolean(fallbackItem.directAudioUrls?.mp4),
+        hasWebmAudio: Boolean(fallbackItem.directAudioUrls?.webm),
+        hasAudioUrl: Boolean(fallbackItem.audioUrl)
+      });
 
       tabMedia.set(id, fallbackItem);
       updateBadge(details.tabId);
@@ -882,7 +955,7 @@ async function handleRequest(details) {
           if (streamType === 'hls') {
             await parseHLSManifest(item, manifestContent, url, details.tabId);
           } else {
-            parseDASHManifest(item, manifestContent, url);
+            await parseDASHManifest(item, manifestContent, url);
           }
           item.parsed = true;
           if (tabMedia.has(id)) {
@@ -1507,6 +1580,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     sendResponse({ success: true });
     return true;
   }
+  if (message.type === 'GET_DIAGNOSTIC_STATE') {
+    let activeItem = null;
+    const allItems = [];
+    for (const map of mediaRegistry.values()) {
+      allItems.push(...map.values());
+    }
+    const ytItem = allItems.find(i => i.source === 'youtube' || i.youtubeId);
+    if (ytItem) {
+      activeItem = {
+        id: ytItem.id,
+        youtubeId: ytItem.youtubeId,
+        directVideoKeys: Object.keys(ytItem.directVideoUrls || {}),
+        directAudioKeys: Object.keys(ytItem.directAudioUrls || {}),
+        hasMp4Audio: Boolean(ytItem.directAudioUrls?.mp4),
+        hasWebmAudio: Boolean(ytItem.directAudioUrls?.webm),
+        audioUrl: ytItem.audioUrl,
+        videoUrl: ytItem.videoUrl
+      };
+    }
+    sendResponse({
+      build: MEDIA_SNIFF_BUILD,
+      itemCount: allItems.length,
+      activeYouTubeItem: activeItem,
+      pendingAudioEntries: Array.from(pendingYouTubeAudio.entries()).map(([k, v]) => ({ key: k, formats: Object.keys(v || {}) })),
+      pendingVideoEntries: Array.from(pendingYouTubeVideo.entries()).map(([k, v]) => ({ key: k, formats: Object.keys(v || {}) }))
+    });
+    return true;
+  }
   if (message.type === 'MANIFEST_DETECTED') {
   if (sender.tab) {
     const tabId = sender.tab.id;
@@ -1646,6 +1747,19 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     return;
   }
+  // Sniffed GoogleVideo URL from content script
+  if (message.type === 'SNIFFED_GOOGLEVIDEO_URL') {
+    if (sender.tab && message.url) {
+      handleRequest({
+        tabId: sender.tab.id,
+        url: message.url,
+        documentUrl: sender.tab.url,
+        initiator: sender.tab.url,
+        type: 'media'
+      });
+    }
+    return;
+  }
   // YouTube player data from content script
   if (message.type === 'YOUTUBE_DATA') {
     if (sender.tab) {
@@ -1681,8 +1795,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
 
       const pendingKey = `${tabId}_${info.videoId}`;
-      const pendingAudio = pendingYouTubeAudio.get(pendingKey);
-      const pendingVideo = pendingYouTubeVideo.get(pendingKey);
+      const pendingAudio = Object.assign({}, pendingYouTubeAudio.get(`${tabId}_active`) || {}, pendingYouTubeAudio.get(pendingKey) || {});
+      const pendingVideo = Object.assign({}, pendingYouTubeVideo.get(`${tabId}_active`) || {}, pendingYouTubeVideo.get(pendingKey) || {});
 
       if (existing) {
         // Update placeholder or fallback card with latest official player data
@@ -1719,18 +1833,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         }
 
         // Merge any captured direct audio/video URLs
-        if (pendingAudio) {
+        if (Object.keys(pendingAudio).length > 0) {
           existing.directAudioUrls = Object.assign(existing.directAudioUrls || {}, pendingAudio);
-          if (!existing.audioUrl && pendingAudio.default) {
-            existing.audioUrl = pendingAudio.default;
+          if (!existing.audioUrl && (pendingAudio.mp4 || pendingAudio.default || pendingAudio.webm)) {
+            existing.audioUrl = pendingAudio.mp4 || pendingAudio.default || pendingAudio.webm;
           }
         }
-        if (pendingVideo) {
+        if (Object.keys(pendingVideo).length > 0) {
           existing.directVideoUrls = Object.assign(existing.directVideoUrls || {}, pendingVideo);
           if (!existing.videoUrl) {
             existing.videoUrl = pendingVideo['1080'] || Object.values(pendingVideo)[0] || null;
           }
         }
+
+        console.log('[YT ITEM AFTER AUDIO]', {
+          itemId: existing.id,
+          youtubeId: existing.youtubeId,
+          directAudioKeys: Object.keys(existing.directAudioUrls || {}),
+          hasMp4Audio: Boolean(existing.directAudioUrls?.mp4),
+          hasWebmAudio: Boolean(existing.directAudioUrls?.webm),
+          hasAudioUrl: Boolean(existing.audioUrl)
+        });
 
         updateBadge(tabId);
         notifyPopup(tabId);
@@ -1777,7 +1900,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         rawFormats: message.formats || [],
         directAudioUrls: initialAudioUrls,
         directVideoUrls: initialVideoUrls,
-        audioUrl: initialAudioUrls.default || null,
+        audioUrl: initialAudioUrls.mp4 || initialAudioUrls.default || initialAudioUrls.webm || null,
         videoUrl: initialVideoUrls['1080'] || Object.values(initialVideoUrls)[0] || null,
         availableQualities: videoFormats
           .sort((a, b) => (b.height || 0) - (a.height || 0))
@@ -1790,6 +1913,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           })),
         timestamp: Date.now()
       });
+
+      const newItem = tabMedia.get(id);
+      console.log('[YT ITEM AFTER AUDIO]', {
+        itemId: newItem.id,
+        youtubeId: newItem.youtubeId,
+        directAudioKeys: Object.keys(newItem.directAudioUrls || {}),
+        hasMp4Audio: Boolean(newItem.directAudioUrls?.mp4),
+        hasWebmAudio: Boolean(newItem.directAudioUrls?.webm),
+        hasAudioUrl: Boolean(newItem.audioUrl)
+      });
+
       updateBadge(tabId);
       notifyPopup(tabId);
     }
@@ -2136,25 +2270,21 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   // Start background download (opens offscreen document and delegates task)
   if (message.type === 'START_DOWNLOAD') {
-    const { itemId, item, downloadType, options } = message;
+    let { itemId, item, downloadType, options } = message;
     console.log('[MediaSniff SW] START_DOWNLOAD received:', { itemId, downloadType, options });
     (async () => {
       // Sync latest direct URLs and audioUrl from mediaRegistry and pending maps
       for (const [tId, tabMedia] of mediaRegistry.entries()) {
         if (tabMedia.has(itemId)) {
           const regItem = tabMedia.get(itemId);
-          if (regItem.directAudioUrls) {
-            item.directAudioUrls = Object.assign({}, regItem.directAudioUrls, item.directAudioUrls || {});
-          }
-          if (regItem.directVideoUrls) {
-            item.directVideoUrls = Object.assign({}, regItem.directVideoUrls, item.directVideoUrls || {});
-          }
-          if (regItem.audioUrl) {
-            item.audioUrl = regItem.audioUrl;
-          }
-          if (regItem.videoUrl && !item.videoUrl) {
-            item.videoUrl = regItem.videoUrl;
-          }
+          item = Object.assign({}, regItem, item);
+          item.directAudioUrls = Object.assign({}, regItem.directAudioUrls || {}, item.directAudioUrls || {});
+          item.directVideoUrls = Object.assign({}, regItem.directVideoUrls || {}, item.directVideoUrls || {});
+          if (regItem.audioUrl) item.audioUrl = regItem.audioUrl;
+          if (regItem.videoUrl) item.videoUrl = regItem.videoUrl;
+          if (regItem.rawAdaptiveFormats) item.rawAdaptiveFormats = regItem.rawAdaptiveFormats;
+          if (regItem.rawFormats) item.rawFormats = regItem.rawFormats;
+          if (regItem.jsUrl) item.jsUrl = regItem.jsUrl;
           break;
         }
       }
@@ -2162,21 +2292,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const yId = item?.youtubeId || (item?.url && getActiveYouTubeVideoId(item.url));
       if (yId) {
         for (const [key, pendingA] of pendingYouTubeAudio.entries()) {
-          if (key.endsWith(`_${yId}`)) {
-            item.directAudioUrls = Object.assign({}, pendingA, item.directAudioUrls || {});
-            if (!item.audioUrl && (pendingA.mp4 || pendingA.default)) {
-              item.audioUrl = pendingA.mp4 || pendingA.default;
+          if (key.endsWith(`_${yId}`) || key.endsWith('_active')) {
+            item.directAudioUrls = Object.assign({}, item.directAudioUrls || {}, pendingA);
+            if (!item.audioUrl && (pendingA.mp4 || pendingA.default || pendingA.webm)) {
+              item.audioUrl = pendingA.mp4 || pendingA.default || pendingA.webm;
             }
           }
         }
         for (const [key, pendingV] of pendingYouTubeVideo.entries()) {
-          if (key.endsWith(`_${yId}`)) {
-            item.directVideoUrls = Object.assign({}, pendingV, item.directVideoUrls || {});
+          if (key.endsWith(`_${yId}`) || key.endsWith('_active')) {
+            item.directVideoUrls = Object.assign({}, item.directVideoUrls || {}, pendingV);
             if (!item.videoUrl) {
               item.videoUrl = pendingV['1080'] || Object.values(pendingV)[0];
             }
           }
         }
+      }
+
+      // Keep mediaRegistry updated with these live direct URLs
+      for (const [tId, tabMedia] of mediaRegistry.entries()) {
+        if (tabMedia.has(itemId)) {
+          const regItem = tabMedia.get(itemId);
+          regItem.directAudioUrls = Object.assign({}, regItem.directAudioUrls || {}, item.directAudioUrls || {});
+          regItem.directVideoUrls = Object.assign({}, regItem.directVideoUrls || {}, item.directVideoUrls || {});
+          if (item.audioUrl) regItem.audioUrl = item.audioUrl;
+          if (item.videoUrl) regItem.videoUrl = item.videoUrl;
+          break;
+        }
+      }
+
+      if (item.source === 'youtube' || item.youtubeId) {
+        console.log('[YT DOWNLOAD SNAPSHOT]', {
+          id: item.id,
+          youtubeId: item.youtubeId,
+          directAudioKeys: Object.keys(item.directAudioUrls || {}),
+          directVideoKeys: Object.keys(item.directVideoUrls || {}),
+          hasAudioUrl: Boolean(item.audioUrl),
+          audioUrl: item.audioUrl,
+          options
+        });
       }
 
       const referer = item?.referer || options?.referer || null;
@@ -2374,6 +2528,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           let targetUrl = item.streamType === 'direct' ? item.url : (item.masterUrl || item.pageUrl || item.url);
           if (isInstagram) {
             targetUrl = item.pageUrl || (item.shortcode ? `https://www.instagram.com/reel/${item.shortcode}/` : item.url);
+          } else if (isYouTube) {
+            const yId = item.youtubeId || (item.url && getActiveYouTubeVideoId(item.url)) || (item.pageUrl && getActiveYouTubeVideoId(item.pageUrl));
+            if (yId) {
+              targetUrl = `https://www.youtube.com/watch?v=${yId}`;
+            } else if (item.pageUrl && item.pageUrl.includes('youtube.com/watch')) {
+              targetUrl = item.pageUrl;
+            }
           }
           
           // Secure cookie delegation (never logged, never sent to UI)
@@ -2383,6 +2544,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             action: 'ytdlp_download',
             jobId: itemId,
             url: targetUrl,
+            quality: options?.ytQuality || options?.quality || '1080',
             filename: options.filename || 'download.mp4',
             headers: {
               'User-Agent': navigator.userAgent,
@@ -3074,7 +3236,7 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
       if (manifestType === 'hls') {
         await parseHLSManifest(item, manifestContent, url);
       } else {
-        parseDASHManifest(item, manifestContent, url);
+        await parseDASHManifest(item, manifestContent, url);
       }
       item.parsed = true;
 
@@ -3108,7 +3270,7 @@ async function handleManifestDetected({ tabId, url, content, manifestType, pageU
           if (manifestType === 'hls') {
             await parseHLSManifest(item, fetchedContent, url);
           } else {
-            parseDASHManifest(item, fetchedContent, url);
+            await parseDASHManifest(item, fetchedContent, url);
           }
           item.parsed = true;
 

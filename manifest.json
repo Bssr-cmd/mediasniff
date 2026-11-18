@@ -11,11 +11,11 @@
     "scripting",
     "offscreen",
     "declarativeNetRequest",
-    "cookies"
+    "cookies",
+    "nativeMessaging"
   ],
   "optional_permissions": [
-    "tabs",
-    "nativeMessaging"
+    "tabs"
   ],
   "host_permissions": [
     "<all_urls>"

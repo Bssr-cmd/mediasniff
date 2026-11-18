@@ -349,6 +349,14 @@
     if (event.data && event.data.type === 'MS_YT_RESPONSE') {
       processYouTubePlayerResponse(event.data.data, event.data.jsUrl);
     }
+    if (event.data && event.data.type === 'MS_GOOGLEVIDEO_URL') {
+      try {
+        chrome.runtime.sendMessage({
+          type: 'SNIFFED_GOOGLEVIDEO_URL',
+          url: event.data.url
+        }).catch(() => {});
+      } catch (e) { /* Extension context invalidated */ }
+    }
     if (event.data && event.data.type === 'MS_VIMEO_RESPONSE') {
       processVimeoPlayerResponse(event.data.data);
     }
@@ -515,9 +523,6 @@
 
   // ─── Vimeo Detection ────────────────────────────────────────────────
   const reportedVimeoIds = new Set();
-    lastReportedVideoId = null;
-    lastReportedJsUrl = null;
-    lastReportedFormatCount = 0;
 
   function injectVimeoScraper() {
     

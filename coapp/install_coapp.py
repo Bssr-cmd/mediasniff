@@ -62,14 +62,20 @@ def main():
     print(f"Wrote Manifest to: {manifest_path}")
     print(f"Manifest data: {json.dumps(manifest_data)}")
     
-    # 3. Create Windows Registry Key
-    reg_path = r"Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp"
-    try:
-        key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
-        winreg.SetValue(key, "", winreg.REG_SZ, manifest_path)
-        winreg.CloseKey(key)
-        print("Successfully created Windows Registry entry under HKCU!")
-    except Exception as e:
-        print(f"Error creating registry entry: {e}")
+    # 3. Create Windows Registry Keys for Chromium-based browsers
+    reg_paths = [
+        r"Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp",
+        r"Software\Microsoft\Edge\NativeMessagingHosts\net.mediasniff.coapp",
+        r"Software\BraveSoftware\Brave-Browser\NativeMessagingHosts\net.mediasniff.coapp",
+        r"Software\Chromium\NativeMessagingHosts\net.mediasniff.coapp",
+    ]
+    for reg_path in reg_paths:
+        try:
+            key = winreg.CreateKey(winreg.HKEY_CURRENT_USER, reg_path)
+            winreg.SetValue(key, "", winreg.REG_SZ, manifest_path)
+            winreg.CloseKey(key)
+            print(f"Successfully created Windows Registry entry: {reg_path}")
+        except Exception as e:
+            print(f"Error creating registry entry for {reg_path}: {e}")
 if __name__ == '__main__':
     main()

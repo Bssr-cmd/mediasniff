@@ -38,6 +38,17 @@
     }, '*');
   }
 
+  // ─── Google Video URL Sniffer ─────────────────────────────────────────
+  const reportedGoogleVideo = new Set();
+  function checkGoogleVideoUrl(url) {
+    if (!url || typeof url !== 'string' || !url.includes('googlevideo.com/videoplayback')) return;
+    if (reportedGoogleVideo.has(url)) return;
+    reportedGoogleVideo.add(url);
+    try {
+      window.postMessage({ type: 'MS_GOOGLEVIDEO_URL', url }, '*');
+    } catch (_) {}
+  }
+
   // ─── Performance API Resource Timing Sniffer ─────────────────────────
   function scanPerformanceEntries() {
     try {
@@ -53,6 +64,8 @@
           reportManifest(name, null, 'dash');
         } else if (nameLower.includes('master.json') || (name.includes('vimeocdn.com') && name.includes('master.json'))) {
           reportManifest(name, null, 'hls');
+        } else if (name.includes('googlevideo.com/videoplayback')) {
+          checkGoogleVideoUrl(name);
         }
       }
     } catch (_) {}
@@ -72,6 +85,8 @@
               reportManifest(name, null, 'dash');
             } else if (nameLower.includes('master.json') || (name.includes('vimeocdn.com') && name.includes('master.json'))) {
               reportManifest(name, null, 'hls');
+            } else if (name.includes('googlevideo.com/videoplayback')) {
+              checkGoogleVideoUrl(name);
             }
           }
         } catch (_) {}
@@ -514,6 +529,8 @@
           reportManifest(url, null, 'dash');
         } else if (urlLower.includes('master.json') || (url.includes('vimeocdn.com') && url.includes('master.json'))) {
           reportManifest(url, null, 'hls');
+        } else if (url.includes('googlevideo.com/videoplayback')) {
+          checkGoogleVideoUrl(url);
         }
       }
 
@@ -630,6 +647,8 @@
           reportManifest(this._msUrl, null, 'dash');
         } else if (uLower.includes('master.json') || (this._msUrl.includes('vimeocdn.com') && this._msUrl.includes('master.json'))) {
           reportManifest(this._msUrl, null, 'hls');
+        } else if (this._msUrl.includes('googlevideo.com/videoplayback')) {
+          checkGoogleVideoUrl(this._msUrl);
         }
       }
       return origOpen.call(this, method, url, ...rest);

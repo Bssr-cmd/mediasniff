@@ -9,10 +9,26 @@ import tempfile
 import shutil
 import ssl
 import uuid
-# Ensure SSL doesn't block downloads due to self-signed certs
+import re
+import threading
+
+# Windows binary stdio configuration to prevent newline translation corruption
+if sys.platform == "win32":
+    import msvcrt
+    try:
+        msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+        msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
+    except Exception:
+        pass
+
+# Windows flag to suppress console window flashing for child processes
+CREATE_NO_WINDOW = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+
+# Ensure SSL doesn't block downloads due to self-signed certs or enterprise MITM proxies
 ctx = ssl.create_default_context()
 ctx.check_hostname = False
 ctx.verify_mode = ssl.CERT_NONE
+
 # Logging helper since we cannot use print() (it would corrupt stdio messaging)
 LOG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "coapp.log")
 
@@ -34,37 +50,120 @@ def log(msg):
     try:
         with open(LOG_FILE, "a", encoding="utf-8") as f:
             f.write(f"{msg}\n")
-    except:
+    except Exception:
         pass
+
 log("--- MediaSniff Companion App Started ---")
+
+# Thread safety locks and state tracking
+send_lock = threading.Lock()
+ACTIVE_PROCESSES = {}
+ACTIVE_PROCESSES_LOCK = threading.Lock()
+CANCELLED_JOBS = set()
+CANCELLED_JOBS_LOCK = threading.Lock()
+
+def register_process(job_id, proc):
+    if not job_id:
+        return
+    with ACTIVE_PROCESSES_LOCK:
+        ACTIVE_PROCESSES[job_id] = proc
+
+def unregister_process(job_id):
+    if not job_id:
+        return
+    with ACTIVE_PROCESSES_LOCK:
+        ACTIVE_PROCESSES.pop(job_id, None)
+
+def cancel_job(job_id):
+    if not job_id:
+        return
+    with CANCELLED_JOBS_LOCK:
+        CANCELLED_JOBS.add(job_id)
+    with ACTIVE_PROCESSES_LOCK:
+        proc = ACTIVE_PROCESSES.get(job_id)
+    if proc:
+        kill_process(proc)
+
+def is_job_cancelled(job_id):
+    if not job_id:
+        return False
+    with CANCELLED_JOBS_LOCK:
+        return job_id in CANCELLED_JOBS
+
+def kill_process(proc):
+    if not proc:
+        return
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=CREATE_NO_WINDOW
+            )
+        else:
+            proc.terminate()
+    except Exception as e:
+        log(f"Error terminating process tree: {e}")
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+def sanitize_filename(filename, default="download.mp4"):
+    """Sanitize filename to prevent directory traversal and Windows-illegal characters."""
+    if not filename or not isinstance(filename, str):
+        return default
+    # Strip directory components
+    filename = os.path.basename(filename)
+    # Replace forbidden Windows characters: < > : " / \ | ? *
+    filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+    # Strip trailing periods and spaces (forbidden by Windows filesystem)
+    filename = filename.strip('. ')
+    return filename or default
+
 def get_message():
     raw_length = sys.stdin.buffer.read(4)
-    if not raw_length:
+    if not raw_length or len(raw_length) < 4:
         return None
     message_length = struct.unpack('@I', raw_length)[0]
-    message = sys.stdin.buffer.read(message_length).decode('utf-8')
-    return json.loads(message)
+    raw_data = bytearray()
+    while len(raw_data) < message_length:
+        chunk = sys.stdin.buffer.read(message_length - len(raw_data))
+        if not chunk:
+            return None
+        raw_data.extend(chunk)
+    return json.loads(raw_data.decode('utf-8'))
+
 def send_message(message_content):
     encoded_content = json.dumps(message_content, separators=(',', ':')).encode('utf-8')
-    sys.stdout.buffer.write(struct.pack('@I', len(encoded_content)))
-    sys.stdout.buffer.write(encoded_content)
-    sys.stdout.buffer.flush()
+    with send_lock:
+        sys.stdout.buffer.write(struct.pack('@I', len(encoded_content)))
+        sys.stdout.buffer.write(encoded_content)
+        sys.stdout.buffer.flush()
+
 def download_file(url, filepath, label, start_pct, end_pct, custom_headers=None, job_id=None):
     log(f"Downloading {label} from {url[:80]}... to {filepath}")
     req_headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     if custom_headers and isinstance(custom_headers, dict):
         for hk, hv in custom_headers.items():
-            if hk.lower() not in ('cookie', 'cookies'):
-                req_headers[hk] = hv
+            req_headers[hk] = hv
     req = urllib.request.Request(url, headers=req_headers)
     
     with urllib.request.urlopen(req, context=ctx) as response:
-        content_length = int(response.headers.get('content-length', 0))
+        try:
+            content_length = int(response.headers.get('content-length', 0))
+        except (ValueError, TypeError):
+            content_length = 0
+            
         chunk_size = 1024 * 256
         downloaded = 0
         
         with open(filepath, 'wb') as out_file:
             while True:
+                if job_id and is_job_cancelled(job_id):
+                    raise Exception("Job cancelled by user")
+                    
                 chunk = response.read(chunk_size)
                 if not chunk:
                     break
@@ -72,37 +171,40 @@ def download_file(url, filepath, label, start_pct, end_pct, custom_headers=None,
                 downloaded += len(chunk)
                 
                 # Report progress
+                mb_downloaded = downloaded / (1024 * 1024)
                 if content_length > 0:
                     fraction = downloaded / content_length
                     pct = int(start_pct + fraction * (end_pct - start_pct))
-                    mb_downloaded = downloaded / (1024 * 1024)
                     mb_total = content_length / (1024 * 1024)
-                    msg_out = {
-                        "status": "progress",
-                        "percent": pct,
-                        "statusLabel": f"Downloading {label}: {mb_downloaded:.1f}MB / {mb_total:.1f}MB"
-                    }
-                    if job_id:
-                        msg_out["jobId"] = job_id
-                    send_message(msg_out)
+                    status_lbl = f"Downloading {label}: {mb_downloaded:.1f}MB / {mb_total:.1f}MB"
+                else:
+                    pct = start_pct
+                    status_lbl = f"Downloading {label}: {mb_downloaded:.1f}MB"
+                    
+                msg_out = {
+                    "status": "progress",
+                    "percent": pct,
+                    "statusLabel": status_lbl
+                }
+                if job_id:
+                    msg_out["jobId"] = job_id
+                send_message(msg_out)
+
 def find_ffmpeg():
-    # 1. Search in same folder
-    local_ffmpeg = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ffmpeg.exe")
-    if os.path.exists(local_ffmpeg):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    local_ffmpeg = os.path.join(base_dir, "ffmpeg.exe" if os.name == 'nt' else "ffmpeg")
+    if os.path.exists(local_ffmpeg) and os.path.getsize(local_ffmpeg) > 1000:
         log(f"Found local FFmpeg: {local_ffmpeg}")
         return local_ffmpeg
     
-    # 2. Search in PATH
-    try:
-        subprocess.run(["ffmpeg", "-version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
-        log("Found system PATH FFmpeg")
-        return "ffmpeg"
-    except:
-        pass
+    found = shutil.which("ffmpeg")
+    if found:
+        log(f"Found system PATH FFmpeg: {found}")
+        return found
         
     return None
 
-def auto_download_ffmpeg():
+def auto_download_ffmpeg(job_id=None):
     log("Auto-downloading FFmpeg static binary dependency...")
     coapp_dir = os.path.dirname(os.path.abspath(__file__))
     output_exe = os.path.join(coapp_dir, "ffmpeg.exe")
@@ -111,41 +213,57 @@ def auto_download_ffmpeg():
     
     try:
         import gzip
-        send_message({"status": "progress", "percent": 81, "statusLabel": "Downloading FFmpeg dependency..."})
+        msg_dl = {"status": "progress", "percent": 81, "statusLabel": "Downloading FFmpeg dependency..."}
+        if job_id:
+            msg_dl["jobId"] = job_id
+        send_message(msg_dl)
+        
         req = urllib.request.Request(gz_url, headers={'User-Agent': 'Mozilla/5.0'})
         with urllib.request.urlopen(req, context=ctx) as response, open(gz_path, 'wb') as out_file:
-            out_file.write(response.read())
+            shutil.copyfileobj(response, out_file)
             
-        send_message({"status": "progress", "percent": 83, "statusLabel": "Extracting FFmpeg binary..."})
+        msg_ex = {"status": "progress", "percent": 83, "statusLabel": "Extracting FFmpeg binary..."}
+        if job_id:
+            msg_ex["jobId"] = job_id
+        send_message(msg_ex)
+        
         with gzip.open(gz_path, 'rb') as f_in, open(output_exe, 'wb') as f_out:
-            f_out.write(f_in.read())
+            shutil.copyfileobj(f_in, f_out)
             
         log("FFmpeg dependency successfully auto-downloaded!")
         return output_exe
     except Exception as e:
         log(f"Failed to auto-download FFmpeg: {e}")
+        if os.path.exists(output_exe):
+            try:
+                os.remove(output_exe)
+            except Exception:
+                pass
         return None
     finally:
         if os.path.exists(gz_path):
             try:
                 os.remove(gz_path)
-            except:
+            except Exception:
                 pass
 
 def find_ytdlp():
     base_dir = os.path.dirname(os.path.abspath(__file__))
     local_ytdlp = os.path.join(base_dir, "yt-dlp.exe" if os.name == 'nt' else "yt-dlp")
-    if os.path.exists(local_ytdlp):
+    if os.path.exists(local_ytdlp) and os.path.getsize(local_ytdlp) > 1000:
         return local_ytdlp
     if shutil.which("yt-dlp"):
         return shutil.which("yt-dlp")
     return None
 
-def auto_download_ytdlp():
+def auto_download_ytdlp(job_id=None):
     log("Auto-downloading yt-dlp dependency...")
-    send_message({"status": "progress", "percent": 5, "statusLabel": "Downloading yt-dlp dependency..."})
-    base_dir = os.path.dirname(os.path.abspath(__file__))
+    msg_dl = {"status": "progress", "percent": 5, "statusLabel": "Downloading yt-dlp dependency..."}
+    if job_id:
+        msg_dl["jobId"] = job_id
+    send_message(msg_dl)
     
+    base_dir = os.path.dirname(os.path.abspath(__file__))
     if os.name == 'nt':
         url = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
         output_exe = os.path.join(base_dir, "yt-dlp.exe")
@@ -154,19 +272,27 @@ def auto_download_ytdlp():
         output_exe = os.path.join(base_dir, "yt-dlp")
         
     try:
-        urllib.request.urlretrieve(url, output_exe)
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req, context=ctx) as response, open(output_exe, 'wb') as out_file:
+            shutil.copyfileobj(response, out_file)
         if os.name != 'nt':
             os.chmod(output_exe, os.stat(output_exe).st_mode | 0o111)
         log("yt-dlp dependency successfully auto-downloaded!")
         return output_exe
     except Exception as e:
         log(f"Failed to auto-download yt-dlp: {e}")
+        if os.path.exists(output_exe):
+            try:
+                os.remove(output_exe)
+            except Exception:
+                pass
         return None
 
 def handle_ytdlp_download(msg):
     job_id = msg.get("jobId") or msg.get("itemId")
     url = msg.get("url")
-    filename = msg.get("filename", "download.mp4")
+    raw_filename = msg.get("filename", "download.mp4")
+    filename = sanitize_filename(raw_filename)
     cookies = msg.get("cookies")
     headers = msg.get("headers") or {}
 
@@ -182,6 +308,13 @@ def handle_ytdlp_download(msg):
             out["error"] = error
         send_message(out)
     
+    if not url:
+        report("failed", status_label="Missing download URL", error="url is required")
+        return
+        
+    with CANCELLED_JOBS_LOCK:
+        CANCELLED_JOBS.discard(job_id)
+
     downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     if not os.path.exists(downloads_dir):
         downloads_dir = os.getcwd()
@@ -191,31 +324,49 @@ def handle_ytdlp_download(msg):
     
     ytdlp_bin = find_ytdlp()
     if not ytdlp_bin:
-        ytdlp_bin = auto_download_ytdlp()
+        ytdlp_bin = auto_download_ytdlp(job_id=job_id)
         
     if not ytdlp_bin:
         log("yt-dlp not found and auto-download failed.")
-        report("failed", status_label="yt-dlp dependency missing.")
+        report("failed", status_label="yt-dlp dependency missing.", error="yt-dlp dependency missing.")
         return
         
     # We also need ffmpeg for yt-dlp to merge formats
     ffmpeg_bin = find_ffmpeg()
     if not ffmpeg_bin:
-        ffmpeg_bin = auto_download_ffmpeg()
+        ffmpeg_bin = auto_download_ffmpeg(job_id=job_id)
+
+    quality = msg.get("quality") or msg.get("ytQuality")
+    if quality:
+        q_match = re.search(r'\d+', str(quality))
+        if q_match:
+            qh = int(q_match.group(0))
+            format_spec = f"bestvideo[height<={qh}][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<={qh}]+bestaudio/best[height<={qh}]/best"
+        else:
+            format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
+    else:
+        format_spec = "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best"
 
     report("progress", percent=10, status_label="Starting yt-dlp...")
     cmd = [
         ytdlp_bin,
         "--no-playlist",
+        "--newline",
         "--socket-timeout", "15",
         "--retries", "2",
-        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "-f", format_spec,
         "--merge-output-format", "mp4",
-        "-o", output_path,
-        url
+        "-o", output_path
     ]
+    if sys.platform == 'win32':
+        cmd.append("--windows-filenames")
+
     if ffmpeg_bin:
-        cmd.extend(["--ffmpeg-location", os.path.dirname(ffmpeg_bin)])
+        ffmpeg_dir = os.path.dirname(ffmpeg_bin) if os.path.isabs(ffmpeg_bin) else None
+        if ffmpeg_dir:
+            cmd.extend(["--ffmpeg-location", ffmpeg_dir])
+        elif os.path.isabs(ffmpeg_bin):
+            cmd.extend(["--ffmpeg-location", ffmpeg_bin])
 
     # Headers delegation
     if isinstance(headers, dict):
@@ -236,44 +387,67 @@ def handle_ytdlp_download(msg):
         except Exception as ce:
             log(f"Failed to create temporary cookie file: {ce}")
 
-    active_processes = getattr(handle_ytdlp_download, "active_processes", None)
-    if active_processes is None:
-        active_processes = {}
-        handle_ytdlp_download.active_processes = active_processes
-
+    cmd.append(url)
     log(f"Executing: {' '.join(cmd)}")
+    
     try:
-        # Run yt-dlp and capture output for progress
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, universal_newlines=True)
-        if job_id:
-            active_processes[job_id] = process
-        import re
+        process = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True,
+            encoding='utf-8',
+            errors='replace',
+            creationflags=CREATE_NO_WINDOW
+        )
+        register_process(job_id, process)
+        
         progress_pattern = re.compile(r'\[download\]\s+([0-9.]+)%')
+        last_output_lines = []
         
         for line in process.stdout:
+            clean_line = line.strip()
+            if clean_line:
+                last_output_lines.append(clean_line)
+                if len(last_output_lines) > 10:
+                    last_output_lines.pop(0)
+                    
             match = progress_pattern.search(line)
             if match:
                 try:
                     pct = float(match.group(1))
                     overall = int(10 + pct * 0.85) # scale from 10% to 95%
                     report("progress", percent=overall, status_label=f"yt-dlp downloading: {pct}%")
-                except:
+                except Exception:
                     pass
         
         process.wait()
+        
+        if is_job_cancelled(job_id):
+            log(f"yt-dlp job {job_id} was cancelled, suppressing exit report.")
+            return
+            
         if process.returncode == 0:
             log(f"yt-dlp download completed successfully! (jobId: {job_id})")
             report("complete", status_label=f"Saved to Downloads: {filename}")
         else:
-            log(f"yt-dlp failed with exit code {process.returncode} (jobId: {job_id})")
-            report("failed", status_label=f"yt-dlp failed (Code {process.returncode})")
+            error_detail = next((l for l in reversed(last_output_lines) if "ERROR" in l.upper()), None)
+            if not error_detail and last_output_lines:
+                error_detail = last_output_lines[-1]
+            error_msg = error_detail or f"yt-dlp exit code {process.returncode}"
+            log(f"yt-dlp failed with exit code {process.returncode} (jobId: {job_id}): {error_msg}")
+            report("failed", status_label=f"yt-dlp failed: {error_msg}", error=error_msg)
             
     except Exception as e:
+        if is_job_cancelled(job_id):
+            log(f"yt-dlp job {job_id} cancelled during exception: {e}")
+            return
         log(f"yt-dlp task error: {e} (jobId: {job_id})")
-        report("failed", status_label=f"yt-dlp Error: {str(e)}")
+        report("failed", status_label=f"yt-dlp Error: {str(e)}", error=str(e))
     finally:
-        if job_id and hasattr(handle_ytdlp_download, "active_processes"):
-            handle_ytdlp_download.active_processes.pop(job_id, None)
+        unregister_process(job_id)
         # Secure cleanup: delete temporary cookie file immediately upon completion/failure
         if cookie_file and os.path.exists(cookie_file):
             try:
@@ -286,7 +460,8 @@ def handle_download_and_mux(msg):
     job_id = msg.get("jobId") or msg.get("itemId")
     video_url = msg.get("videoUrl")
     audio_url = msg.get("audioUrl")
-    filename = msg.get("filename", "download.mp4")
+    raw_filename = msg.get("filename", "download.mp4")
+    filename = sanitize_filename(raw_filename)
     headers = msg.get("headers") or {}
 
     def report(status, percent=None, status_label=None, error=None):
@@ -301,6 +476,13 @@ def handle_download_and_mux(msg):
             out["error"] = error
         send_message(out)
     
+    if not video_url:
+        report("failed", status_label="Missing video URL", error="videoUrl is required")
+        return
+        
+    with CANCELLED_JOBS_LOCK:
+        CANCELLED_JOBS.discard(job_id)
+
     # Resolve standard Windows Downloads folder
     downloads_dir = os.path.join(os.path.expanduser("~"), "Downloads")
     if not os.path.exists(downloads_dir):
@@ -322,25 +504,29 @@ def handle_download_and_mux(msg):
             try:
                 download_file(audio_url, temp_audio, "audio", 50, 80, custom_headers=headers, job_id=job_id)
             except Exception as audio_err:
+                if is_job_cancelled(job_id):
+                    return
                 log(f"Audio download failed: {audio_err}")
                 raise Exception(f"Audio download failed: {audio_err}")
         
+        if is_job_cancelled(job_id):
+            return
+            
         # 3. Locate FFmpeg
         ffmpeg_bin = find_ffmpeg()
         if not ffmpeg_bin:
-            ffmpeg_bin = auto_download_ffmpeg()
+            ffmpeg_bin = auto_download_ffmpeg(job_id=job_id)
             
         if not ffmpeg_bin:
             log("FFmpeg not found and auto-download failed! Falling back to raw video copying.")
-            # If no FFmpeg and no audio, copy video to destination
             if not audio_url:
-                os.replace(temp_video, output_path)
+                shutil.move(temp_video, output_path)
                 report("complete", status_label=f"Saved: {filename}")
                 return
             else:
                 raise Exception("FFmpeg not found on host system and auto-download failed. Merging requires FFmpeg.")
                 
-        # 4. Mux tracks losslessly using FFmpeg
+        # 4. Mux tracks natively using FFmpeg
         report("progress", percent=85, status_label="Muxing tracks natively (FFmpeg)...")
         
         cmd = [ffmpeg_bin]
@@ -350,11 +536,26 @@ def handle_download_and_mux(msg):
             cmd += ["-i", temp_video, "-c", "copy", "-y", output_path]
             
         log(f"Executing: {' '.join(cmd)}")
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            creationflags=CREATE_NO_WINDOW
+        )
+        register_process(job_id, proc)
+        stdout, stderr = proc.communicate()
+        unregister_process(job_id)
         
-        if result.returncode != 0:
-            log(f"FFmpeg copy failed: {result.stderr}. Retrying with auto-encoding...")
-            # Fallback: copy video losslessly, transcode audio to highly compatible aac
+        if is_job_cancelled(job_id):
+            log(f"Download/Mux job {job_id} cancelled during FFmpeg muxing.")
+            return
+            
+        if proc.returncode != 0:
+            log(f"FFmpeg copy failed: {stderr}. Retrying with auto-encoding...")
+            # Fallback: copy video, transcode audio to aac
             cmd_fallback = [ffmpeg_bin]
             if audio_url:
                 cmd_fallback += ["-i", temp_video, "-i", temp_audio, "-c:v", "copy", "-c:a", "aac", "-strict", "experimental", "-y", output_path]
@@ -362,26 +563,45 @@ def handle_download_and_mux(msg):
                 cmd_fallback += ["-i", temp_video, "-c:v", "copy", "-y", output_path]
                 
             log(f"Executing fallback: {' '.join(cmd_fallback)}")
-            result = subprocess.run(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            proc_fallback = subprocess.Popen(
+                cmd_fallback,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                creationflags=CREATE_NO_WINDOW
+            )
+            register_process(job_id, proc_fallback)
+            stdout, stderr = proc_fallback.communicate()
+            unregister_process(job_id)
             
-            if result.returncode != 0:
-                log(f"FFmpeg failed with exit code {result.returncode}. Error: {result.stderr}")
-                raise Exception(f"FFmpeg muxing failed: {result.stderr[:100]}")
+            if is_job_cancelled(job_id):
+                return
+                
+            if proc_fallback.returncode != 0:
+                log(f"FFmpeg failed with exit code {proc_fallback.returncode}. Error: {stderr}")
+                err_snippet = (stderr or "").strip().splitlines()[-1] if stderr else f"Exit code {proc_fallback.returncode}"
+                raise Exception(f"FFmpeg muxing failed: {err_snippet}")
             
         log(f"Lossless muxing completed successfully! (jobId: {job_id})")
         report("complete", status_label=f"Saved to Downloads: {filename}")
         
     except Exception as e:
+        if is_job_cancelled(job_id):
+            log(f"Download/Mux job {job_id} was cancelled, suppressing failure report.")
+            return
         log(f"Download/Mux task error: {e} (jobId: {job_id})")
         report("failed", status_label=f"Host Error: {str(e)}", error=str(e))
         
     finally:
+        unregister_process(job_id)
         # Clean up temp files
         for f in (temp_video, temp_audio):
             if os.path.exists(f):
                 try:
                     os.remove(f)
-                except:
+                except Exception:
                     pass
 
 def main():
@@ -402,18 +622,16 @@ def main():
                     resp["jobId"] = job_id
                 send_message(resp)
             elif action == "ytdlp_download":
-                handle_ytdlp_download(msg)
+                t = threading.Thread(target=handle_ytdlp_download, args=(msg,), daemon=True)
+                t.start()
             elif action == "download_and_mux":
-                handle_download_and_mux(msg)
+                t = threading.Thread(target=handle_download_and_mux, args=(msg,), daemon=True)
+                t.start()
             elif action == "cancel":
                 target_job = msg.get("jobId") or msg.get("itemId")
-                procs = getattr(handle_ytdlp_download, "active_processes", {})
-                if target_job and target_job in procs:
-                    try:
-                        procs[target_job].terminate()
-                        log(f"Terminated process for cancelled job: {target_job}")
-                    except Exception as te:
-                        log(f"Error terminating job {target_job}: {te}")
+                log(f"Processing cancel request for jobId: {target_job}")
+                if target_job:
+                    cancel_job(target_job)
                 resp = {"status": "cancelled", "statusLabel": "Job cancelled"}
                 if target_job:
                     resp["jobId"] = target_job
@@ -427,6 +645,14 @@ def main():
         except Exception as e:
             log(f"Main loop error: {e}")
             break
+
+    # Clean up all active child processes on exit
+    with ACTIVE_PROCESSES_LOCK:
+        for jid, p in list(ACTIVE_PROCESSES.items()):
+            try:
+                kill_process(p)
+            except Exception:
+                pass
 
 if __name__ == '__main__':
     main()

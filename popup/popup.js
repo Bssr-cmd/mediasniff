@@ -3,6 +3,9 @@
  * Handles UI rendering, downloads, muxing, and user interactions.
  */
 
+const MEDIA_SNIFF_BUILD = 'YT-AUDIO-FIX-2026-09-14-01';
+console.log('[MediaSniff Popup] Build:', MEDIA_SNIFF_BUILD);
+
 // ─── State ──────────────────────────────────────────────────────────
 let currentTabId = null;
 let mediaItems = [];
@@ -438,7 +441,7 @@ function createMediaCard(item) {
     <div class="quality-section">
       <div class="quality-label">Video Quality</div>
       <select class="quality-select" id="ytquality-${item.id}">
-        ${uniqueQualities.map(q => `<option value="${q.height}">${q.label} (${q.width}x${q.height})</option>`).join('')}
+        ${uniqueQualities.map(q => `<option value="${q.height}">${q.label}${q.width > 0 ? ` (${q.width}x${q.height})` : ''}</option>`).join('')}
       </select>
     </div>`;
   }
@@ -945,7 +948,6 @@ async function handleMuxDownload(item) {
 
   const qualitySelect = document.getElementById(`quality-${item.id}`);
   const audioSelect = document.getElementById(`audio-${item.id}`);
-  const embedSubCheckbox = document.getElementById(`embedSub-${item.id}`);
 
   const qualityIndex = qualitySelect ? parseInt(qualitySelect.value) : 0;
   const audioIndex = audioSelect ? parseInt(audioSelect.value) : 0;

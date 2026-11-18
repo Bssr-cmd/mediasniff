@@ -106,6 +106,8 @@ foreach ($pv in $pathVariations) {
     Write-Host "  -> Calculated ID ($pv): $eid" -ForegroundColor Gray
 }
 
+$null = $uniqueIds.Add("jpjpgkedgcgbfghcbladidalmmchlgek")
+
 # 3. Double-check in Chrome/Edge/Brave User Data Preferences for loaded profiles
 $chromePrefPath = @(
     "$env:LOCALAPPDATA\Google\Chrome\User Data",
@@ -116,7 +118,7 @@ $chromePrefPath = @(
 try {
     foreach ($path in $chromePrefPath) {
         if (Test-Path $path) {
-            $prefFiles = Get-ChildItem -Path $path -Filter "Preferences" -Recurse -ErrorAction SilentlyContinue
+            $prefFiles = Get-ChildItem -Path $path -Include "Preferences","Secure Preferences" -Recurse -ErrorAction SilentlyContinue
             foreach ($file in $prefFiles) {
                 $content = Get-Content -Raw -Path $file.FullName -ErrorAction SilentlyContinue
                 if ($content -and ($content.Contains("MediaSniff") -or $content.Contains("mediasniff"))) {
@@ -124,7 +126,7 @@ try {
                     if ($json -and $json.extensions -and $json.extensions.settings) {
                         foreach ($prop in $json.extensions.settings.psobject.properties) {
                             $extData = $prop.Value
-                            if ($extData -and $extData.manifest -and $extData.manifest.name -and ($extData.manifest.name -match "(?i)mediasniff")) {
+                            if ($extData -and (($extData.path -and $extData.path -match "mediasniff") -or ($extData.manifest -and $extData.manifest.name -and ($extData.manifest.name -match "(?i)mediasniff")))) {
                                 $null = $uniqueIds.Add($prop.Name)
                                 Write-Host "  -> Found active loaded Extension ID in profile: $($prop.Name)" -ForegroundColor Green
                             }
