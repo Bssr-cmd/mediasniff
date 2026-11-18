@@ -108,15 +108,18 @@ flowchart TD
 | **MPEG-TS Converter**| `lib/ts-converter.js` | Demuxes MPEG-TS transport packets, synchronizes PES video/audio streams, and generates standard MP4 containers. |
 | **WASM Muxer** | `lib/muxer.js` | High-performance WebAssembly remuxer supporting multi-track interleaving and container validation. |
 | **Companion App** | `coapp/coapp.py` | Native messaging host wrapping `yt-dlp` and `ffmpeg` with cookie jar delegation and real-time progress callbacks. |
+| **In-Tab Fetch Proxy** | `content/content.js` | Tab-delegated `googlevideo.com` fetch bridge routing CDN stream requests with official `Origin: https://www.youtube.com` headers to bypass 403 blocks in-browser. |
 
 ---
 
 ## 🛠️ Troubleshooting
 
 * **YouTube shows HTTP 403 or Video Stream Error:**
-  - Ensure the companion app is installed by running `coapp\install_coapp.ps1`.
+  - MediaSniff includes an **In-Tab Fetch Delegation** engine that bypasses 403 blocks directly from the browser tab!
+  - If using the Native Companion mode, ensure the companion app is installed by running `coapp\install_coapp.ps1`.
   - Reload the extension in `chrome://extensions/`.
 * **Twitter/X Video Fails to Mux:**
+  - Twitter/X uses fragmented HLS streams. The in-browser WASM multiplexer includes sample verification fallbacks across chunk tables (`stsz`, `stts`, `stco`, `co64`).
   - Make sure the video has played for at least 1-2 seconds on the page before clicking Download so all initial variant playlists are sniffed.
 * **Companion App Not Found:**
   - Verify that `HKCU:\Software\Google\Chrome\NativeMessagingHosts\net.mediasniff.coapp` exists in the Windows Registry pointing to `coapp\net.mediasniff.coapp.json`.

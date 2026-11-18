@@ -2256,6 +2256,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     });
     return true;
   }
+  // ─── YT_FETCH_CHUNK: Route YouTube CDN fetch through YouTube tab ──────
+  // The offscreen document cannot fetch googlevideo.com (gets 403) because
+  // the CDN checks Origin. The YouTube tab's content script sends the request
+  // from Origin: https://www.youtube.com which the CDN accepts.
+  if (message.type === 'YT_FETCH_CHUNK_SW') {
+    (async () => {
+      try {
+        const { url, range } = message;
+        const result = await fetchViaYouTubeTab(url, range);
+        if (result.ok) {
+          sendResponse({ ok: true, buffer: result.buffer });
+        } else {
+          sendResponse({ ok: false, error: result.error });
+        }
+      } catch (err) {
+        sendResponse({ ok: false, error: err.message });
+      }
+    })();
+    return true;
+  }
+
   // Fetch manifest on behalf of offscreen document with full service worker network privileges & DNR rules
   if (message.type === 'FETCH_MANIFEST') {
     (async () => {
@@ -2930,6 +2951,39 @@ function notifyPopup(tabId, debounceMs = 0) {
   }, debounceMs);
   popupNotifyTimers.set(tabId, timer);
 }
+/**
+ * Fetch a googlevideo.com URL via the active YouTube tab's content script,
+ * bypassing CDN 403 by using the tab's Origin: https://www.youtube.com.
+ * Falls back to direct fetch if no YouTube tab is available.
+ */
+async function fetchViaYouTubeTab(url, range = '') {
+  try {
+    // Find an active YouTube tab
+    const tabs = await chrome.tabs.query({ url: ['*://*.youtube.com/*', '*://www.youtube.com/*'] });
+    const ytTab = tabs.find(t => t.status === 'complete' && t.id >= 0 && !t.url.includes('youtube.com/tv'));
+    if (!ytTab) {
+      return { ok: false, error: 'No active YouTube tab found' };
+    }
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => resolve({ ok: false, error: 'Tab fetch timeout' }), 30000);
+      chrome.tabs.sendMessage(ytTab.id, {
+        type: 'YT_FETCH_CHUNK',
+        url,
+        range
+      }, (response) => {
+        clearTimeout(timeout);
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve(response || { ok: false, error: 'No response from tab' });
+      });
+    });
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+}
+
 async function fetchManifest(url, referer = null) {
   if (referer) {
     try {

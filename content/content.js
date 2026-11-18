@@ -737,6 +737,39 @@
         sendResponse({ thumbnail });
         return true;
       }
+
+      // ─── In-Tab YouTube CDN Fetch Proxy ───────────────────────────
+      // Fetches googlevideo.com URLs from INSIDE the YouTube tab so the
+      // browser sends Origin: https://www.youtube.com instead of
+      // chrome-extension://<id>, bypassing the CDN 403 restriction.
+      if (message.type === 'YT_FETCH_CHUNK' && message.url) {
+        const url = message.url;
+        const isYouTube = location.hostname.includes('youtube.com') || location.hostname.includes('youtu.be');
+        if (!isYouTube) {
+          sendResponse({ ok: false, error: 'Not on YouTube tab' });
+          return true;
+        }
+        (async () => {
+          try {
+            const resp = await fetch(url, {
+              credentials: 'include',
+              mode: 'cors',
+              headers: {
+                'Range': message.range || '',
+              }
+            });
+            if (!resp.ok) {
+              sendResponse({ ok: false, error: `HTTP ${resp.status}` });
+              return;
+            }
+            const buffer = await resp.arrayBuffer();
+            sendResponse({ ok: true, buffer });
+          } catch (err) {
+            sendResponse({ ok: false, error: err.message });
+          }
+        })();
+        return true; // keep async channel open
+      }
     });
   }
 
